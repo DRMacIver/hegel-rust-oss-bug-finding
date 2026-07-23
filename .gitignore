@@ -1,0 +1,11 @@
+# Per-run working copies (each a separate git checkout of upstream + added tests; ~49G, nested repos)
+targets/
+# Pristine upstream clones used for verification (~2G)
+upstream-cache/
+# Separate repos with their own remotes / PRs
+hegel-rust/
+hegel-skill/
+# scratch / build
+target/
+*.log
+.hegel/
