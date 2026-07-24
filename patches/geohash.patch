@@ -1,0 +1,512 @@
+diff --git a/.gitignore b/.gitignore
+index 2c96eb1..2ab6b7f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ target/
+ Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 98099fe..8fa3235 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,5 +21,6 @@ libm = "0.2.6"
+ 
+ [dev-dependencies]
+ csv = "1.2"
++hegeltest = "0.28.2"
+ num-traits = {version = "0.2", default-features = false, features = ["libm"]}
+ serde = {version = "1", features = ["derive"]}
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..9d30549
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,124 @@
++# Hegel Property-Based Testing Report — `geohash` (georust/geohash, v0.13.2)
++
++Property-based tests were added with [hegel](https://hegel.dev) (`hegeltest`
++v0.28.2 as a dev-dependency). All tests live alongside the existing tests in
++`tests/base.rs`, in a `properties` module (11 hegel tests: 9 green properties
++plus 2 deterministically pinned KNOWN FAILURE tests).
++
++## Properties tested
++
++Generators: `geohashes(min_len)` — syntactically valid geohash strings over
++the real base-32 alphabet, length 1–12; `coords()` — coordinates in the
++documented domain (lon ∈ [-180, 180], lat ∈ [-90, 90]) with the exact domain
++boundaries and ±0.0 boosted via `one_of!`/`sampled_from`.
++
++1. **Encode→decode containment** (`prop_encode_decode_containment`) —
++   `decode(encode(c, len))` returns a cell (center ± lon/lat error) that
++   contains `c`. Tolerance: half-cell error + 1e-12 degrees absolute slack
++   (encode does one rounded multiply, `coord * ~1/180 + 1.5`; half an ulp at
++   p≈2.0 maps back to ~4e-14 degrees). Longitude compared modulo 360 since
++   x = 180 and x = -180 are the same meridian (the library wraps 180 → -180,
++   which is geometrically legitimate). Excludes the ~1e-13-degree sliver
++   below lat 90 pinned as a known bug (see below).
++2. **Decode→encode roundtrip** (`prop_decode_encode_roundtrip`) — for any
++   valid hash, `encode(decode(h).center, h.len()) == h` exactly (the decoded
++   center is half a cell from every boundary, so no tolerance is needed).
++3. **Prefix monotonicity** (`prop_encode_prefix_monotone`) —
++   `encode(c, k)` is a prefix of `encode(c, 12)` for k in 1..=11.
++4. **Bounding-box nesting** (`prop_decode_bbox_prefix_nesting`) —
++   `decode_bbox(prefix)` geometrically contains `decode_bbox(hash)`. Exact
++   comparison, no tolerance: the decode arithmetic is exact dyadic
++   (small-denominator binary fractions scaled by 180/360).
++5. **Precision strictly improves with length**
++   (`prop_error_shrinks_with_length`) — both error radii of a proper prefix
++   are strictly larger than those of the full hash (each character adds 5
++   bits, at least 2 per axis).
++6. **Neighbor is exactly one cell away** (`prop_neighbor_is_one_cell_away`)
++   — for all 8 directions, the neighbor's decoded center equals the original
++   center shifted by 2×error in that direction, with longitude wrapping mod
++   360 and latitude wrapping mod 180 (crossing a pole re-enters at the
++   opposite row — the library's observed N/S edge semantics, verified
++   self-consistent by probing before writing the property). Tolerance 1e-9
++   degrees, far below the smallest cell (~1.6e-7 degrees at length 12).
++7. **Neighbor opposite-direction roundtrip**
++   (`prop_neighbor_opposite_roundtrip`) — `neighbor(neighbor(h, d), opp(d))
++   == h` exactly, for all 8 directions, including across the antimeridian and
++   the pole rows (the wrapping is self-inverse; holds unguarded).
++8. **Validation/rejection** (`prop_decode_rejects_invalid_characters`) — a
++   valid hash decodes Ok; corrupting any one position with a character
++   outside the base-32 alphabet ('a', 'i', 'l', 'o', uppercase, punctuation)
++   yields `Err(InvalidHashCharacter(c))` naming exactly that character.
++9. **Decode robustness** (`prop_decode_nonempty_never_panics`) — `decode` on
++   arbitrary non-empty Unicode strings (including over-length ones) returns
++   Ok/Err and never panics. The empty string is excluded here because it is
++   pinned as a KNOWN FAILURE (below).
++
++## Suspected bugs
++
++Two real bugs found; both are kept as deterministically failing pinned tests
++(per instructions, no fixes were made):
++
++1. **`encode` maps latitude 90 (and its next-lower double) to the south
++   pole row** (`prop_encode_lat90_containment`, KNOWN FAILURE). Latitude
++   90.0 is accepted as valid input, but the internal mapping computes
++   `y * (1/180) + 1.5`, which rounds to exactly 2.0 for y = 90.0 and for
++   `90.0_f64.next_down()` (89.99999999999999 — found only by the 10x
++   exploratory run). The bit pattern of 2.0 has a different exponent, so the
++   top-32-significand-bits extraction reads 0, i.e. latitude −90.
++   `encode((0.0, 90.0), 6) == "h00000"`, which decodes to a cell centered at
++   lat −89.997 — the north pole encodes as the south pole. (The analogous
++   lon = 180 → −180 wrap is the same meridian and therefore harmless; the
++   latitude wrap is a genuine containment violation.)
++2. **`decode("")` panics in debug builds** (`prop_decode_never_panics`,
++   KNOWN FAILURE). The empty string passes the length check (only
++   `len > 12` is rejected) and reaches
++   `hash << (64 - bits)` with `bits = 0` in `bbox_int_with_precision`
++   (src/core.rs:242) — "attempt to shift left with overflow". In release
++   builds the shift silently wraps instead. Expected behavior would be a
++   clean `Err`. The test's `one_of!` branch generating `""` directly makes
++   the failure deterministic; the shrunk counterexample is `s = ""`.
++
++## Unsound properties abandoned
++
++- **Exact (zero-tolerance) longitude containment.** x = 180 encodes into the
++  cell starting at −180; since ±180 is the same meridian this is legitimate
++  wraparound, so the containment property compares longitude modulo 360
++  rather than being reported as a bug.
++- **Non-wrapping latitude adjacency for N/S neighbors.** The library wraps
++  latitude modulo 180 at the poles (N of a top-row cell is the corresponding
++  bottom-row cell). Rather than asserting "no neighbor exists at the pole"
++  (never promised), the adjacency property adopts the wrap semantics, which
++  probing showed to be self-consistent (opposite-direction roundtrip holds
++  everywhere).
++- `neighbors()` vs `neighbor()` agreement and `encode` vs `encode_iter`
++  agreement were considered and dropped as tautological — each is defined
++  directly in terms of the other.
++
++## Test results
++
++- Final run: `cargo test` — 13 passed, 2 failed. The only failures are the
++  two KNOWN FAILURE pins above; both fail deterministically on every run
++  (the lat-90 pin fails on every generated case; the empty-string pin
++  generates `""` via a dedicated `one_of!` branch).
++- Liveness verified: temporarily inverted the containment assertion; hegel
++  reported a shrunk counterexample (`COORD(0.0 0.0)`, len 1), then reverted.
++  No property hides its assertions behind a rarely-satisfied guard.
++- Exploratory 10x run (`test_cases = 1000` on all properties, then reverted
++  to the default): found that the lat-90 bug also captures
++  `90.0_f64.next_down()`; the canonical pin and the sibling exclusion were
++  widened accordingly. No other new failures at 10x.
++- `.hegel/` added to `.gitignore`.
++
++## Skill feedback
++
++- The workflow's "construct degenerate cases exactly" and boundary-boosting
++  advice paid off directly: uniform floats never hit lat = 90.0, and the
++  boosted `sampled_from` boundary branch is what makes the containment
++  property able to see the pole bug at all.
++- The "one exploratory high-count run" step found a strictly stronger form
++  of the pole bug (`next_down(90.0)` also affected) that the default count
++  missed — exactly the boundary-coincidence case the skill describes.
++- The Rust reference's guidance on `#[hegel::composite]` with parameters
++  (`geohashes(min_len)`) and on `one_of!` was sufficient; no API friction
++  encountered on this edition-2018 crate. `cargo add --dev hegeltest`
++  worked first try.
+diff --git a/tests/base.rs b/tests/base.rs
+index 4efb9a4..351dfd0 100644
+--- a/tests/base.rs
++++ b/tests/base.rs
+@@ -142,3 +142,358 @@ fn test_neighbor_wide() {
+     assert_eq!(ns.n, "9g3q");
+     assert_eq!(ns.ne, "9g3w");
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod properties {
++    use geohash::{decode, decode_bbox, encode, neighbor, Coord, Direction, GeohashError};
++    use hegel::generators;
++
++    // The geohash base-32 alphabet ('a', 'i', 'l', 'o' are excluded).
++    const GEOHASH_ALPHABET: [char; 32] = [
++        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j',
++        'k', 'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
++    ];
++
++    const ALL_DIRECTIONS: [Direction; 8] = [
++        Direction::N,
++        Direction::NE,
++        Direction::E,
++        Direction::SE,
++        Direction::S,
++        Direction::SW,
++        Direction::W,
++        Direction::NW,
++    ];
++
++    fn opposite(d: Direction) -> Direction {
++        match d {
++            Direction::N => Direction::S,
++            Direction::NE => Direction::SW,
++            Direction::E => Direction::W,
++            Direction::SE => Direction::NW,
++            Direction::S => Direction::N,
++            Direction::SW => Direction::NE,
++            Direction::W => Direction::E,
++            Direction::NW => Direction::SE,
++        }
++    }
++
++    /// Circular (modulo 360) distance between two longitudes, so that
++    /// x = 180 and x = -180 (the same meridian) compare as equal.
++    fn lon_circ_dist(a: f64, b: f64) -> f64 {
++        let d = (a - b).abs() % 360.0;
++        d.min(360.0 - d)
++    }
++
++    /// A syntactically valid geohash string: 32-char base-32 alphabet,
++    /// length between `min_len` and the maximum supported length of 12.
++    #[hegel::composite]
++    fn geohashes(tc: hegel::TestCase, min_len: usize) -> String {
++        let len = tc.draw(
++            generators::integers::<usize>()
++                .min_value(min_len)
++                .max_value(12),
++        );
++        (0..len)
++            .map(|_| tc.draw(generators::sampled_from(GEOHASH_ALPHABET.to_vec())))
++            .collect()
++    }
++
++    /// A coordinate in the documented valid domain (lon in [-180, 180],
++    /// lat in [-90, 90]), with the exact domain boundaries and zero boosted:
++    /// uniform floats essentially never land on them, and they are where the
++    /// interesting quantization behavior lives.
++    #[hegel::composite]
++    fn coords(tc: hegel::TestCase) -> Coord<f64> {
++        let x = tc.draw(hegel::one_of!(
++            generators::floats::<f64>().min_value(-180.0).max_value(180.0),
++            generators::sampled_from(vec![-180.0, 180.0, 0.0, -0.0]),
++        ));
++        let y = tc.draw(hegel::one_of!(
++            generators::floats::<f64>().min_value(-90.0).max_value(90.0),
++            generators::sampled_from(vec![-90.0, 90.0, 0.0, -0.0]),
++        ));
++        Coord { x, y }
++    }
++
++    // Property 1: encode -> decode containment. The decoded cell
++    // (center +/- error) must contain the coordinate that was encoded.
++    //
++    // Tolerances: encode performs one rounded multiply (coord * ~1/180 + 1.5),
++    // which can move a coordinate lying within half an ulp of a cell boundary
++    // into the adjacent cell. Half an ulp at p ~ 2.0 maps back to ~4e-14
++    // degrees, so we allow 1e-12 degrees of absolute slack on top of the
++    // half-cell error. Longitude is compared modulo 360 because x = 180 and
++    // x = -180 are the same meridian and the library wraps 180 to -180.
++    #[hegel::test]
++    fn prop_encode_decode_containment(tc: hegel::TestCase) {
++        let c = tc.draw(coords());
++        // KNOWN BUG exclusion: latitudes within ~2 ulps of 90.0 (90.0 itself
++        // and 90.0_f64.next_down(), found by a 10x exploratory run) encode
++        // into the *southernmost* cell row, so containment fails there.
++        // Pinned deterministically in prop_encode_lat90_containment below.
++        // The excluded sliver is ~1e-13 degrees wide.
++        tc.assume(c.y < 90.0 - 1e-13);
++        let len = tc.draw(generators::integers::<usize>().min_value(1).max_value(12));
++
++        let hash = encode(c, len).expect("valid coordinate must encode");
++        let (center, lon_err, lat_err) = decode(&hash).expect("encoded hash must decode");
++
++        const SLACK: f64 = 1e-12;
++        assert!(
++            lon_circ_dist(c.x, center.x) <= lon_err + SLACK,
++            "lon {} not within {} +/- {} (hash {})",
++            c.x,
++            center.x,
++            lon_err,
++            hash
++        );
++        assert!(
++            (c.y - center.y).abs() <= lat_err + SLACK,
++            "lat {} not within {} +/- {} (hash {})",
++            c.y,
++            center.y,
++            lat_err,
++            hash
++        );
++    }
++
++    // KNOWN FAILURE (real bug): latitude 90.0 is accepted by encode as a valid
++    // coordinate, but encodes into the southernmost cell row: the internal
++    // mapping computes y/180 + 1.5, which for y = 90 rounds to exactly 2.0.
++    // The bit pattern of 2.0 has a different exponent, so the top 32
++    // significand bits read as all zeros -- i.e. latitude -90. decode of the
++    // resulting hash returns a cell centered near -90, nowhere near the north
++    // pole. E.g. encode((0, 90), 6) == "h00000", which decodes to lat
++    // -89.997. The same rounding also captures 90.0_f64.next_down()
++    // (89.99999999999999, found by a 10x exploratory run). This fails
++    // deterministically on every generated case.
++    #[hegel::test]
++    fn prop_encode_lat90_containment(tc: hegel::TestCase) {
++        let x = tc.draw(
++            generators::floats::<f64>()
++                .min_value(-180.0)
++                .max_value(180.0),
++        );
++        let y = tc.draw(generators::sampled_from(vec![90.0, 90.0_f64.next_down()]));
++        let len = tc.draw(generators::integers::<usize>().min_value(1).max_value(12));
++
++        let hash = encode(Coord { x, y }, len).expect("lat 90 is accepted as valid");
++        let (center, _, lat_err) = decode(&hash).expect("encoded hash must decode");
++
++        assert!(
++            (y - center.y).abs() <= lat_err + 1e-12,
++            "lat {} not within {} +/- {} (hash {})",
++            y,
++            center.y,
++            lat_err,
++            hash
++        );
++    }
++
++    // Property 2: decode -> encode roundtrip. The center returned by decode
++    // lies strictly inside its cell (half a cell away from each boundary), so
++    // re-encoding it at the same length must reproduce the hash exactly.
++    #[hegel::test]
++    fn prop_decode_encode_roundtrip(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(1));
++        let (center, _, _) = decode(&hash).expect("valid alphabet hash must decode");
++        let reencoded = encode(center, hash.len()).expect("decoded center must encode");
++        assert_eq!(reencoded, hash);
++    }
++
++    // Property 3: prefix monotonicity. A shorter geohash of the same
++    // coordinate is a prefix of the longer one (each character refines the
++    // same cell subdivision).
++    #[hegel::test]
++    fn prop_encode_prefix_monotone(tc: hegel::TestCase) {
++        let c = tc.draw(coords());
++        let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(11));
++
++        let full = encode(c, 12).expect("valid coordinate must encode");
++        let short = encode(c, k).expect("valid coordinate must encode");
++        assert_eq!(short, full[..k], "encode(c, {}) is not a prefix of encode(c, 12)", k);
++    }
++
++    // Property 4: bounding-box nesting. The cell of a hash prefix must
++    // geometrically contain the cell of the longer hash. The decode
++    // arithmetic here is exact dyadic (all values are small-denominator
++    // binary fractions scaled by 180/360), so no tolerance is needed.
++    #[hegel::test]
++    fn prop_decode_bbox_prefix_nesting(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(2));
++        let k = tc.draw(
++            generators::integers::<usize>()
++                .min_value(1)
++                .max_value(hash.len() - 1),
++        );
++
++        let outer = decode_bbox(&hash[..k]).expect("prefix must decode");
++        let inner = decode_bbox(&hash).expect("hash must decode");
++
++        assert!(
++            outer.min().x <= inner.min().x
++                && outer.min().y <= inner.min().y
++                && outer.max().x >= inner.max().x
++                && outer.max().y >= inner.max().y,
++            "bbox of prefix {:?} does not contain bbox of {:?}: {:?} vs {:?}",
++            &hash[..k],
++            hash,
++            outer,
++            inner
++        );
++    }
++
++    // Property 5: precision strictly improves with length. Each extra
++    // character adds 5 bits (at least 2 to each axis), so both error radii
++    // strictly shrink for any proper prefix.
++    #[hegel::test]
++    fn prop_error_shrinks_with_length(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(2));
++        let k = tc.draw(
++            generators::integers::<usize>()
++                .min_value(1)
++                .max_value(hash.len() - 1),
++        );
++
++        let (_, lon_err_short, lat_err_short) = decode(&hash[..k]).expect("prefix must decode");
++        let (_, lon_err_full, lat_err_full) = decode(&hash).expect("hash must decode");
++
++        assert!(
++            lon_err_full < lon_err_short,
++            "lon error did not shrink: {} (len {}) vs {} (len {})",
++            lon_err_full,
++            hash.len(),
++            lon_err_short,
++            k
++        );
++        assert!(
++            lat_err_full < lat_err_short,
++            "lat error did not shrink: {} (len {}) vs {} (len {})",
++            lat_err_full,
++            hash.len(),
++            lat_err_short,
++            k
++        );
++    }
++
++    // Property 6: a neighbor is exactly one cell away. The neighbor's decoded
++    // center must equal the original center shifted by one full cell
++    // (2 * error) in the requested direction. Longitude wraps modulo 360 (the
++    // antimeridian); latitude wraps modulo 180 -- crossing a pole re-enters at
++    // the opposite row, which is the library's observed wrapping behavior for
++    // the N/S edges. The shifted coordinate is itself a cell center, so the
++    // comparison should be exact up to float rounding; 1e-9 degrees of
++    // tolerance is far below the smallest cell size (~1.6e-7 degrees at
++    // length 12).
++    #[hegel::test]
++    fn prop_neighbor_is_one_cell_away(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(1));
++        let dir = tc.draw(generators::sampled_from(ALL_DIRECTIONS.to_vec()));
++
++        let n = neighbor(&hash, dir).expect("valid hash must have neighbors");
++        assert_eq!(n.len(), hash.len(), "neighbor changed hash length");
++
++        let (c, lon_err, lat_err) = decode(&hash).expect("hash must decode");
++        let (nc, _, _) = decode(&n).expect("neighbor must decode");
++        let (dlat, dlng) = dir.to_tuple();
++
++        let expected_x = (c.x + 2.0 * lon_err * dlng + 180.0).rem_euclid(360.0) - 180.0;
++        let expected_y = (c.y + 2.0 * lat_err * dlat + 90.0).rem_euclid(180.0) - 90.0;
++
++        const TOL: f64 = 1e-9;
++        assert!(
++            lon_circ_dist(nc.x, expected_x) <= TOL,
++            "neighbor({}, {:?}) = {}: lon center {} != expected {}",
++            hash,
++            dir,
++            n,
++            nc.x,
++            expected_x
++        );
++        assert!(
++            (nc.y - expected_y).abs() <= TOL,
++            "neighbor({}, {:?}) = {}: lat center {} != expected {}",
++            hash,
++            dir,
++            n,
++            nc.y,
++            expected_y
++        );
++    }
++
++    // Property 7: moving to a neighbor and back in the opposite direction
++    // returns the original hash, for all 8 directions -- including across the
++    // antimeridian and the pole rows (wrapping is self-inverse).
++    #[hegel::test]
++    fn prop_neighbor_opposite_roundtrip(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(1));
++        let dir = tc.draw(generators::sampled_from(ALL_DIRECTIONS.to_vec()));
++
++        let there = neighbor(&hash, dir).expect("valid hash must have neighbors");
++        let back = neighbor(&there, opposite(dir)).expect("neighbor must have neighbors");
++        assert_eq!(back, hash, "{:?} then {:?} via {}", dir, opposite(dir), there);
++    }
++
++    // Property 8 (validation/rejection): corrupting one position of a valid
++    // geohash with a character outside the base-32 alphabet ('a', 'i', 'l',
++    // 'o', uppercase letters, punctuation, ...) makes decode return
++    // InvalidHashCharacter naming that character; the uncorrupted hash
++    // decodes fine.
++    #[hegel::test]
++    fn prop_decode_rejects_invalid_characters(tc: hegel::TestCase) {
++        let hash = tc.draw(geohashes(1));
++        assert!(decode(&hash).is_ok(), "valid hash {} failed to decode", hash);
++
++        let pos = tc.draw(
++            generators::integers::<usize>()
++                .min_value(0)
++                .max_value(hash.len() - 1),
++        );
++        let bad = tc.draw(generators::sampled_from(vec![
++            'a', 'i', 'l', 'o', 'A', 'B', 'Z', '!', '@', '-', ' ', '~',
++        ]));
++        let corrupted: String = hash
++            .chars()
++            .enumerate()
++            .map(|(i, ch)| if i == pos { bad } else { ch })
++            .collect();
++
++        match decode(&corrupted) {
++            Err(GeohashError::InvalidHashCharacter(c)) => assert_eq!(c, bad),
++            other => panic!(
++                "decode({:?}) should reject character {:?}, got {:?}",
++                corrupted, bad, other
++            ),
++        }
++    }
++
++    // KNOWN FAILURE (real bug): decode("") panics in debug builds with
++    // "attempt to shift left with overflow" (src/core.rs,
++    // bbox_int_with_precision: `hash << (64 - bits)` with bits = 0). The
++    // empty string passes the length check (only len > 12 is rejected) and
++    // reaches the shift. The dedicated one_of! branch generating the empty
++    // string makes the failure deterministic on every run.
++    #[hegel::test]
++    fn prop_decode_never_panics(tc: hegel::TestCase) {
++        let s: String = tc.draw(hegel::one_of!(
++            generators::just(String::new()),
++            generators::text().max_size(24),
++        ));
++        // Must return Ok or Err -- never panic.
++        drop(decode(&s));
++    }
++
++    // Sibling of prop_decode_never_panics: the empty string is excluded here
++    // because it is pinned as a KNOWN FAILURE there (debug-mode shift
++    // overflow panic). Everything else -- arbitrary Unicode, over-long
++    // strings, invalid characters -- must produce a clean Err, never a panic.
++    #[hegel::test]
++    fn prop_decode_nonempty_never_panics(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text().min_size(1).max_size(24));
++        drop(decode(&s));
++    }
++}

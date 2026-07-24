@@ -1,0 +1,904 @@
+diff --git a/.gitignore b/.gitignore
+index 2f7896d..ff96cca 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+ target/
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..db719ee
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,163 @@
++# Hegel property-based testing report: hcl-rs (fable)
++
++Target: `crates/hcl-rs` (lib name `hcl`, v0.19.7) in the martinohmann/hcl-rs
++workspace, plus its `hcl-primitives` dependency (where several root causes
++live). hegeltest 0.28.2 added as a dev-dependency of `hcl-rs`; `serde_json`
++dev-dependency gained the `float_roundtrip` feature so it is an exact float
++oracle. Consent check: no AI-contribution gate found (CONTRIBUTING.md is
++standard; no HUMAN_VS_MACHINE.md / .ai-ack / anti-AI license clause).
++
++## Properties tested
++
++Tests live in the existing integration-test files; shared generators in
++`tests/common/mod.rs` (`gen` module: `tricky_strings` at the escape boundary,
++`escape_safe_strings`, `idents` incl. keywords/dashes/unicode, `safe_numbers`,
++recursive `exprs`/`bodies`/`values`, `top_level_values`).
++
++`tests/ser.rs`:
++1. **Body serialize→parse fixpoint** (`prop_body_serialize_parse_fixpoint`) —
++   arbitrary `Body` (attributes with unique keys, nested blocks with
++   ident/string labels, expressions over null/bool/number/string/array/object)
++   → `hcl::to_string` → `hcl::parse` → equality AND re-serialized text
++   fixpoint.
++2. **Value serialize→parse fixpoint** (`prop_value_serialize_parse_fixpoint`) —
++   same for `hcl::Value` trees via `hcl::from_str::<Value>`.
++3. **String escaping roundtrip** (`prop_string_escape_roundtrip`) — strings
++   built from escape-boundary tokens (`${`, `%{`, `$${`, quotes, backslashes,
++   control chars, NEL/LS/PS, unicode) as attribute values. **KNOWN FAILURE**
++   (bug 3 below).
++4. **Keyword object keys roundtrip** (`prop_keyword_object_keys_roundtrip`) —
++   object keys `true`/`false`/`null`/`for`. **KNOWN FAILURE** (bug 4).
++5. **Number serialize→parse roundtrip** (`prop_number_serialize_parse_roundtrip`)
++   — i64/u64/f64 numbers keep value and int-vs-float type through text.
++6. **`Number::from_f64` value preservation** (`prop_number_from_f64_roundtrips_value`)
++   — `from_f64(f).as_f64() == Some(f)` for finite f. **KNOWN FAILURE** (bug 2).
++7. **JSON interop** (`prop_value_json_roundtrip`) — `Value` →
++   `serde_json::to_string` → `Value` is identity (serde_json with
++   `float_roundtrip` as exact oracle).
++
++`tests/de.rs`:
++8. **Parse robustness** (`prop_parse_never_panics_on_arbitrary_text`,
++   `prop_parse_never_panics_on_hcl_shaped_text`) — `hcl::parse` /
++   `hcl::from_str::<Value>` never panic on arbitrary unicode text or on
++   HCL-fragment soup (unclosed heredocs, dangling markers, operators).
++9. **Deep-nesting robustness** (`prop_parse_never_panics_on_nested_input`) —
++   sweeps depth 0..=40 across 6 nesting shapes (the sweep space is small
++   enough that hegel exhausted all 246 combinations at high case count);
++   capped at 40 because of bug 1, which is pinned by the `#[ignore]`d
++   reproducer `deeply_nested_input_overflows_stack`.
++10. **Negated integer literals are non-positive**
++    (`prop_parse_negated_integer_literal_is_nonpositive`) — `a = -N` for u64
++    N must not parse to a positive number. **KNOWN FAILURE** (bug 5; also the
++    debug-build panic for N = 2^63).
++11. **`from_body` / text-route agreement**
++    (`prop_from_body_agrees_with_parsing_serialized_body`) —
++    `hcl::from_body::<Value>(body)` equals
++    `hcl::from_str::<Value>(&hcl::to_string(&body))` (exercises the HCL JSON
++    spec block-merging on both routes).
++12. **Attribute vs block disambiguation**
++    (`prop_attribute_vs_block_disambiguation`) — for any identifier k
++    (keywords, dashes, unicode): `k = {}` is an attribute, `k {}` / `k lbl {}`
++    are blocks with the right identifier/labels.
++
++`tests/format.rs`:
++13. **Format-trait Value roundtrip** (`prop_format_value_roundtrip`) —
++    `hcl::format::to_string(&value)` embedded as an attribute expression
++    re-parses to an equal `Value`. **KNOWN FAILURE** (bug 6).
++
++`tests/template.rs`:
++14. **Template parse robustness** (`prop_template_parse_never_panics`) —
++    `Template::from_str` on arbitrary/template-shaped text, and the same text
++    embedded as a quoted attribute value, never panic.
++
++## Test results
++
++`cargo test -p hcl-rs --no-fail-fast`: everything passes **except** the five
++deliberately failing KNOWN-FAILURE pins (properties 3, 4, 6, 10, 13) and one
++`#[ignore]`d process-aborting reproducer. All pins fail deterministically
++(boosted generators / sampled counterexamples). Liveness was verified by
++inverting the body-fixpoint assertion (hegel shrank to `Body([])`) and
++reverting; a 10x exploratory run (test_cases = 1000, verified with case
++counters: 1104 body-fixpoint cases) surfaced no additional failures beyond
++those below.
++
++## Suspected bugs
++
++All are oracle-independent (panic, abort, or roundtrip corruption of an input
++we still hold). Not yet deduped against the upstream issue tracker.
++
++1. **Stack overflow / process abort on deeply nested input** (`hcl-edit`
++   parser, reached via `hcl::parse`). On a 2 MiB test thread the process
++   aborts at depth ~100 for nested objects (`{b={b=...}}`) and blocks, ~150
++   for arrays, ~200 for parens and unary minus chains (debug build). A DoS
++   vector for the documented untrusted-input entry point. Pinned by
++   `deeply_nested_input_overflows_stack` (`#[ignore]`d — cannot be caught).
++   (An old pest-era performance issue may be related; the current
++   winnow-based parser still recurses unboundedly.)
++2. **`Number::from_f64` silently corrupts whole-valued floats ≥ 2^63**
++   (`hcl-primitives/src/number.rs`, `N::from_finite_f64`): `value.fract()==0`
++   routes through a *saturating* `value as i64` cast, so
++   `from_f64(1e300)` → `9223372036854775807` and `from_f64(-1e300)` →
++   `-9223372036854775808`. Corrupts `Value::from(f64)`, serde serialization
++   of large float fields, and parsing of literals like `1e300`. Shrunk
++   counterexample: `9.223372036854778e18`.
++3. **`escape_markers` mis-escapes `$`/`%` runs before `{`**
++   (`hcl-primitives/src/template.rs`, `escape_markers_owned`): the scanner
++   consumes `$`/`%` pairs blindly, so in `"${$${"` the second marker is left
++   unescaped: it serializes to `"$${$${"`, which parses back as `"${${"` —
++   silent string-value corruption on a plain serialize→parse roundtrip.
++   Mixed runs (`"${$%{"`) even produce *unparseable* output. Correct output
++   would be `"$${$$${"`.
++4. **Keyword object keys serialize to text that changes meaning**:
++   `ObjectKey::Identifier("true")` serializes bare as `{ true = ... }` and
++   re-parses as `ObjectKey::Expression(Bool(true))`; `hcl::from_str::<Value>`
++   then *errors* ("invalid type: boolean `true`, expected a string") while
++   `hcl::from_body` on the original body succeeds. An object key `for`
++   serializes to `{ for = ... }`, which does not parse at all (for-expression
++   ambiguity). The serializer should quote these keys.
++5. **Unary minus on large integer literals wraps/saturates**
++   (`hcl-primitives` `N::neg` + parse-time folding):
++   `a = -9223372036854775808` (i64::MIN!) **panics** with "attempt to negate
++   with overflow" in debug builds — i.e. `parse(to_string(body))` panics for
++   a body holding `i64::MIN`; `a = -9223372036854775809` parses as
++   **+9223372036854775807**; `a = -18446744073709551615` parses as **+1**.
++   The silent sign-flips reproduce in release builds too.
++6. **`Format`-path `Value` serialization emits invalid HCL for
++   template-looking strings**: `Format for Value` writes strings for which
++   `is_templated` is true verbatim (`src/format/impls.rs`), but
++   `is_templated` does not validate the template, so
++   `hcl::format::to_string(&Value::String("${x".into()))` produces `"${x"`,
++   which fails to re-parse. (The serde path `hcl::to_string` escapes instead
++   — the two serializers disagree about template preservation.)
++
++## Unsound properties abandoned
++
++- **serde_json as float oracle without `float_roundtrip`**: the JSON interop
++  property initially "failed" on `0.9500391205085137` → `...136`. That is
++  serde_json's documented default fast-path float parsing, not an hcl bug;
++  fixed by enabling the `float_roundtrip` feature on the dev-dependency
++  rather than weakening the property.
++- No property was weakened beyond the documented exclusions: sibling
++  generators exclude i64::MIN, whole floats ≥ 2^63, `$`/`%`-run escape
++  sequences, and keyword object keys — each exclusion carries a comment
++  naming the canonical pinned test for the bug it avoids.
++
++## Skill feedback
++
++- The escape-boundary guidance ("generate at the encode-set boundary") was
++  directly decisive: bug 3 was found immediately by concatenating boundary
++  tokens; uniform text had not hit it.
++- The "probe recursion depth directly" and "sweep depth" advice found the
++  stack overflow in the first probe run; the observed threshold (~100 on a
++  2 MiB thread) confirms the skill's warning that test threads overflow far
++  earlier than main threads.
++- The serde_json float-oracle trap happened exactly as the skill's "audit a
++  floating-point oracle" note predicts (1-ULP disagreement, opt-in
++  round-trip mode); the note made triage instant.
++- The depth×shape sweep space (41×6) was exhausted by hegel at high case
++  count — a nice confirmation the engine enumerates small discrete spaces,
++  worth mentioning in the reference as a way to get exhaustive coverage of
++  small sweeps for free.
++- Friction: `one_of!` branches mixing a `#[hegel::composite]` generator with
++  `.boxed()` generators unified without explicit boxing of the composite —
++  the reference's "box only if the compiler demands" wording was accurate.
+diff --git a/crates/hcl-rs/Cargo.toml b/crates/hcl-rs/Cargo.toml
+index 89689e6..c82db73 100644
+--- a/crates/hcl-rs/Cargo.toml
++++ b/crates/hcl-rs/Cargo.toml
+@@ -42,9 +42,10 @@ serde = { version = "1.0.217", features = ["derive"] }
+ vecmap-rs = { version = "0.2", features = ["serde"] }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ indoc = "2.0"
+ pretty_assertions = "1.4.1"
+-serde_json = { version = "1.0.134", features = ["preserve_order"] }
++serde_json = { version = "1.0.134", features = ["float_roundtrip", "preserve_order"] }
+ 
+ [[example]]
+ name = "in-place-expr-evaluation"
+diff --git a/crates/hcl-rs/tests/common/mod.rs b/crates/hcl-rs/tests/common/mod.rs
+index c75ea16..7414e8e 100644
+--- a/crates/hcl-rs/tests/common/mod.rs
++++ b/crates/hcl-rs/tests/common/mod.rs
+@@ -71,3 +71,247 @@ where
+     assert_eq!(err.kind(), expected.kind());
+     assert_eq!(err.expr(), expected.expr());
+ }
++
++/// Hegel generators shared by the property-based tests in `tests/ser.rs`,
++/// `tests/de.rs`, `tests/format.rs` and `tests/template.rs`.
++pub mod gen {
++    use hcl::expr::{Expression, Object, ObjectKey};
++    use hcl::structure::{Attribute, Block, BlockLabel, Body, Structure};
++    use hcl::{Identifier, Map, Number, Value};
++    use hegel::generators::{self, BoxedGenerator, Generator};
++
++    /// Tokens that sit right at the string-escaping boundary of the HCL
++    /// formatter: quotes, backslashes, control characters (escaped via the
++    /// `ESCAPE` table in `src/format/escape.rs`), template interpolation and
++    /// directive markers (`${` / `%{`, escaped via
++    /// `hcl_primitives::template::escape_markers`), heredoc introducers,
++    /// unicode line separators and multi-byte characters.
++    const BOUNDARY_TOKENS: &[&str] = &[
++        "${", "%{", "$${", "%%{", "${x}", "%{ if a }b%{ endif }", "${ x }", "}", "{", "$", "%",
++        "$$", "%%", "\"", "\\", "\\n", "\\\\", "\n", "\r", "\r\n", "\t", "\u{0}", "\u{8}",
++        "\u{c}", "\u{1b}", "\u{7f}", "\u{85}", "\u{2028}", "\u{2029}", "ß", "🦀", "<<EOT", "EOT",
++        "<<-EOT", "'", "`", "#", "//", "/*", "*/",
++    ];
++
++    /// Strings generated at the escape boundary: a concatenation of arbitrary
++    /// unicode text and boundary tokens, so that escaping-relevant sequences
++    /// appear with high probability while still exploring free-form content.
++    #[hegel::composite]
++    pub fn tricky_strings(tc: hegel::TestCase) -> String {
++        let pieces: Vec<String> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::text().max_size(5).boxed(),
++                generators::sampled_from(
++                    BOUNDARY_TOKENS
++                        .iter()
++                        .map(|s| (*s).to_string())
++                        .collect::<Vec<_>>(),
++                )
++                .boxed(),
++            ))
++            .max_size(6),
++        );
++        pieces.concat()
++    }
++
++    /// Like [`tricky_strings`], but avoiding the escape-boundary sequences
++    /// that are corrupted by a KNOWN BUG in
++    /// `hcl_primitives::template::escape_markers` (a `$`/`%` run directly
++    /// before `{` misaligns its pair-wise scan, so e.g. `"${$${"` escapes to
++    /// `"$${$${"` which parses back as `"${${"`). The bug is pinned by
++    /// `prop_string_escape_roundtrip` in tests/ser.rs; this exclusion only
++    /// de-noises sibling properties.
++    #[hegel::composite]
++    pub fn escape_safe_strings(tc: hegel::TestCase) -> String {
++        let mut s = tc.draw(tricky_strings());
++        // Collapse any run of two-or-more `$`/`%` characters directly before
++        // a `{` down to a single character, so the buggy pair-wise scan in
++        // `escape_markers` never misaligns.
++        loop {
++            let collapsed = s
++                .replace("$${", "${")
++                .replace("%%{", "%{")
++                .replace("$%{", "%{")
++                .replace("%${", "${");
++            if collapsed == s {
++                break;
++            }
++            s = collapsed;
++        }
++        s
++    }
++
++    /// Valid HCL identifiers, including dashes, keywords and unicode.
++    #[hegel::composite]
++    pub fn idents(tc: hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::from_regex(r"[a-zA-Z_][a-zA-Z0-9_-]{0,10}")
++                .fullmatch(true)
++                .boxed(),
++            generators::sampled_from(vec![
++                "héllo".to_string(),
++                "变量".to_string(),
++                "_".to_string(),
++                "true".to_string(),
++                "for".to_string(),
++                "a-b".to_string(),
++            ])
++            .boxed(),
++        ))
++    }
++
++    /// `hcl::Number`s that avoid two known bugs which are pinned by dedicated
++    /// tests (per-exclusion comments below); everything else is unrestricted.
++    #[hegel::composite]
++    pub fn safe_numbers(tc: hegel::TestCase) -> Number {
++        tc.draw(hegel::one_of!(
++            // i64::MIN excluded: parsing its serialized form
++            // `-9223372036854775808` panics with "attempt to negate with
++            // overflow" in debug builds. KNOWN BUG, pinned by
++            // `prop_parse_negated_integer_literal_is_nonpositive` in tests/de.rs.
++            generators::integers::<i64>()
++                .min_value(i64::MIN + 1)
++                .map(Number::from)
++                .boxed(),
++            generators::integers::<u64>().map(Number::from).boxed(),
++            // Floats bounded to (-2^63, 2^63): `Number::from_f64` corrupts
++            // whole-valued floats with magnitude >= 2^63 (saturating `as i64`
++            // cast). KNOWN BUG, pinned by
++            // `prop_number_from_f64_roundtrips_value` in tests/ser.rs.
++            generators::floats::<f64>()
++                .min_value(-9.0e18)
++                .max_value(9.0e18)
++                .map(|f| Number::from_f64(f).expect("finite float"))
++                .boxed(),
++            generators::sampled_from(vec![5e-324, -5e-324, 0.1, 1e-300, f64::EPSILON])
++                .map(|f| Number::from_f64(f).expect("finite float"))
++                .boxed(),
++        ))
++    }
++
++    /// Arbitrary "value-like" expressions: null, bools, numbers, strings,
++    /// arrays and objects, nested up to `depth`.
++    pub fn exprs(depth: u32) -> BoxedGenerator<'static, Expression> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 3 } else { 5 };
++            match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++                0 => Expression::Null,
++                1 => Expression::Bool(tc.draw(generators::booleans())),
++                2 => Expression::Number(tc.draw(safe_numbers())),
++                3 => Expression::String(tc.draw(escape_safe_strings())),
++                4 => Expression::Array(tc.draw(generators::vecs(exprs(depth - 1)).max_size(3))),
++                _ => {
++                    // The keyword identifiers `true`/`false`/`null`/`for` are
++                    // excluded as *object keys*: they serialize bare, and
++                    // either re-parse as literal expressions instead of
++                    // identifier keys (`true`/`false`/`null`) or make the
++                    // whole object unparseable (`for` starts a for
++                    // expression). KNOWN BUG, pinned by
++                    // `prop_keyword_object_keys_roundtrip` in tests/ser.rs.
++                    let ident_keys: Vec<String> = tc.draw(
++                        generators::vecs(idents().filter(|k| {
++                            !matches!(k.as_str(), "true" | "false" | "null" | "for")
++                        }))
++                        .max_size(2)
++                        .unique(true),
++                    );
++                    let string_keys: Vec<String> =
++                        tc.draw(generators::vecs(escape_safe_strings()).max_size(2).unique(true));
++                    let mut object = Object::new();
++                    for key in ident_keys {
++                        let value = tc.draw(exprs(depth - 1));
++                        object.insert(ObjectKey::Identifier(Identifier::unchecked(key)), value);
++                    }
++                    for key in string_keys {
++                        let value = tc.draw(exprs(depth - 1));
++                        object.insert(ObjectKey::from(key), value);
++                    }
++                    Expression::Object(object)
++                }
++            }
++        })
++        .boxed()
++    }
++
++    /// Arbitrary HCL bodies: attributes (unique keys per body level, as
++    /// required by the parser) and nested blocks with identifier or string
++    /// labels, nested up to `depth`.
++    pub fn bodies(depth: u32) -> BoxedGenerator<'static, Body> {
++        hegel::compose!(|tc| {
++            let attr_keys: Vec<String> =
++                tc.draw(generators::vecs(idents()).max_size(3).unique(true));
++            let mut structures: Vec<Structure> = Vec::new();
++            for key in attr_keys {
++                let expr = tc.draw(exprs(2));
++                structures.push(Structure::Attribute(Attribute::new(
++                    Identifier::unchecked(key),
++                    expr,
++                )));
++            }
++            if depth > 0 {
++                let num_blocks = tc.draw(generators::integers::<u8>().max_value(2));
++                for _ in 0..num_blocks {
++                    let identifier = Identifier::unchecked(tc.draw(idents()));
++                    let num_labels = tc.draw(generators::integers::<u8>().max_value(2));
++                    let mut labels = Vec::new();
++                    for _ in 0..num_labels {
++                        if tc.draw(generators::booleans()) {
++                            labels.push(BlockLabel::Identifier(Identifier::unchecked(
++                                tc.draw(idents()),
++                            )));
++                        } else {
++                            labels.push(BlockLabel::String(tc.draw(escape_safe_strings())));
++                        }
++                    }
++                    let body: Body = tc.draw(bodies(depth - 1));
++                    structures.push(Structure::Block(Block {
++                        identifier,
++                        labels,
++                        body,
++                    }));
++                }
++            }
++            structures.into_iter().collect()
++        })
++        .boxed()
++    }
++
++    /// Arbitrary `hcl::Value` trees nested up to `depth`.
++    pub fn values(depth: u32) -> BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 3 } else { 5 };
++            match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++                0 => Value::Null,
++                1 => Value::Bool(tc.draw(generators::booleans())),
++                2 => Value::Number(tc.draw(safe_numbers())),
++                3 => Value::String(tc.draw(escape_safe_strings())),
++                4 => Value::Array(tc.draw(generators::vecs(values(depth - 1)).max_size(3))),
++                _ => {
++                    let keys: Vec<String> = tc.draw(
++                        generators::vecs(escape_safe_strings()).max_size(3).unique(true),
++                    );
++                    let mut map = Map::new();
++                    for key in keys {
++                        let value = tc.draw(values(depth - 1));
++                        map.insert(key, value);
++                    }
++                    Value::Object(map)
++                }
++            }
++        })
++        .boxed()
++    }
++
++    /// Top-level `hcl::Value`s as accepted by `hcl::to_string`: an object
++    /// whose keys are valid identifiers (attribute keys).
++    #[hegel::composite]
++    pub fn top_level_values(tc: hegel::TestCase) -> Value {
++        let keys: Vec<String> = tc.draw(generators::vecs(idents()).max_size(3).unique(true));
++        let mut map = Map::new();
++        for key in keys {
++            let value = tc.draw(values(2));
++            map.insert(key, value);
++        }
++        Value::Object(map)
++    }
++}
+diff --git a/crates/hcl-rs/tests/de.rs b/crates/hcl-rs/tests/de.rs
+index d7a20ef..1eedd01 100644
+--- a/crates/hcl-rs/tests/de.rs
++++ b/crates/hcl-rs/tests/de.rs
+@@ -458,3 +458,170 @@ fn terraform() {
+ 
+     assert_deserialize(input, expected);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod props {
++    use crate::common::gen;
++    use hcl::{Expression, Value};
++    use hegel::generators::{self, Generator};
++
++    /// `hcl::parse` / `hcl::from_str` must never panic on arbitrary input:
++    /// they return `Err` for anything that is not valid HCL.
++    #[hegel::test]
++    fn prop_parse_never_panics_on_arbitrary_text(tc: hegel::TestCase) {
++        let input = tc.draw(generators::text().max_size(200));
++        drop(hcl::parse(&input));
++        drop(hcl::from_str::<Value>(&input));
++    }
++
++    /// Fragments of HCL syntax, assembled in arbitrary order. This explores
++    /// "almost valid" inputs (unclosed heredocs, dangling template markers,
++    /// operators in odd positions) much more densely than uniform text.
++    #[hegel::test]
++    fn prop_parse_never_panics_on_hcl_shaped_text(tc: hegel::TestCase) {
++        const FRAGMENTS: &[&str] = &[
++            "a", "b", "=", "{", "}", "[", "]", "(", ")", "\"", "\\", "${", "%{", "$${", "<<EOT",
++            "<<-EOT", "EOT", "\n", " ", ",", ".", "*", "-", "!", "?", ":", "0", "1.5", "0x1",
++            "1e10", "true", "false", "null", "for", "in", "if", "else", "endif", "endfor", "&&",
++            "||", "==", "...", "~", "$", "%", "#", "//", "/*", "*/", "\t", "🦀", "\u{2028}", "\r",
++        ];
++        let parts: Vec<String> = tc.draw(
++            generators::vecs(generators::sampled_from(
++                FRAGMENTS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
++            ))
++            .max_size(40),
++        );
++        let input = parts.concat();
++        drop(hcl::parse(&input));
++        drop(hcl::from_str::<Value>(&input));
++    }
++
++    /// Nested arrays/objects/blocks/parens/templates must parse (or error)
++    /// without crashing.
++    ///
++    /// The depth is capped at 40 because the parser's recursion overflows the
++    /// stack and ABORTS THE PROCESS at surprisingly shallow depths (~100 for
++    /// nested objects/blocks on a 2 MiB test thread). KNOWN BUG, pinned by
++    /// the `#[ignore]`d reproducer `deeply_nested_input_overflows_stack`
++    /// below; the cap protects this test's process, not the library's
++    /// contract.
++    #[hegel::test]
++    fn prop_parse_never_panics_on_nested_input(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().max_value(40));
++        let shape = tc.draw(generators::integers::<u8>().max_value(5));
++        let input = match shape {
++            0 => format!("a = {}{}", "[".repeat(depth), "]".repeat(depth)),
++            1 => format!("a = {}0{}", "{b=".repeat(depth), "}".repeat(depth)),
++            2 => format!("{}{}", "b {\n".repeat(depth), "}\n".repeat(depth)),
++            3 => format!("a = {}1{}", "(".repeat(depth), ")".repeat(depth)),
++            4 => format!("a = {}1", "-".repeat(depth)),
++            _ => format!("a = \"{}x{}\"", "${".repeat(depth), "}".repeat(depth)),
++        };
++        drop(hcl::parse(&input));
++        drop(hcl::from_str::<Value>(&input));
++    }
++
++    /// KNOWN BUG (process abort): parsing deeply nested input overflows the
++    /// stack and aborts the whole process instead of returning an error.
++    /// `hcl::parse` is the documented entry point for untrusted input, so
++    /// this is a denial-of-service vector. On a 2 MiB thread the overflow
++    /// already happens at depth ~100 for nested objects/blocks, ~150 for
++    /// arrays and ~200 for parens/unary operators (debug build).
++    ///
++    /// Ignored because a stack overflow cannot be caught: running this test
++    /// takes down the entire test binary.
++    #[test]
++    #[ignore = "KNOWN BUG: aborts the process with a stack overflow"]
++    fn deeply_nested_input_overflows_stack() {
++        let depth = 4096;
++        let input = format!("a = {}0{}", "{b=".repeat(depth), "}".repeat(depth));
++        drop(hcl::parse(&input)); // aborts: stack overflow
++    }
++
++    /// A negated integer literal `-N` (N a decimal u64 literal) must parse to
++    /// a non-positive number.
++    ///
++    /// KNOWN FAILURE: the parser folds unary minus via `N::neg`
++    /// (crates/hcl-primitives/src/number.rs), which negates through a
++    /// wrapping/saturating `as i64` cast:
++    /// - `a = -9223372036854775808` (i64::MIN) panics with "attempt to negate
++    ///   with overflow" in debug builds;
++    /// - `a = -9223372036854775809` silently parses as +9223372036854775807;
++    /// - `a = -18446744073709551615` silently parses as +1.
++    /// The sampled branch below makes the failure deterministic.
++    #[hegel::test(test_cases = 256)]
++    fn prop_parse_negated_integer_literal_is_nonpositive(tc: hegel::TestCase) {
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().boxed(),
++            // Boost the buggy region at and above 2^63 so the known failure
++            // reproduces on every run.
++            generators::sampled_from(vec![
++                9223372036854775808u64, // 2^63: panics in debug builds
++                9223372036854775809,    // parses as +9223372036854775807
++                u64::MAX,               // parses as +1
++            ])
++            .boxed(),
++        ));
++        let input = format!("a = -{n}");
++        let body = hcl::parse(&input)
++            .unwrap_or_else(|err| panic!("`{input}` failed to parse: {err}"));
++        let attr = body.attributes().next().expect("one attribute");
++        match &attr.expr {
++            Expression::Number(num) => {
++                let f = num.as_f64().expect("number is representable as f64");
++                assert!(f <= 0.0, "`{input}` parsed as positive number {num}");
++            }
++            // If the parser chose not to fold the negation, an explicit
++            // unary operation on a non-negative literal is also correct.
++            Expression::Operation(_) => {}
++            other => panic!("`{input}` parsed as unexpected expression: {other:?}"),
++        }
++    }
++
++    /// Deserializing a `Body` directly (`hcl::from_body`) must agree with
++    /// serializing it to text and parsing that (`hcl::from_str`). Both routes
++    /// apply the HCL JSON spec's block-merging rules, so they must produce
++    /// identical `Value`s.
++    #[hegel::test]
++    fn prop_from_body_agrees_with_parsing_serialized_body(tc: hegel::TestCase) {
++        let body = tc.draw(gen::bodies(2));
++        let via_body: Value =
++            hcl::from_body(body.clone()).expect("from_body on a literal body must not fail");
++        let text = hcl::to_string(&body).unwrap();
++        let via_text: Value = hcl::from_str(&text)
++            .unwrap_or_else(|err| panic!("serialized body failed to re-parse: {err}\n---\n{text}"));
++        assert_eq!(via_body, via_text, "from_body != from_str∘to_string\n---\n{text}");
++    }
++
++    /// `k = {}` must parse as an attribute named `k`; `k {}` and
++    /// `k "label" {}` must parse as blocks — for every valid identifier,
++    /// including keywords, dashes and unicode.
++    #[hegel::test]
++    fn prop_attribute_vs_block_disambiguation(tc: hegel::TestCase) {
++        let k = tc.draw(gen::idents());
++
++        let body = hcl::parse(&format!("{k} = {{}}\n"))
++            .unwrap_or_else(|err| panic!("`{k} = {{}}` failed to parse: {err}"));
++        assert_eq!(body.blocks().count(), 0);
++        let attr = body.attributes().next().expect("attribute");
++        assert_eq!(attr.key.as_str(), k);
++        assert!(matches!(attr.expr, Expression::Object(_)));
++
++        let body = hcl::parse(&format!("{k} {{}}\n"))
++            .unwrap_or_else(|err| panic!("`{k} {{}}` failed to parse: {err}"));
++        assert_eq!(body.attributes().count(), 0);
++        let block = body.blocks().next().expect("block");
++        assert_eq!(block.identifier.as_str(), k);
++        assert!(block.labels.is_empty());
++
++        let label = tc.draw(gen::idents());
++        let body = hcl::parse(&format!("{k} {label} {{}}\n"))
++            .unwrap_or_else(|err| panic!("`{k} {label} {{}}` failed to parse: {err}"));
++        let block = body.blocks().next().expect("labeled block");
++        assert_eq!(block.identifier.as_str(), k);
++        assert_eq!(block.labels.len(), 1);
++    }
++}
+diff --git a/crates/hcl-rs/tests/format.rs b/crates/hcl-rs/tests/format.rs
+index 9269e83..6165418 100644
+--- a/crates/hcl-rs/tests/format.rs
++++ b/crates/hcl-rs/tests/format.rs
+@@ -297,3 +297,45 @@ fn traversal() {
+ fn empty_block() {
+     assert_format(hcl::block!(empty {}), "empty {}\n");
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod props {
++    use crate::common::gen;
++    use hcl::Value;
++    use hegel::generators::{self, Generator};
++
++    /// `hcl::format::to_string` (the `Format` trait path) on a `Value` must
++    /// produce text that parses back to an equal `Value` when embedded as an
++    /// attribute expression.
++    ///
++    /// KNOWN FAILURE: unlike the serde serializer (`hcl::to_string`), the
++    /// `Format` impl for `Value` writes strings that merely *look* templated
++    /// (`is_templated` in src/util.rs) verbatim, without escaping. For a
++    /// string that is not a valid template — e.g. `"${x"` or a templated
++    /// string containing a raw newline — the output is invalid HCL and fails
++    /// to parse; roundtripping a valid `Value` through `format::to_string`
++    /// errors out. The `just` branch below makes the failure deterministic.
++    #[hegel::test(test_cases = 256)]
++    fn prop_format_value_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw(hegel::one_of!(
++            gen::values(2),
++            // Deterministic pin: an invalid template fragment.
++            generators::just(Value::String("${x".to_string())).boxed(),
++        ));
++        let formatted =
++            hcl::format::to_string(&value).expect("formatting a Value must not fail");
++        let document = format!("a = {formatted}\n");
++        let parsed = match hcl::parse(&document) {
++            Ok(parsed) => parsed,
++            Err(err) => panic!(
++                "format::to_string produced unparseable HCL for {value:?}: {err}\n---\n{document}"
++            ),
++        };
++        let attr = parsed.attributes().next().expect("one attribute");
++        let back = Value::from(attr.expr.clone());
++        assert_eq!(back, value, "Value drifted through format::to_string\n---\n{document}");
++    }
++}
+diff --git a/crates/hcl-rs/tests/ser.rs b/crates/hcl-rs/tests/ser.rs
+index a500e19..8074a7b 100644
+--- a/crates/hcl-rs/tests/ser.rs
++++ b/crates/hcl-rs/tests/ser.rs
+@@ -206,3 +206,185 @@ fn identifiers_with_hyphens() {
+         "hyphen-ated = null\n",
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod props {
++    use crate::common::gen;
++    use hcl::structure::{Attribute, Body};
++    use hcl::{Expression, Identifier, Number, Value};
++    use hegel::generators::{self, Generator};
++
++    /// Serializing an arbitrary `Body` and parsing the result must yield the
++    /// same `Body`, and re-serializing must reproduce the exact same text
++    /// (fixpoint).
++    #[hegel::test]
++    fn prop_body_serialize_parse_fixpoint(tc: hegel::TestCase) {
++        let body = tc.draw(gen::bodies(2));
++        let text = hcl::to_string(&body).expect("serializing a Body must not fail");
++        let parsed = match hcl::parse(&text) {
++            Ok(parsed) => parsed,
++            Err(err) => panic!("serialized body failed to re-parse: {err}\n---\n{text}"),
++        };
++        assert_eq!(parsed, body, "parse(to_string(body)) != body\n---\n{text}");
++        let text2 = hcl::to_string(&parsed).unwrap();
++        assert_eq!(text2, text, "to_string/parse is not a fixpoint");
++    }
++
++    /// Serializing an arbitrary top-level `Value` and deserializing the
++    /// result must yield the same `Value`, and re-serializing must reproduce
++    /// the exact same text (fixpoint).
++    #[hegel::test]
++    fn prop_value_serialize_parse_fixpoint(tc: hegel::TestCase) {
++        let value = tc.draw(gen::top_level_values());
++        let text = hcl::to_string(&value).expect("serializing a Value must not fail");
++        let parsed: Value = match hcl::from_str(&text) {
++            Ok(parsed) => parsed,
++            Err(err) => panic!("serialized value failed to re-parse: {err}\n---\n{text}"),
++        };
++        assert_eq!(parsed, value, "from_str(to_string(value)) != value\n---\n{text}");
++        let text2 = hcl::to_string(&parsed).unwrap();
++        assert_eq!(text2, text, "to_string/from_str is not a fixpoint");
++    }
++
++    /// String attribute values generated at the escape boundary (quotes,
++    /// backslashes, control chars, `${` / `%{` template markers, unicode)
++    /// must round-trip exactly through serialize + parse.
++    ///
++    /// KNOWN FAILURE: `hcl_primitives::template::escape_markers` consumes
++    /// `$`/`%` pairs blindly while scanning, so a `$` run directly before `{`
++    /// misaligns the scan and an escaped-marker sequence is left unescaped:
++    /// `"${$${"` is escaped to `"$${$${"` (instead of `"$${$$${"`), which
++    /// parses back as `"${${"` — silent string corruption. The sampled branch
++    /// below makes the failure deterministic. Sibling properties avoid the
++    /// buggy class via `gen::escape_safe_strings`.
++    #[hegel::test(test_cases = 256)]
++    fn prop_string_escape_roundtrip(tc: hegel::TestCase) {
++        let string = tc.draw(hegel::one_of!(
++            gen::tricky_strings(),
++            // Boost the buggy region so the known failure reproduces on
++            // every run.
++            generators::sampled_from(vec!["${$${".to_string(), "%{%%{".to_string()]).boxed(),
++        ));
++        let body: Body = std::iter::once(hcl::structure::Structure::Attribute(Attribute::new(
++            Identifier::unchecked("a"),
++            Expression::String(string.clone()),
++        )))
++        .collect();
++        let text = hcl::to_string(&body).unwrap();
++        let parsed = match hcl::parse(&text) {
++            Ok(parsed) => parsed,
++            Err(err) => panic!("escaped string {string:?} failed to re-parse: {err}\n---\n{text}"),
++        };
++        assert_eq!(parsed, body, "string {string:?} did not roundtrip\n---\n{text}");
++        let text2 = hcl::to_string(&parsed).unwrap();
++        assert_eq!(text2, text, "string escaping is not a fixpoint");
++    }
++
++    /// Object keys that are keyword identifiers (`true`, `false`, `null`,
++    /// `for`) must round-trip through serialize + parse like any other
++    /// identifier key.
++    ///
++    /// KNOWN FAILURE: keyword identifier keys are serialized bare, which
++    /// changes their meaning on re-parse:
++    /// - `ObjectKey::Identifier(Identifier::unchecked("true"))` serializes to
++    ///   `{ true = ... }` and re-parses as the *literal expression key*
++    ///   `ObjectKey::Expression(Expression::Bool(true))`. As a consequence
++    ///   `hcl::from_str::<Value>` even fails on such documents ("invalid
++    ///   type: boolean `true`, expected a string") while `hcl::from_body` on
++    ///   the original body succeeds. Same for `false` and `null`.
++    /// - An object key `for` serializes to `{ for = ... }`, which does not
++    ///   parse at all (the parser starts a `for` expression).
++    /// Sibling properties exclude keyword object keys in `gen::exprs`.
++    #[hegel::test]
++    fn prop_keyword_object_keys_roundtrip(tc: hegel::TestCase) {
++        let keyword = tc.draw(generators::sampled_from(vec![
++            "true".to_string(),
++            "false".to_string(),
++            "null".to_string(),
++            "for".to_string(),
++        ]));
++        let mut object = hcl::Object::new();
++        object.insert(
++            hcl::ObjectKey::Identifier(Identifier::unchecked(keyword.clone())),
++            Expression::Null,
++        );
++        let body: Body = std::iter::once(hcl::structure::Structure::Attribute(Attribute::new(
++            Identifier::unchecked("a"),
++            Expression::Object(object),
++        )))
++        .collect();
++        let text = hcl::to_string(&body).unwrap();
++        let parsed = hcl::parse(&text)
++            .unwrap_or_else(|err| panic!("`{text}` failed to parse: {err}"));
++        assert_eq!(
++            parsed, body,
++            "object key `{keyword}` changed type on re-parse\n---\n{text}"
++        );
++    }
++
++    /// Numbers must round-trip through serialize + parse with the same value
++    /// and the same internal representation (integer vs float).
++    #[hegel::test]
++    fn prop_number_serialize_parse_roundtrip(tc: hegel::TestCase) {
++        let number = tc.draw(gen::safe_numbers());
++        let body: Body = std::iter::once(hcl::structure::Structure::Attribute(Attribute::new(
++            Identifier::unchecked("n"),
++            Expression::Number(number.clone()),
++        )))
++        .collect();
++        let text = hcl::to_string(&body).unwrap();
++        let parsed = hcl::parse(&text)
++            .unwrap_or_else(|err| panic!("number {number} failed to re-parse: {err}"));
++        let attr = parsed.attributes().next().expect("one attribute");
++        let Expression::Number(back) = &attr.expr else {
++            panic!("number {number} re-parsed as non-number: {:?}", attr.expr);
++        };
++        assert_eq!(*back, number, "number value drifted\n---\n{text}");
++        assert_eq!(back.is_f64(), number.is_f64(), "number type drifted");
++        assert_eq!(back.is_u64(), number.is_u64(), "number type drifted");
++        assert_eq!(back.is_i64(), number.is_i64(), "number type drifted");
++    }
++
++    /// `Number::from_f64` must preserve the value of any finite float:
++    /// `Number::from_f64(f).as_f64() == Some(f)`.
++    ///
++    /// KNOWN FAILURE: whole-valued floats with magnitude >= 2^63 are corrupted
++    /// by a saturating `as i64` cast in `N::from_finite_f64`
++    /// (crates/hcl-primitives/src/number.rs): `Number::from_f64(1e300)`
++    /// becomes `9223372036854775807`. This also corrupts `Value::from(f64)`
++    /// and every serde serialization of large float fields. The sampled
++    /// branch below makes the failure deterministic.
++    #[hegel::test(test_cases = 256)]
++    fn prop_number_from_f64_roundtrips_value(tc: hegel::TestCase) {
++        let f = tc.draw(hegel::one_of!(
++            generators::floats::<f64>()
++                .allow_nan(false)
++                .allow_infinity(false)
++                .boxed(),
++            // Boost the buggy region (whole floats >= 2^63) so the known
++            // failure reproduces on every run.
++            generators::sampled_from(vec![1e19f64, -1e19, 9.3e18, 1e300, -1e300]).boxed(),
++        ));
++        let number = Number::from_f64(f).expect("finite float");
++        assert_eq!(
++            number.as_f64(),
++            Some(f),
++            "Number::from_f64({f:?}) lost the value: became {number}"
++        );
++    }
++
++    /// An `hcl::Value` must survive a round-trip through its serde JSON
++    /// representation (HCL has a documented JSON interop story; `serde_json`
++    /// is the reference JSON implementation).
++    #[hegel::test]
++    fn prop_value_json_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw(gen::values(3));
++        let json = serde_json::to_string(&value).expect("Value serializes to JSON");
++        let back: Value = serde_json::from_str(&json)
++            .unwrap_or_else(|err| panic!("JSON {json} failed to deserialize: {err}"));
++        assert_eq!(back, value, "Value drifted through JSON: {json}");
++    }
++}
+diff --git a/crates/hcl-rs/tests/template.rs b/crates/hcl-rs/tests/template.rs
+index 4266a4a..e5fd55d 100644
+--- a/crates/hcl-rs/tests/template.rs
++++ b/crates/hcl-rs/tests/template.rs
+@@ -21,3 +21,40 @@ fn from_expr() {
+ 
+     assert_eq!(Template::from_expr(&expr).unwrap(), expected);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod props {
++    use hcl::Template;
++    use hegel::generators::{self, Generator};
++    use std::str::FromStr;
++
++    /// The template sub-language parser must never panic: arbitrary text and
++    /// template-shaped text (interpolations, directives, strip markers, in
++    /// arbitrary order) either parse or return an error. The same input
++    /// embedded as a quoted attribute value must not panic the main parser
++    /// either.
++    #[hegel::test]
++    fn prop_template_parse_never_panics(tc: hegel::TestCase) {
++        const FRAGMENTS: &[&str] = &[
++            "${", "}", "%{", "~", " if ", " else ", " endif ", " for ", " in ", " endfor ", "x",
++            "a.b", "\"", "\\", "$", "%", "$${", "%%{", " ", "\n", "1", "!", "==", "?", ":", "🦀",
++        ];
++        let input = tc.draw(hegel::one_of!(
++            generators::text().max_size(100).boxed(),
++            generators::vecs(generators::sampled_from(
++                FRAGMENTS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
++            ))
++            .max_size(20)
++            .map(|parts| parts.concat())
++            .boxed(),
++        ));
++        drop(Template::from_str(&input));
++        // The same content as a quoted template expression inside a document
++        // (quotes/newlines in `input` make this invalid HCL — that must
++        // produce an Err, never a panic).
++        drop(hcl::parse(&format!("a = \"{input}\"")));
++    }
++}

@@ -1,0 +1,764 @@
+diff --git a/.gitignore b/.gitignore
+index a9d37c5..16f6b9f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ target
+ Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 5d482f4..f2e6c58 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,9 @@ log = { version = "0.4.17", optional = true }
+ memchr = { version = "2.7.4", default-features = false }
+ serde = { version = "1.0.160", features = ["derive"], optional = true }
+ 
++[dev-dependencies]
++hegeltest = "0.28.2"
++
+ [package.metadata.docs.rs]
+ all-features = true
+ rustdoc-args = ["--cfg", "docsrs"]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..547e953
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,186 @@
++# Hegel Property-Based Testing Report: `vte` 0.15.0
++
++Tests were added with `hegeltest` 0.28.2 (`cargo add --dev hegeltest --ignore-rust-version`;
++the crate pins `rust-version = 1.62.1`, below hegeltest's MSRV of 1.86).
++
++Test locations follow the skill's "modify existing test files" rule:
++
++- `src/lib.rs` (existing `mod tests`) — 10 parser properties
++- `src/params.rs` (new `#[cfg(test)] mod tests`; the file had none) — 2 `Params` properties
++- `src/ansi.rs` (existing `mod tests`, `ansi` + `std` features) — 1 `Processor` property
++
++## Properties tested
++
++| # | Property | Test | Evidence |
++|---|----------|------|----------|
++| 1 | `Parser::advance` never panics on arbitrary bytes fed in arbitrary chunks through one reused parser | `tests::advance_never_panics_on_arbitrary_chunked_input` | Parse robustness (Tier 1): the parser consumes untrusted PTY data; docs say it implements the DEC ANSI state machine which is total over all bytes |
++| 2 | Feeding input in arbitrary chunks produces exactly the same dispatch sequence as feeding it whole | `tests::chunked_advance_equals_whole_input_advance` | The `partial_utf8` buffer exists solely for this; existing unit tests `partial_utf8`, `partial_invalid_utf8`, `partial_utf8_separating_utf8` assert specific instances |
++| 3 | `Perform::print` never receives C0/C1 control characters | `tests::print_never_receives_control_chars` | `Perform::execute` doc: "Execute a C0 or C1 control function"; `ground_dispatch` routes `\x00..=\x1f` and `\u{80}..=\u{9f}` to `execute` |
++| 4 | `Perform::execute` only receives C0/C1 control bytes | `tests::execute_only_receives_control_bytes` | Same doc contract, opposite direction |
++| 5 | A well-formed CSI sequence (arbitrary params/subparams within `MAX_PARAMS`, optional private marker, ≤2 intermediates, final byte `0x40..=0x7E`) round-trips into exactly one `csi_dispatch` with that data and `ignore == false` | `tests::csi_roundtrip` | Generalizes existing unit tests `parse_csi_*`, `csi_subparameters`, `esc_reset`; state-machine byte ranges in `advance_csi_*` |
++| 6 | An OSC sequence with arbitrary parameter byte strings round-trips into one `osc_dispatch` with those params and the right `bell_terminated` flag | `tests::osc_roundtrip` | Generalizes `parse_osc`, `osc_bell_terminated`, `osc_c0_st_terminated`, `osc_containing_string_terminator` |
++| 7 | Numeric CSI params saturate at `u16::MAX` for arbitrary `u64` values, leading zeros irrelevant | `tests::csi_param_saturates_at_u16_max` | `action_paramnext` uses `saturating_mul`/`saturating_add`; unit test `parse_long_csi_param` checks one instance |
++| 8 | DCS callback protocol: `put`/`unhook` only occur between `hook` and its matching `unhook`; hooks never nest | `tests::dcs_hook_put_unhook_protocol` | `Perform::hook`/`put`/`unhook` docs describe this handler lifecycle |
++| 9 | Dispatched data respects documented size limits: ≤ `MAX_PARAMS` (sub)params, ≤ `MAX_INTERMEDIATES` intermediates, ≤ `MAX_OSC_PARAMS` OSC params, CSI action char in `0x40..=0x7E`, no empty subparam slices | `tests::dispatched_data_respects_size_limits` | The `MAX_*` constants plus the `ignore`-flag documentation on `csi_dispatch`/`hook` |
++| 10 | `advance_until_terminated` is equivalent to `advance`: terminating at arbitrary points and resuming with the remaining bytes yields the same total dispatch sequence | `tests::advance_until_terminated_resumes_to_same_dispatches` | Method doc: "This is equivalent to `Self::advance`, but stops when..."; `#[must_use]` note says the return value is for processing remaining bytes |
++| 11 | `Params` agrees with a `Vec<Vec<u16>>` model under every `push`/`extend`/`clear` sequence (stateful model test, `#[hegel::state_machine]`), including `len`/`is_empty` consistency | `params::tests::params_agree_with_model` | Model test (Tier 1); operations guarded by `is_full` exactly as at all call sites in `lib.rs` |
++| 12 | `ParamsIter::size_hint` satisfies the `Iterator` contract: lower bound ≤ items yielded ≤ upper bound | `params::tests::params_iter_size_hint_is_consistent` | std `Iterator::size_hint` documented contract |
++| 13 | `ansi::Processor::advance` never panics and always makes progress on arbitrary chunked bytes with synchronized-update escapes (BSU/ESU) mixed in | `ansi::tests::processor_advance_never_panics` | Feature-flag testing (`ansi` is non-default); the `advance` loop plus sync buffering (`advance_sync`) is the crate's most intricate control flow |
++
++Generators: input is assembled from raw binary, valid UTF-8 text, and single
++codepoints with the C1 range (`U+0080..=U+009F`) boosted via `one_of!`
++(a boundary conjunction per the skill: the bug at #2/#3 needs a C1 codepoint
++*and* a chunk split inside its encoding). Escape-state properties use bytes
++biased toward escape-sequence syntax so CSI/OSC/DCS states and their size
++limits are actually reached.
++
++## Test results
++
++Run with `cargo test --features ansi` (also run: default features, and
++`--no-default-features`; identical outcomes for the tests that build there).
++
++| Test | Result |
++|------|--------|
++| `tests::advance_never_panics_on_arbitrary_chunked_input` | PASS |
++| `tests::chunked_advance_equals_whole_input_advance` | **FAIL — suspected real bug 1** |
++| `tests::print_never_receives_control_chars` | **FAIL — same root cause as bug 1** |
++| `tests::execute_only_receives_control_bytes` | PASS |
++| `tests::csi_roundtrip` | PASS |
++| `tests::osc_roundtrip` | PASS |
++| `tests::csi_param_saturates_at_u16_max` | PASS |
++| `tests::dcs_hook_put_unhook_protocol` | PASS |
++| `tests::dispatched_data_respects_size_limits` | PASS |
++| `tests::advance_until_terminated_resumes_to_same_dispatches` | PASS |
++| `params::tests::params_agree_with_model` | PASS |
++| `params::tests::params_iter_size_hint_is_consistent` | **FAIL — suspected real bug 2** |
++| `ansi::tests::processor_advance_never_panics` | PASS |
++
++All 54 pre-existing unit tests still pass. Liveness was verified by
++temporarily inverting the assertion in `csi_param_saturates_at_u16_max`
++(hegel shrank to `value = 0, leading_zeros = 0`) and reverting. An
++exploratory 10x run (`test_cases = 1000` on every property, then reverted)
++found nothing beyond the failures below.
++
++## Suspected bugs
++
++### Bug 1: C1 controls split across `advance` calls are printed instead of executed
++
++Minimal counterexample (shrunk by hegel): bytes `[0xC2, 0x80]` (UTF-8 for
++`U+0080`), fed as `advance(&[0xC2])` then `advance(&[0x80])`.
++
++- Whole input: `Execute(0x80)`
++- Chunked: `Print('\u{80}')`
++
++Why it's a library bug: `ground_dispatch` deliberately routes decoded
++`'\u{80}'..='\u{9f}'` characters to `Perform::execute` ("Execute a C0 or C1
++control function"), so the same byte stream produces different terminal
++actions depending on where the network/PTY read happens to split — exactly
++the divergence the `partial_utf8` machinery exists to prevent, and the
++behavior the crate's own `partial_utf8*` unit tests pin down for other cases.
++
++Code path at fault: `Parser::advance_partial_utf8` in `src/lib.rs`. Both its
++`Ok(parsed)` branch and its `valid_bytes > 0` branch call
++`performer.print(c)` unconditionally, without the C0/C1 check that
++`ground_dispatch` applies. Two of the added tests fail on this
++(`chunked_advance_equals_whole_input_advance` and
++`print_never_receives_control_chars`); both shrink to `[c2, 80]`.
++
++### Bug 2: `ParamsIter::size_hint` violates the `Iterator` contract when subparams are present
++
++Minimal counterexample (shrunk by hegel): `params.extend(0); params.push(0)`
++— one parameter consisting of two subparameters. `params.iter()` yields
++exactly 1 item, but `size_hint()` returns `(2, Some(2))`.
++
++Why it's a library bug: std documents that `size_hint`'s lower bound must
++not exceed the actual number of remaining items. Consumers such as
++`Vec::from_iter`/`collect` rely on it for pre-allocation, and
++`iter().count()` disagreeing with `size_hint().0` breaks that contract.
++
++Code path at fault: `ParamsIter::size_hint` in `src/params.rs` computes
++`self.params.len() - self.index`, but `Params::len` counts parameters *and*
++subparameters while the iterator yields one item per parameter (each item a
++slice of its subparams). The hint is only correct when no parameter has
++subparameters. (Relatedly, `Params::len`'s doc comment "Returns the number of
++parameters" is inaccurate for the same reason — it returns the total
++including subparameters, as the model test documents.)
++
++Both failing tests were left in place, per instructions; no library code was
++modified.
++
++## Unsound properties abandoned
++
++None abandoned outright. Two scoping decisions worth recording:
++
++- **CSI/OSC round-trips generate only canonical encodings.** Parameter values
++  are rendered with `to_string()`, totals are kept within `MAX_PARAMS` /
++  `MAX_OSC_PARAMS`, and OSC parameter bytes exclude C0 controls and `;`.
++  These are contract bounds, not test-convenience bounds: outside them the
++  parser is *documented* to be lossy (saturation, `ignore` flag, control
++  bytes ignored inside OSC strings), so an exact round-trip would be an
++  unsound property there. The lossy regions are still covered by the
++  saturation, size-limit, and no-panic properties.
++- **The chunk-equivalence property was expected to be possibly unsound** for
++  invalid UTF-8 (the comment in `advance_ground` about skipping invalid bytes
++  hints chunked and whole processing might legitimately differ). Tracing the
++  code showed replacement-character emission is actually consistent; the only
++  divergence found is Bug 1, which contradicts documented `execute`
++  behavior, so the property was kept at full strength.
++
++## Skill feedback
++
++Most things worked exactly as documented; the failures shrank to textbook
++minimal counterexamples, and the imperative draw style made the chunking and
++resume-loop tests easy to express. Specific notes:
++
++1. **The MSRV gotcha in the Rust reference paid off immediately.**
++   `cargo add --dev hegeltest` failed against `rust-version = 1.62.1` with
++   precisely the error the Setup section predicts, and
++   `--ignore-rust-version` worked. No time lost.
++
++2. **Gap: `#[hegel::test]` does not compile in `#![no_std]` crates without an
++   extra import.** vte is `no_std` when built with `--no-default-features`,
++   and the crate root already has `#[cfg(all(test, not(feature = "std"))))]
++   extern crate std;`. That is not enough: the macro expansion calls
++   `.to_string()` on `&str`, which needs the `ToString` *trait in scope*, and
++   a `no_std` crate has no std prelude — so every `#[hegel::test]` fails with
++   E0599 "no method named `to_string`". Fix is a one-liner in the test module
++   (`use std::string::ToString;`), but it took a failed build to discover.
++   The reference's Setup section covers edition-2015 `extern crate hegel;`
++   but says nothing about `no_std` crates; vte's category (`no-std`) suggests
++   this will recur. Suggested addition next to the edition-2015 note: "In
++   `#![no_std]` crates, test builds need both `extern crate std` and `use
++   std::string::ToString;` in the test module, because the macro expansion
++   calls `.to_string()` outside the std prelude."
++
++3. **Minor reference gap: no `char`/codepoint generator.** The generator
++   reference has text/binary but nothing for single codepoints. For UTF-8
++   boundary testing I wanted "arbitrary `char` with the C1 control range
++   boosted" and built it as `one_of!(integers::<u32>() ranges) .. char::from_u32`
++   by hand. A `generators::chars()` (or a documented idiom in the reference,
++   like the bignum digit-string idiom) would have saved the detour, and
++   ASCII-only `text()` habits are exactly what the skill warns about.
++
++4. **The "boundary conjunctions need help" paragraph in Generator Discipline
++   was load-bearing.** Bug 1 requires a C1 codepoint *and* a chunk split
++   inside its 2-byte encoding. With the C1 range boosted via `one_of!` the
++   failure reproduces at the default 100 cases; with plain
++   `generators::binary()` the conjunction is a ~10^-3 coincidence per case
++   and the committed test would likely be flaky-green. The skill text told me
++   to do this before I knew the bug existed.
++
++5. **Stateful testing section was accurate** (rules with `tc.assume` guards,
++   invariants running on the initial state, `hegel::stateful::run` consuming
++   the machine). The `Params` machine worked first try.
++
++6. **Practical friction, not skill's fault but worth knowing:** hegel's dep
++   tree (hegeltest-c with cbindgen, clap, dashu, etc.) adds ~230 MB of debug
++   build artifacts. On this space-constrained box the first link failed with
++   ENOSPC; `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` kept it workable.
++   A one-line note in Setup ("the first build compiles a sizable native
++   helper crate") would set expectations.
++
++7. **Liveness-check and 10x-run advice worked as written**, including gotcha
++   13 (no global case-count override): `sed`-ing `test_cases = 1000` in and
++   out was mildly clunky but fine. The deliberate liveness failure left a
++   `.hegel/` database entry as gotcha 11 warns; deleted, and `.hegel/` added
++   to `.gitignore` per gotcha 3.
+diff --git a/src/ansi.rs b/src/ansi.rs
+index 592266e..335b354 100644
+--- a/src/ansi.rs
++++ b/src/ansi.rs
+@@ -2092,6 +2092,31 @@ mod tests {
+         }
+     }
+ 
++    /// Property: `Processor::advance` never panics and never fails to make
++    /// progress, for arbitrary bytes (with synchronized-update escapes mixed
++    /// in to exercise the sync buffering path) fed in arbitrary chunks.
++    #[hegel::test]
++    fn processor_advance_never_panics(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let mut processor = Processor::<TestSyncHandler>::new();
++        let mut handler = MockHandler::default();
++
++        let num_chunks = tc.draw(generators::integers::<usize>().max_value(6));
++        for _ in 0..num_chunks {
++            let chunk: Vec<u8> = tc.draw(hegel::one_of!(
++                generators::binary().max_size(32),
++                generators::sampled_from(vec![
++                    BSU_CSI.to_vec(),
++                    ESU_CSI.to_vec(),
++                    b"\x1b[?2026h\x1b[1m".to_vec(),
++                    b"\x1b]104".to_vec(),
++                ]),
++            ));
++            processor.advance(&mut handler, &chunk);
++        }
++    }
++
+     #[test]
+     fn parse_control_attribute() {
+         static BYTES: &[u8] = &[0x1B, b'[', b'1', b'm'];
+diff --git a/src/lib.rs b/src/lib.rs
+index 60bd823..d9ccdff 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -833,6 +833,7 @@ extern crate std;
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::string::ToString;
+     use std::vec::Vec;
+ 
+     use super::*;
+@@ -1541,4 +1542,394 @@ mod tests {
+         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
+         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+     }
++
++    // ------------------------------------------------------------------
++    // Property-based tests (hegel)
++    // ------------------------------------------------------------------
++
++    use hegel::generators::{self, Generator};
++
++    /// Feed `bytes` through a single parser in one call and collect dispatches.
++    fn dispatched_for(bytes: &[u8]) -> Vec<Sequence> {
++        let mut dispatcher = Dispatcher::default();
++        let mut parser = Parser::new();
++        parser.advance(&mut dispatcher, bytes);
++        dispatcher.dispatched
++    }
++
++    /// Feed `bytes` through a single parser split at hegel-chosen positions
++    /// (possibly producing empty chunks) and collect dispatches.
++    fn dispatched_chunked(tc: &hegel::TestCase, bytes: &[u8]) -> Vec<Sequence> {
++        let num_splits = tc.draw(generators::integers::<usize>().max_value(8));
++        let mut splits = Vec::with_capacity(num_splits);
++        for _ in 0..num_splits {
++            splits.push(tc.draw(generators::integers::<usize>().max_value(bytes.len())));
++        }
++        splits.sort_unstable();
++
++        let mut dispatcher = Dispatcher::default();
++        let mut parser = Parser::new();
++        let mut start = 0;
++        for split in splits {
++            parser.advance(&mut dispatcher, &bytes[start..split]);
++            start = split;
++        }
++        parser.advance(&mut dispatcher, &bytes[start..]);
++        dispatcher.dispatched
++    }
++
++    /// Arbitrary parser input assembled from raw bytes, valid UTF-8 text, and
++    /// single codepoints with the C1 control range boosted, so multi-byte
++    /// UTF-8 and C0/C1 boundary cases actually show up.
++    #[hegel::composite]
++    fn input_bytes(tc: hegel::TestCase) -> Vec<u8> {
++        let num_pieces = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut bytes = Vec::new();
++        for _ in 0..num_pieces {
++            match tc.draw(generators::integers::<u8>().max_value(2)) {
++                0 => bytes.extend(tc.draw(generators::binary().max_size(8))),
++                1 => bytes.extend(tc.draw(generators::text().max_size(8)).into_bytes()),
++                _ => {
++                    let code = tc.draw(hegel::one_of!(
++                        // C1 controls, which ground_dispatch handles specially.
++                        generators::integers::<u32>().min_value(0x80).max_value(0x9F),
++                        generators::integers::<u32>().max_value(0x10FFFF),
++                    ));
++                    let c = char::from_u32(code).unwrap_or('\u{FFFD}');
++                    let mut buf = [0u8; 4];
++                    bytes.extend(c.encode_utf8(&mut buf).as_bytes());
++                },
++            }
++        }
++        bytes
++    }
++
++    /// Bytes biased towards escape sequence syntax so that CSI/OSC/DCS states
++    /// and their size limits are actually reached.
++    #[hegel::composite]
++    fn escape_heavy_bytes(tc: hegel::TestCase) -> Vec<u8> {
++        let len = tc.draw(generators::integers::<usize>().max_value(96));
++        let mut bytes = Vec::with_capacity(len);
++        for _ in 0..len {
++            bytes.push(tc.draw(hegel::one_of!(
++                generators::sampled_from(vec![
++                    0x1B, b'[', b']', b'P', b';', b':', b'0', b'1', b'9', b'm', b'h', b'\\', 0x07,
++                    b' ', b'!', b'?', b'<', b'|', 0x9C,
++                ]),
++                generators::integers::<u8>(),
++            )));
++        }
++        bytes
++    }
++
++    /// Property: `advance` never panics, for arbitrary bytes fed in arbitrary
++    /// chunks through a single reused parser (parse robustness).
++    #[hegel::test]
++    fn advance_never_panics_on_arbitrary_chunked_input(tc: hegel::TestCase) {
++        let size = tc.draw(generators::integers::<usize>().max_value(1024));
++        let mut bytes: Vec<u8> = tc.draw(generators::binary().min_size(size));
++        bytes.extend(tc.draw(input_bytes()));
++        let _ = dispatched_chunked(&tc, &bytes);
++    }
++
++    /// Property: feeding input in arbitrary chunks produces exactly the same
++    /// dispatch sequence as feeding it in one call. The `partial_utf8` buffer
++    /// exists precisely to guarantee this (see the `partial_utf8*` unit tests).
++    #[hegel::test]
++    fn chunked_advance_equals_whole_input_advance(tc: hegel::TestCase) {
++        let bytes = tc.draw(input_bytes());
++        let whole = dispatched_for(&bytes);
++        let chunked = dispatched_chunked(&tc, &bytes);
++        assert_eq!(chunked, whole, "input: {:02x?}", bytes);
++    }
++
++    /// Property: `Perform::print` never receives C0/C1 control characters;
++    /// those are documented to go through `Perform::execute` instead
++    /// (see `ground_dispatch`).
++    #[hegel::test]
++    fn print_never_receives_control_chars(tc: hegel::TestCase) {
++        let bytes = tc.draw(input_bytes());
++        for seq in dispatched_chunked(&tc, &bytes) {
++            if let Sequence::Print(c) = seq {
++                assert!(
++                    !matches!(c, '\x00'..='\x1f' | '\u{80}'..='\u{9f}'),
++                    "control character {:?} was printed instead of executed; input: {:02x?}",
++                    c,
++                    bytes
++                );
++            }
++        }
++    }
++
++    /// Property: `Perform::execute` only receives C0/C1 control function
++    /// bytes, per its documentation.
++    #[hegel::test]
++    fn execute_only_receives_control_bytes(tc: hegel::TestCase) {
++        let bytes = tc.draw(input_bytes());
++        for seq in dispatched_chunked(&tc, &bytes) {
++            if let Sequence::Execute(byte) = seq {
++                assert!(
++                    matches!(byte, 0x00..=0x1F | 0x80..=0x9F),
++                    "non-control byte {:#04x} was executed; input: {:02x?}",
++                    byte,
++                    bytes
++                );
++            }
++        }
++    }
++
++    /// CSI parameter lists whose total number of (sub)parameters fits within
++    /// `MAX_PARAMS`, so a lossless dispatch is guaranteed.
++    #[hegel::composite]
++    fn csi_params(tc: hegel::TestCase) -> Vec<Vec<u16>> {
++        let num_params = tc.draw(generators::integers::<usize>().max_value(8));
++        let mut params = Vec::new();
++        let mut total = 0;
++        for _ in 0..num_params {
++            let remaining = params::MAX_PARAMS - total;
++            if remaining == 0 {
++                break;
++            }
++            let num_subparams =
++                tc.draw(generators::integers::<usize>().min_value(1).max_value(remaining.min(5)));
++            let mut param = Vec::with_capacity(num_subparams);
++            for _ in 0..num_subparams {
++                param.push(tc.draw(generators::integers::<u16>()));
++            }
++            total += num_subparams;
++            params.push(param);
++        }
++        params
++    }
++
++    /// Property: a well-formed CSI sequence built from arbitrary parameters,
++    /// subparameters, an optional private marker, and intermediates round-trips
++    /// through the parser into a single `csi_dispatch` with exactly that data.
++    #[hegel::test]
++    fn csi_roundtrip(tc: hegel::TestCase) {
++        let params = tc.draw(csi_params());
++        let marker: Option<u8> = tc.draw(generators::optional(
++            generators::integers::<u8>().min_value(0x3C).max_value(0x3F),
++        ));
++        let max_intermediates = 2 - marker.iter().len();
++        let intermediates: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().min_value(0x20).max_value(0x2F))
++                .max_size(max_intermediates),
++        );
++        let final_byte = tc.draw(generators::integers::<u8>().min_value(0x40).max_value(0x7E));
++
++        let mut input = vec![0x1B, b'['];
++        input.extend(marker);
++        let param_text = params
++            .iter()
++            .map(|param| param.iter().map(u16::to_string).collect::<Vec<_>>().join(":"))
++            .collect::<Vec<_>>()
++            .join(";");
++        input.extend(param_text.bytes());
++        input.extend(&intermediates);
++        input.push(final_byte);
++
++        // An empty parameter string dispatches as a single zero parameter.
++        let expected_params = if params.is_empty() { vec![vec![0]] } else { params.clone() };
++        let mut expected_intermediates: Vec<u8> = marker.into_iter().collect();
++        expected_intermediates.extend(&intermediates);
++
++        assert_eq!(
++            dispatched_for(&input),
++            vec![Sequence::Csi(expected_params, expected_intermediates, false, final_byte as char)]
++        );
++    }
++
++    /// Property: an OSC sequence built from arbitrary parameter byte strings
++    /// round-trips through the parser into a single `osc_dispatch` with
++    /// exactly those parameters and the right terminator flag.
++    #[hegel::test]
++    fn osc_roundtrip(tc: hegel::TestCase) {
++        let num_params =
++            tc.draw(generators::integers::<usize>().min_value(1).max_value(MAX_OSC_PARAMS));
++        let mut params: Vec<Vec<u8>> = Vec::with_capacity(num_params);
++        for _ in 0..num_params {
++            // Parameter bytes: anything except C0 controls (ignored or
++            // terminators inside OSC) and the `;` separator.
++            params.push(
++                tc.draw(
++                    generators::vecs(
++                        generators::integers::<u8>().min_value(0x20).filter(|byte| *byte != b';'),
++                    )
++                    .max_size(6),
++                ),
++            );
++        }
++        let bell_terminated = tc.draw(generators::booleans());
++
++        let mut input = vec![0x1B, b']'];
++        for (i, param) in params.iter().enumerate() {
++            if i != 0 {
++                input.push(b';');
++            }
++            input.extend(param);
++        }
++        if bell_terminated {
++            input.push(0x07);
++        } else {
++            input.extend(b"\x1b\\");
++        }
++
++        let dispatched = dispatched_for(&input);
++        let expected_osc = Sequence::Osc(params, bell_terminated);
++        if bell_terminated {
++            assert_eq!(dispatched, vec![expected_osc]);
++        } else {
++            assert_eq!(dispatched, vec![expected_osc, Sequence::Esc(Vec::new(), false, b'\\')]);
++        }
++    }
++
++    /// Property: numeric CSI parameters saturate at `u16::MAX` instead of
++    /// overflowing (see `action_paramnext` and `parse_long_csi_param`).
++    /// Leading zeros must not affect the value.
++    #[hegel::test]
++    fn csi_param_saturates_at_u16_max(tc: hegel::TestCase) {
++        let value = tc.draw(generators::integers::<u64>());
++        let leading_zeros = tc.draw(generators::integers::<usize>().max_value(3));
++        let input = format!("\x1b[{}{}m", "0".repeat(leading_zeros), value);
++
++        let expected = value.min(u64::from(u16::MAX)) as u16;
++        assert_eq!(
++            dispatched_for(input.as_bytes()),
++            vec![Sequence::Csi(vec![vec![expected]], Vec::new(), false, 'm')]
++        );
++    }
++
++    /// Property: the DCS callback protocol documented on `Perform` holds for
++    /// arbitrary input: `put` and `unhook` only occur between a `hook` and its
++    /// matching `unhook`, and hooks never nest.
++    #[hegel::test]
++    fn dcs_hook_put_unhook_protocol(tc: hegel::TestCase) {
++        let bytes = tc.draw(escape_heavy_bytes());
++        let mut hooked = false;
++        for seq in dispatched_for(&bytes) {
++            match seq {
++                Sequence::DcsHook(..) => {
++                    assert!(!hooked, "hook while already hooked; input: {:02x?}", bytes);
++                    hooked = true;
++                },
++                Sequence::DcsPut(_) => {
++                    assert!(hooked, "put outside a DCS; input: {:02x?}", bytes)
++                },
++                Sequence::DcsUnhook => {
++                    assert!(hooked, "unhook without hook; input: {:02x?}", bytes);
++                    hooked = false;
++                },
++                _ => (),
++            }
++        }
++    }
++
++    /// Property: dispatched data always respects the documented size limits:
++    /// at most `MAX_PARAMS` (sub)parameters, `MAX_INTERMEDIATES` intermediates,
++    /// `MAX_OSC_PARAMS` OSC parameters, and CSI action chars in `0x40..=0x7E`.
++    #[hegel::test]
++    fn dispatched_data_respects_size_limits(tc: hegel::TestCase) {
++        let bytes = tc.draw(escape_heavy_bytes());
++        for seq in dispatched_for(&bytes) {
++            match seq {
++                Sequence::Csi(params, intermediates, _, action) => {
++                    assert!(params.iter().map(Vec::len).sum::<usize>() <= params::MAX_PARAMS);
++                    assert!(params.iter().all(|param| !param.is_empty()));
++                    assert!(intermediates.len() <= MAX_INTERMEDIATES);
++                    assert!(matches!(action, '\x40'..='\x7E'));
++                },
++                Sequence::DcsHook(params, intermediates, _, _) => {
++                    assert!(params.iter().map(Vec::len).sum::<usize>() <= params::MAX_PARAMS);
++                    assert!(params.iter().all(|param| !param.is_empty()));
++                    assert!(intermediates.len() <= MAX_INTERMEDIATES);
++                },
++                Sequence::Osc(params, _) => assert!(params.len() <= MAX_OSC_PARAMS),
++                Sequence::Esc(intermediates, ..) => {
++                    assert!(intermediates.len() <= MAX_INTERMEDIATES)
++                },
++                _ => (),
++            }
++        }
++    }
++
++    /// A `Perform` impl that reports `terminated` once the wrapped dispatcher
++    /// has recorded at least `limit` events.
++    #[derive(Default)]
++    struct TerminatingDispatcher {
++        inner: Dispatcher,
++        limit: usize,
++    }
++
++    impl Perform for TerminatingDispatcher {
++        fn print(&mut self, c: char) {
++            self.inner.print(c);
++        }
++
++        fn execute(&mut self, byte: u8) {
++            self.inner.execute(byte);
++        }
++
++        fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
++            self.inner.hook(params, intermediates, ignore, action);
++        }
++
++        fn put(&mut self, byte: u8) {
++            self.inner.put(byte);
++        }
++
++        fn unhook(&mut self) {
++            self.inner.unhook();
++        }
++
++        fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
++            self.inner.osc_dispatch(params, bell_terminated);
++        }
++
++        fn csi_dispatch(
++            &mut self,
++            params: &Params,
++            intermediates: &[u8],
++            ignore: bool,
++            action: char,
++        ) {
++            self.inner.csi_dispatch(params, intermediates, ignore, action);
++        }
++
++        fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
++            self.inner.esc_dispatch(intermediates, ignore, byte);
++        }
++
++        fn terminated(&self) -> bool {
++            self.inner.dispatched.len() >= self.limit
++        }
++    }
++
++    /// Property: `advance_until_terminated` is documented as equivalent to
++    /// `advance`; terminating at arbitrary points and resuming with the
++    /// remaining bytes must produce the same dispatch sequence overall.
++    #[hegel::test]
++    fn advance_until_terminated_resumes_to_same_dispatches(tc: hegel::TestCase) {
++        let mut bytes = tc.draw(input_bytes());
++        bytes.extend(tc.draw(escape_heavy_bytes()));
++        let expected = dispatched_for(&bytes);
++
++        let mut parser = Parser::new();
++        let mut dispatcher = TerminatingDispatcher {
++            inner: Dispatcher::default(),
++            limit: tc.draw(generators::integers::<usize>().max_value(4)),
++        };
++        let mut processed = 0;
++        while processed < bytes.len() {
++            processed += parser.advance_until_terminated(&mut dispatcher, &bytes[processed..]);
++            if processed < bytes.len() {
++                // The parser stopped early; allow more events before resuming.
++                dispatcher.limit = dispatcher.inner.dispatched.len()
++                    + 1
++                    + tc.draw(generators::integers::<usize>().max_value(4));
++            }
++        }
++
++        assert_eq!(dispatcher.inner.dispatched, expected, "input: {:02x?}", bytes);
++    }
+ }
+diff --git a/src/params.rs b/src/params.rs
+index 967befb..9357456 100644
+--- a/src/params.rs
++++ b/src/params.rs
+@@ -142,3 +142,102 @@ impl Debug for Params {
+         write!(f, "]")
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::string::ToString;
++    use std::vec::Vec;
++
++    use hegel::generators;
++    use hegel::TestCase;
++
++    use super::*;
++
++    /// Model-based test: `Params` must agree with a simple `Vec<Vec<u16>>`
++    /// model under every sequence of `push`/`extend`/`clear` operations the
++    /// parser can perform (guarded by `is_full`, as all call sites are).
++    struct ParamsMachine {
++        subject: Params,
++        /// Completed parameters.
++        completed: Vec<Vec<u16>>,
++        /// Subparameters of the parameter currently being built via `extend`.
++        current: Vec<u16>,
++    }
++
++    #[hegel::state_machine]
++    impl ParamsMachine {
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            tc.assume(!self.subject.is_full());
++            let item = tc.draw(generators::integers::<u16>());
++            self.subject.push(item);
++
++            let mut param = core::mem::take(&mut self.current);
++            param.push(item);
++            self.completed.push(param);
++        }
++
++        #[rule]
++        fn extend(&mut self, tc: TestCase) {
++            tc.assume(!self.subject.is_full());
++            let item = tc.draw(generators::integers::<u16>());
++            self.subject.extend(item);
++            self.current.push(item);
++        }
++
++        #[rule]
++        fn clear(&mut self, _tc: TestCase) {
++            self.subject.clear();
++            self.completed.clear();
++            self.current.clear();
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _tc: TestCase) {
++            let mut expected = self.completed.clone();
++            if !self.current.is_empty() {
++                expected.push(self.current.clone());
++            }
++
++            let actual: Vec<Vec<u16>> = self.subject.iter().map(|param| param.to_vec()).collect();
++            assert_eq!(actual, expected);
++
++            let total = self.completed.iter().map(Vec::len).sum::<usize>() + self.current.len();
++            assert_eq!(self.subject.len(), total);
++            assert_eq!(self.subject.is_empty(), total == 0);
++        }
++    }
++
++    #[hegel::test]
++    fn params_agree_with_model(tc: TestCase) {
++        let machine = ParamsMachine {
++            subject: Params::default(),
++            completed: Vec::new(),
++            current: Vec::new(),
++        };
++        hegel::stateful::run(machine, tc);
++    }
++
++    /// Property: `ParamsIter::size_hint` must satisfy the `Iterator` contract:
++    /// lower bound <= actual number of items <= upper bound.
++    #[hegel::test]
++    fn params_iter_size_hint_is_consistent(tc: TestCase) {
++        let mut params = Params::default();
++        let num_ops = tc.draw(generators::integers::<usize>().max_value(MAX_PARAMS));
++        for _ in 0..num_ops {
++            let item = tc.draw(generators::integers::<u16>());
++            if tc.draw(generators::booleans()) {
++                params.push(item);
++            } else {
++                params.extend(item);
++            }
++        }
++
++        let (lower, upper) = params.iter().size_hint();
++        let count = params.iter().count();
++        assert!(lower <= count, "size_hint lower bound {} exceeds item count {}", lower, count);
++        if let Some(upper) = upper {
++            assert!(count <= upper, "item count {} exceeds size_hint upper bound {}", count, upper);
++        }
++    }
++}

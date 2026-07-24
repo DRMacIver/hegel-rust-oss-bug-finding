@@ -1,0 +1,687 @@
+diff --git a/.gitignore b/.gitignore
+index 27670e4..d7682b9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -140,4 +140,6 @@ tags
+ ### VisualStudioCode Patch ###
+ # Ignore all local history of files
+ .history
+-.ionide
+\ No newline at end of file
++.ionide
++# hegel property-based testing failure database
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index f46db52..0d20947 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,7 @@ rocket = { version = "0.5", optional = true }
+ rust_decimal = { version = "1.15", default-features = false, optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ serde_json = "1"
+ 
+ [features]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..1c1883c
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,166 @@
++# Hegel Property-Based Testing Report — `byte-unit`
++
++Property-based tests were added with [hegel](https://hegel.dev) (`hegeltest` 0.28.2, added
++with `cargo add --dev hegeltest --ignore-rust-version`; hegeltest's MSRV is 1.86 while the
++crate pins `rust-version = "1.85"` — a maintainer decision if these tests are upstreamed).
++Tests live in the existing integration test files `tests/byte.rs` (module
++`hegel_properties`) and `tests/unit.rs` (module `hegel_properties`), and run under the
++default feature set (`std` + `byte`, i.e. a `u64`-backed `Byte`). Generators and constants
++are written to stay correct under the `u128` feature as well (cfg-gated `MAX_BYTES`,
++`MAX_PRECISION`, unit lists).
++
++## Properties tested
++
++All properties draw `Byte` values from a composite generator (`arb_byte`) covering the
++full representable range, boosted toward boundaries (`0`, `1`, `MAX`) and toward exact
++multiples of every unit.
++
++### `tests/byte.rs`
++
++1. **`byte_parse_str_never_panics`** — `Byte::parse_str` never panics, on arbitrary
++   Unicode text and on near-miss numeric strings (`"<u64><junk>"` with junk like `"."`,
++   `"-"`, `"e3"`, `".."`).
++   *Evidence:* parsers must be total on `&str` (skill Tier-1 "parse robustness"); the
++   crate's own tests feed it malformed inputs expecting `Err`, never a panic.
++2. **`display_reparses_to_same_byte`** — `Byte::parse_str(byte.to_string(), _) == byte`
++   over the full range (including `u64::MAX`, exercising the parse path's `Decimal`
++   accumulation with 20-digit integers).
++   *Evidence:* the existing `parse_str` unit test includes
++   `("18446744073709551615", Byte::from_u64(u64::MAX))`; `Display` docs show plain output
++   is the byte count.
++3. **`alternate_display_reparses_to_same_byte`** — every documented alternate format style
++   (`{:#}`, `{:#.p}`, `{:-#}`, `{:>+#15.p}`, `{:#15}`, precision 0..=19) re-parses to the
++   identical `Byte`.
++   *Evidence:* alternate `Display` is documented "with an exact unit ... still precisely"
++   and is implemented on top of `get_recoverable_unit`.
++4. **`recoverable_unit_recovers_byte_exactly`** —
++   `Byte::from_decimal_with_unit(byte.get_recoverable_unit(allow_in_bits, precision)) == byte`
++   for both `allow_in_bits` values and all documented precisions (0..=19; 0..=26 under
++   `u128`).
++   *Evidence:* doc contract "Find the appropriate unit and value that can be used to
++   recover back to this `Byte` precisely."
++5. **`exact_unit_recovers_byte_exactly`** — `get_exact_unit` returns `(n, unit)` with
++   `n * unit_bytes == byte` exactly and `Byte::from_u128_with_unit(n, unit) == byte`,
++   both `allow_in_bits` values. Unit sizes come from the public `as_bits_u128() >> 3`,
++   not the private helper.
++   *Evidence:* doc contract "the largest unit which is the greatest factor".
++6. **`from_u64_with_unit_matches_u128_arithmetic`** — for every unit and full-range
++   `u64` sizes (boosted at 0/1/MAX−1/MAX), `from_u64_with_unit` agrees with independent
++   `u128` arithmetic: `ceil(n/8)` for `Bit`, `n * unit_bytes` otherwise, and returns
++   `None` exactly when the product exceeds the representable maximum.
++   *Evidence:* doc contract per constructor ("If the calculated byte is too large, this
++   function will return `None`"; "If the input unit is `Bit`, the calculated byte will be
++   rounded up").
++7. **`parse_str_matches_decimal_oracle`** — parsing constructed
++   `"<int>[.<frac>]<0-2 spaces><unit-or-empty>"` strings agrees with an independent
++   oracle: `rust_decimal`'s own string parser (`Decimal::from_str`) composed with
++   `from_decimal_with_unit`. The hand-rolled digit/fraction/whitespace loop in
++   `Byte::parse_str` is independent code from `Decimal::from_str`.
++   *Evidence:* `parse_str` docs list the accepted grammar; existing unit tests encode
++   individual instances (`"1.2kb"`, `"76.65 MB"`, `"2 kiB"`).
++8. **`appropriate_unit_selects_largest_fitting_unit`** — `get_appropriate_unit` picks a
++   unit of the requested `UnitType` that is the largest one not exceeding the byte count
++   (and `B` when nothing fits), checked against a spec-restated ascending unit ladder.
++   *Evidence:* method name/docs ("Find the appropriate unit") plus the `UnitType` docs.
++9. **`appropriate_unit_get_byte_is_close`** — round-tripping through
++   `get_appropriate_unit(..).get_byte()` is within f64 rounding error of the original:
++   `|back − byte| ≤ (byte >> 47) + 1` (worst-case relative error of the
++   f64→Decimal→ceil pipeline is ~2⁻⁵¹; the bound gives 16× headroom).
++   *Evidence:* `get_byte` docs ("The result may not be logically equal to the original
++   `Byte` instance due to the accuracy of floating-point numbers") — inexact, but the
++   error must be floating-point-sized, not unit-sized. *Excludes* the known-bug region
++   near the maximum (see below), with a comment referencing the canonical failing test.
++10. **`adjusted_byte_ordering_is_monotone`** — `AdjustedByte`'s `Ord` (defined via
++    `get_byte`) orders two values adjusted to the same (arbitrary) unit consistently
++    with their byte counts: `a <= b ⇒ a.get_adjusted_unit(u) <= b.get_adjusted_unit(u)`.
++    *Evidence:* `PartialEq`/`Ord` impls in `src/byte/adjusted/mod.rs` compare via
++    `get_byte`. Same known-bug region excluded.
++11. **`known_bug_adjusted_byte_get_byte_panics_near_max`** — KNOWN FAILURE pin (see
++    Suspected bugs). Deterministic: the generator is pinned to
++    `[u64::MAX − 512, u64::MAX]`, where every input panics. `#[cfg(not(feature = "u128"))]`.
++
++### `tests/unit.rs`
++
++12. **`unit_as_str_parse_roundtrip`** — for every `Unit`,
++    `Unit::parse_str(unit.as_str(), false, prefer_byte) == unit` for both `prefer_byte`
++    values (canonical strings are explicit about bit vs byte, so `prefer_byte` must not
++    matter).
++    *Evidence:* the existing `parse_str` unit test's table encodes many instances of
++    exactly this.
++13. **`unit_parse_str_never_panics`** — `Unit::parse_str` never panics on arbitrary text
++    with any flag combination. (The byte-scanning + `get_char_from_bytes` unsafe path
++    makes this worth having: multi-byte UTF-8 error characters are reconstructed with
++    `from_utf8_unchecked`.)
++
++## Test results
++
++- **Liveness check:** temporarily inverted the assertion in
++  `display_reparses_to_same_byte`; hegel reported a shrunk minimal counterexample
++  (`Byte(0)`). Reverted, and the `.hegel/` failure database was deleted afterwards.
++- **Default run (`cargo test --tests`):** 12 of 13 properties pass; the KNOWN FAILURE
++  pin fails deterministically (shrinks to `v = 18446744073709551103`, i.e.
++  `u64::MAX − 512`), alongside all 6 pre-existing unit tests passing.
++- **Exploratory 10× run (`test_cases = 1000` on every property, then reverted):** no
++  additional failures.
++- `.hegel/` added to `.gitignore`.
++
++## Suspected bugs
++
++**`AdjustedByte::get_byte` (and therefore `AdjustedByte`'s `PartialEq`/`Ord`/`Eq`)
++panics for byte counts near the representable maximum.**
++
++- Reproducer: `Byte::from_u64(u64::MAX).get_appropriate_unit(UnitType::Binary).get_byte()`
++  → `called 'Option::unwrap()' on a 'None' value` at `src/byte/adjusted/mod.rs:224`.
++- Mechanism: `get_appropriate_unit`/`get_adjusted_unit` compute `value` as an `f64`
++  division, which can round *up* — every byte count within 512 of `u64::MAX` becomes
++  exactly `16.0 EiB` = 2⁶⁴ bytes. `get_byte` then does
++  `Byte::from_f64_with_unit(self.value, self.unit).unwrap()`, and
++  `from_f64_with_unit` correctly returns `None` for 2⁶⁴ > `u64::MAX`, so the `unwrap`
++  panics. `UnitType::Decimal` also panics for `u64::MAX` (value rounds to
++  `18.446744073709552 EB` > `u64::MAX` bytes); some nearby values (e.g.
++  `15.999999999999998 EiB`) also fail via the `Decimal` multiplication path.
++- Blast radius: any comparison (`==`, `<`, sorting) of `AdjustedByte` values in this
++  region panics too, since `PartialEq`/`Ord` call `get_byte`.
++- The docs only warn the result "may not be logically equal ... due to the accuracy of
++  floating-point numbers" — a panic is not covered by that caveat.
++- Pinned by `known_bug_adjusted_byte_get_byte_panics_near_max` (fails deterministically
++  on every run). Sibling properties (9, 10) exclude the region via `GET_BYTE_SAFE_MAX`
++  with comments referencing the canonical test; the bound protects the tests from the
++  known bug, not the library's contract. Not fixed, per instructions.
++
++The analogous region under the `u128` feature (near 10²⁷ − 1) is expected to have the
++same problem but was not exercised (default features only); the pin test is cfg-gated to
++`not(feature = "u128")`.
++
++## Unsound properties abandoned
++
++- **Exact `AdjustedByte` round-trip** (`adjusted.get_byte() == byte`) — explicitly
++  disclaimed by the `get_byte` docs; replaced with the bounded-error property (9).
++- **`AdjustedByte` equality across units for the same `Byte`**
++  (`b.get_adjusted_unit(u1) == b.get_adjusted_unit(u2)`) — unsound for the same reason:
++  `get_byte` reconstruction error differs per unit, so logical equality is not promised.
++- **Unit round-trip with `ignore_case = true`** — deliberately not asserted:
++  `ignore_case = true` maps bit-unit canonical strings to byte units by design
++  (`"Kib"` → `KiB`), so the round-trip only holds for `ignore_case = false` (property 12).
++- **Maximality of `get_exact_unit`'s choice** ("the *largest* unit ...") — dropped: a
++  faithful oracle would re-implement the crate-private ordered multiples table in the
++  test; only the exactness/inverse half (property 5) is asserted.
++
++## Skill feedback
++
++- The Rust reference's Setup section was accurate and saved time twice: the MSRV
++  conflict (`--ignore-rust-version` retry) and the package-vs-crate naming
++  (`hegeltest` vs `use hegel::`).
++- The "no global case-count override" gotcha (#13) is real; a `sed` over
++  `#[hegel::test]` worked fine for the 10× pass but an env-var override would be nicer.
++- The "keep a failing test that pins a real bug deterministically" guidance worked
++  exactly as described: pinning the generator to the failing region
++  (`min_value(u64::MAX - 512)`) makes the failure reproduce on every run and shrink to
++  the region's minimum.
++- The skill's "forgot about zero / precision-through-f64" bug-class hints pointed
++  directly at the one real bug found (f64 rounding at the top of the range rather than
++  at zero, but the same class).
++- One friction point: `sampled_from` requiring `T: Send + Sync + 'static` was satisfied
++  here (plain enums), but `one_of!` branches with differently-typed generators unified
++  only because all branches were the same generator type; the reference's note about
++  `.boxed()` covered the fallback so this never blocked.
+diff --git a/tests/byte.rs b/tests/byte.rs
+index 8687ce1..bbe2eb5 100644
+--- a/tests/byte.rs
++++ b/tests/byte.rs
+@@ -170,3 +170,397 @@ fn tests() {
+         assert_eq!(byte, serde_json::from_str::<Byte>(case.0).unwrap(), "{i}");
+     }
+ }
++
++// ===========================================================================
++// Property-based tests (hegel)
++// ===========================================================================
++
++mod hegel_properties {
++    use byte_unit::{Byte, Unit, UnitType};
++    use hegel::generators;
++    use rust_decimal::prelude::*;
++
++    /// The maximum byte value representable by `Byte` in the active configuration.
++    #[cfg(feature = "u128")]
++    const MAX_BYTES: u128 = 1_000_000_000_000_000_000_000_000_000 - 1; // 10^27 - 1
++    #[cfg(not(feature = "u128"))]
++    const MAX_BYTES: u128 = u64::MAX as u128;
++
++    /// The maximum documented precision for `get_recoverable_unit`.
++    #[cfg(feature = "u128")]
++    const MAX_PRECISION: usize = 26;
++    #[cfg(not(feature = "u128"))]
++    const MAX_PRECISION: usize = 19;
++
++    /// Upper bound used by tests that go through `AdjustedByte::get_byte`.
++    ///
++    /// This bound protects the tests from a KNOWN BUG, not the library's
++    /// contract: `AdjustedByte::get_byte` panics when the f64 value rounds
++    /// upward such that `value * unit` exceeds the maximum byte value (see the
++    /// canonical failing test `known_bug_adjusted_byte_get_byte_panics_near_max`
++    /// below). The margin is far larger than the worst-case f64 rounding error.
++    const GET_BYTE_SAFE_MAX: u128 = MAX_BYTES - (MAX_BYTES >> 30);
++
++    fn all_units() -> Vec<Unit> {
++        vec![
++            Unit::Bit,
++            Unit::B,
++            Unit::Kbit,
++            Unit::Kibit,
++            Unit::KB,
++            Unit::KiB,
++            Unit::Mbit,
++            Unit::Mibit,
++            Unit::MB,
++            Unit::MiB,
++            Unit::Gbit,
++            Unit::Gibit,
++            Unit::GB,
++            Unit::GiB,
++            Unit::Tbit,
++            Unit::Tibit,
++            Unit::TB,
++            Unit::TiB,
++            Unit::Pbit,
++            Unit::Pibit,
++            Unit::PB,
++            Unit::PiB,
++            Unit::Ebit,
++            Unit::Eibit,
++            Unit::EB,
++            Unit::EiB,
++            #[cfg(feature = "u128")]
++            Unit::Zbit,
++            #[cfg(feature = "u128")]
++            Unit::Zibit,
++            #[cfg(feature = "u128")]
++            Unit::ZB,
++            #[cfg(feature = "u128")]
++            Unit::ZiB,
++            #[cfg(feature = "u128")]
++            Unit::Ybit,
++            #[cfg(feature = "u128")]
++            Unit::Yibit,
++            #[cfg(feature = "u128")]
++            Unit::YB,
++            #[cfg(feature = "u128")]
++            Unit::YiB,
++        ]
++    }
++
++    /// Number of bytes a (non-`Bit`) unit represents, derived from the public
++    /// `as_bits_u128` so tests don't depend on crate-private helpers.
++    fn unit_bytes(unit: Unit) -> u128 {
++        assert_ne!(unit, Unit::Bit);
++        unit.as_bits_u128() >> 3
++    }
++
++    /// A `Byte` covering the full representable range, boosted toward
++    /// boundaries and toward exact multiples of units (interesting for the
++    /// exact/recoverable-unit paths).
++    #[hegel::composite]
++    fn arb_byte(tc: hegel::TestCase) -> Byte {
++        let v = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => tc.draw(generators::integers::<u128>().max_value(MAX_BYTES)),
++            1 => tc.draw(generators::sampled_from(vec![0, 1, MAX_BYTES - 1, MAX_BYTES])),
++            _ => {
++                let unit = tc.draw(generators::sampled_from(
++                    all_units().into_iter().filter(|u| *u != Unit::Bit).collect::<Vec<_>>(),
++                ));
++                let ub = unit_bytes(unit);
++                let m = tc.draw(generators::integers::<u128>().max_value(MAX_BYTES / ub));
++                m * ub
++            },
++        };
++
++        Byte::from_u128(v).unwrap()
++    }
++
++    // -----------------------------------------------------------------------
++    // Parse robustness
++    // -----------------------------------------------------------------------
++
++    /// `Byte::parse_str` must never panic, for arbitrary garbage and for
++    /// near-miss numeric strings.
++    #[hegel::test]
++    fn byte_parse_str_never_panics(tc: hegel::TestCase) {
++        let s = if tc.draw(generators::booleans()) {
++            tc.draw(generators::text())
++        } else {
++            // near-miss numeric strings: a number followed by junk
++            let n = tc.draw(generators::integers::<u64>());
++            let mid = tc.draw(generators::sampled_from(vec![
++                "", ".", ".5", " ", "  ", "-", "e3", "..", ". ",
++            ]));
++            let tail = tc.draw(generators::text().max_size(6));
++            format!("{n}{mid}{tail}")
++        };
++        let ignore_case = tc.draw(generators::booleans());
++
++        drop(Byte::parse_str(&s, ignore_case));
++    }
++
++    // -----------------------------------------------------------------------
++    // Display / parse round-trips
++    // -----------------------------------------------------------------------
++
++    /// Plain `Display` output (a bare integer) must re-parse to the same
++    /// `Byte`, over the full representable range.
++    #[hegel::test]
++    fn display_reparses_to_same_byte(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        let ignore_case = tc.draw(generators::booleans());
++
++        let s = byte.to_string();
++
++        assert_eq!(Ok(byte), Byte::parse_str(&s, ignore_case).map_err(|e| e.to_string()));
++    }
++
++    /// Alternate (`{:#}`) `Display` output uses `get_recoverable_unit`, which
++    /// is documented to be precise, so it must re-parse to the same `Byte` for
++    /// every documented format style and precision.
++    #[hegel::test]
++    fn alternate_display_reparses_to_same_byte(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        let prec = tc.draw(generators::integers::<usize>().max_value(MAX_PRECISION));
++
++        let s = match tc.draw(generators::integers::<u8>().max_value(4)) {
++            0 => format!("{byte:#}"),
++            1 => format!("{byte:#.prec$}"),
++            2 => format!("{byte:-#}"),
++            3 => format!("{byte:>+#15.prec$}"),
++            _ => format!("{byte:#15}"),
++        };
++        tc.note(&format!("formatted: {s:?}"));
++
++        // The unit in the output is an exact byte-based unit string, so
++        // parsing must not depend on ignore_case.
++        assert_eq!(Ok(byte), Byte::parse_str(&s, false).map_err(|e| e.to_string()));
++    }
++
++    // -----------------------------------------------------------------------
++    // Unit-finding inverses
++    // -----------------------------------------------------------------------
++
++    /// `get_recoverable_unit` is documented to "find the appropriate unit and
++    /// value that can be used to recover back to this `Byte` precisely".
++    #[hegel::test]
++    fn recoverable_unit_recovers_byte_exactly(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        let allow_in_bits = tc.draw(generators::booleans());
++        let precision = tc.draw(generators::integers::<usize>().max_value(MAX_PRECISION));
++
++        let (value, unit) = byte.get_recoverable_unit(allow_in_bits, precision);
++
++        assert_eq!(
++            Some(byte),
++            Byte::from_decimal_with_unit(value, unit),
++            "get_recoverable_unit({allow_in_bits}, {precision}) returned ({value}, {unit:?})"
++        );
++    }
++
++    /// `get_exact_unit` returns a unit that is a factor of the byte count and
++    /// a value that multiplies back to exactly the original `Byte`.
++    #[hegel::test]
++    fn exact_unit_recovers_byte_exactly(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        let allow_in_bits = tc.draw(generators::booleans());
++
++        let (n, unit) = byte.get_exact_unit(allow_in_bits);
++
++        let ub = unit_bytes(unit); // `get_exact_unit` never returns `Bit`
++        assert_eq!(byte.as_u128(), n * ub, "unit {unit:?} is not an exact factor");
++        assert_eq!(Some(byte), Byte::from_u128_with_unit(n, unit));
++    }
++
++    // -----------------------------------------------------------------------
++    // Unit conversion exactness
++    // -----------------------------------------------------------------------
++
++    /// `from_u64_with_unit` must agree with independent u128 arithmetic:
++    /// `size * unit` bytes for byte-based units, `ceil(size / 8)` for `Bit`,
++    /// and `None` exactly when the result exceeds the representable maximum.
++    #[hegel::test]
++    fn from_u64_with_unit_matches_u128_arithmetic(tc: hegel::TestCase) {
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u64>(),
++            generators::sampled_from(vec![0, 1, u64::MAX - 1, u64::MAX]),
++        ));
++        let unit = tc.draw(generators::sampled_from(all_units()));
++
++        let expected: Option<u128> = if unit == Unit::Bit {
++            Some((n as u128).div_ceil(8))
++        } else {
++            (n as u128).checked_mul(unit_bytes(unit)).filter(|v| *v <= MAX_BYTES)
++        };
++
++        let result = Byte::from_u64_with_unit(n, unit);
++
++        assert_eq!(expected, result.map(Byte::as_u128), "{n} {unit:?}");
++    }
++
++    // -----------------------------------------------------------------------
++    // Parsing constructed valid strings against an independent oracle
++    // -----------------------------------------------------------------------
++
++    /// Parsing a constructed `"<number><spaces><unit>"` string must agree
++    /// with `rust_decimal`'s own string parser combined with
++    /// `from_decimal_with_unit` (the hand-rolled digit loop in
++    /// `Byte::parse_str` is independent code).
++    #[hegel::test]
++    fn parse_str_matches_decimal_oracle(tc: hegel::TestCase) {
++        let int_part = tc.draw(generators::integers::<u64>());
++        let frac_digits = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(9)).max_size(6),
++        );
++        let spaces = tc.draw(generators::integers::<usize>().max_value(2));
++        // also exercise the empty unit (implies `B` when prefer_byte)
++        let unit = tc.draw(generators::optional(generators::sampled_from(all_units())));
++
++        let mut num = int_part.to_string();
++        if !frac_digits.is_empty() {
++            num.push('.');
++            for d in &frac_digits {
++                num.push((b'0' + d) as char);
++            }
++        }
++
++        let unit_str = unit.map(Unit::as_str).unwrap_or("");
++        let s = format!("{num}{}{unit_str}", " ".repeat(spaces));
++        tc.note(&format!("input: {s:?}"));
++
++        let expected_value = Decimal::from_str(&num).unwrap();
++        let expected = Byte::from_decimal_with_unit(expected_value, unit.unwrap_or(Unit::B));
++
++        match (Byte::parse_str(&s, false), expected) {
++            (Ok(parsed), Some(expected)) => assert_eq!(expected, parsed),
++            (Err(_), None) => (), // both agree the value exceeds bounds
++            (parsed, expected) => {
++                panic!("mismatch: parse gave {parsed:?}, oracle gave {expected:?}")
++            },
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // get_appropriate_unit
++    // -----------------------------------------------------------------------
++
++    fn ladder(unit_type: UnitType) -> Vec<Unit> {
++        let mut units = vec![Unit::B];
++        units.extend(
++            all_units()
++                .into_iter()
++                .filter(|u| !u.is_bit())
++                .filter(|u| match unit_type {
++                    UnitType::Binary => u.is_binary_multiples(),
++                    UnitType::Decimal => !u.is_binary_multiples(),
++                    UnitType::Both => true,
++                }),
++        );
++        units.sort_by_key(|u| unit_bytes(*u));
++        units
++    }
++
++    /// `get_appropriate_unit` must pick the largest unit of the requested
++    /// unit type that does not exceed the byte count (and `B` otherwise).
++    #[hegel::test]
++    fn appropriate_unit_selects_largest_fitting_unit(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        let unit_type = tc.draw(generators::sampled_from(vec![
++            UnitType::Binary,
++            UnitType::Decimal,
++            UnitType::Both,
++        ]));
++
++        let adjusted = byte.get_appropriate_unit(unit_type);
++        let unit = adjusted.get_unit();
++        let ladder = ladder(unit_type);
++
++        assert!(ladder.contains(&unit), "{unit:?} is not a {unit_type:?} unit");
++
++        let ub = unit_bytes(unit);
++        assert!(byte.as_u128() >= ub || unit == Unit::B, "{unit:?} is too large for {byte}");
++
++        if let Some(next) = ladder.iter().find(|u| unit_bytes(**u) > ub) {
++            assert!(
++                byte.as_u128() < unit_bytes(*next),
++                "{next:?} would have fit {byte} but {unit:?} was chosen"
++            );
++        }
++    }
++
++    /// Recovering a `Byte` from its appropriate-unit representation is
++    /// documented to be inexact ("may not be logically equal ... due to the
++    /// accuracy of floating-point numbers"), but the error must be bounded by
++    /// f64 rounding: a couple of ULPs plus the round-up of `ceil`.
++    #[hegel::test]
++    fn appropriate_unit_get_byte_is_close(tc: hegel::TestCase) {
++        let byte = tc.draw(arb_byte());
++        // Excluded region: KNOWN BUG, `get_byte` panics near the maximum; see
++        // `known_bug_adjusted_byte_get_byte_panics_near_max`.
++        tc.assume(byte.as_u128() <= GET_BYTE_SAFE_MAX);
++        let unit_type = tc.draw(generators::sampled_from(vec![
++            UnitType::Binary,
++            UnitType::Decimal,
++            UnitType::Both,
++        ]));
++
++        let adjusted = byte.get_appropriate_unit(unit_type);
++        let back = adjusted.get_byte();
++
++        let tolerance = (byte.as_u128() >> 47) + 1;
++        assert!(
++            back.as_u128().abs_diff(byte.as_u128()) <= tolerance,
++            "{byte} -> {adjusted} -> {back} (tolerance {tolerance})"
++        );
++    }
++
++    /// KNOWN FAILURE: real bug in `AdjustedByte::get_byte`.
++    ///
++    /// `Byte::get_appropriate_unit` computes an `f64` value that can round
++    /// upward (every byte count within 512 of `u64::MAX` becomes exactly
++    /// `16 EiB` = 2^64 bytes), and `AdjustedByte::get_byte` then calls
++    /// `Byte::from_f64_with_unit(...).unwrap()`, which panics because 2^64
++    /// exceeds the maximum representable byte value
++    /// (src/byte/adjusted/mod.rs:224, `Option::unwrap()` on `None`).
++    /// `AdjustedByte`'s `PartialEq`/`Ord` panic on the same inputs, since they
++    /// call `get_byte` internally.
++    ///
++    /// The generator is pinned to the failing region, so this test fails
++    /// deterministically on every run. Sibling tests exclude the region via
++    /// `GET_BYTE_SAFE_MAX`.
++    #[cfg(not(feature = "u128"))]
++    #[hegel::test]
++    fn known_bug_adjusted_byte_get_byte_panics_near_max(tc: hegel::TestCase) {
++        let v = tc.draw(generators::integers::<u64>().min_value(u64::MAX - 512));
++        let byte = Byte::from_u64(v);
++
++        let adjusted = byte.get_appropriate_unit(UnitType::Binary);
++
++        // must not panic (the docs only promise possible *inaccuracy*)
++        let _ = adjusted.get_byte();
++    }
++
++    // -----------------------------------------------------------------------
++    // Ordering consistency
++    // -----------------------------------------------------------------------
++
++    /// `AdjustedByte`'s `Ord` (defined via `get_byte`) must order two values
++    /// adjusted to the same unit consistently with their byte counts.
++    #[hegel::test]
++    fn adjusted_byte_ordering_is_monotone(tc: hegel::TestCase) {
++        let a = tc.draw(arb_byte());
++        let b = tc.draw(arb_byte());
++        // Excluded region: KNOWN BUG, `get_byte` (used by `Ord`) panics near
++        // the maximum; see `known_bug_adjusted_byte_get_byte_panics_near_max`.
++        tc.assume(a.as_u128() <= GET_BYTE_SAFE_MAX && b.as_u128() <= GET_BYTE_SAFE_MAX);
++        let unit = tc.draw(generators::sampled_from(all_units()));
++
++        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
++
++        assert!(
++            lo.get_adjusted_unit(unit) <= hi.get_adjusted_unit(unit),
++            "{lo} <= {hi} but their {unit:?}-adjusted forms compare the other way"
++        );
++    }
++}
+diff --git a/tests/unit.rs b/tests/unit.rs
+index 7114fb6..8e4fa71 100644
+--- a/tests/unit.rs
++++ b/tests/unit.rs
+@@ -134,3 +134,83 @@ fn tests() {
+         assert_eq!(case.1, serde_json::from_str(case.0).unwrap(), "{i}");
+     }
+ }
++
++// ===========================================================================
++// Property-based tests (hegel)
++// ===========================================================================
++
++mod hegel_properties {
++    use byte_unit::Unit;
++    use hegel::generators;
++
++    fn all_units() -> Vec<Unit> {
++        vec![
++            Unit::Bit,
++            Unit::B,
++            Unit::Kbit,
++            Unit::Kibit,
++            Unit::KB,
++            Unit::KiB,
++            Unit::Mbit,
++            Unit::Mibit,
++            Unit::MB,
++            Unit::MiB,
++            Unit::Gbit,
++            Unit::Gibit,
++            Unit::GB,
++            Unit::GiB,
++            Unit::Tbit,
++            Unit::Tibit,
++            Unit::TB,
++            Unit::TiB,
++            Unit::Pbit,
++            Unit::Pibit,
++            Unit::PB,
++            Unit::PiB,
++            Unit::Ebit,
++            Unit::Eibit,
++            Unit::EB,
++            Unit::EiB,
++            #[cfg(feature = "u128")]
++            Unit::Zbit,
++            #[cfg(feature = "u128")]
++            Unit::Zibit,
++            #[cfg(feature = "u128")]
++            Unit::ZB,
++            #[cfg(feature = "u128")]
++            Unit::ZiB,
++            #[cfg(feature = "u128")]
++            Unit::Ybit,
++            #[cfg(feature = "u128")]
++            Unit::Yibit,
++            #[cfg(feature = "u128")]
++            Unit::YB,
++            #[cfg(feature = "u128")]
++            Unit::YiB,
++        ]
++    }
++
++    /// Every unit's canonical string (`as_str`) must parse back to the same
++    /// unit with `ignore_case = false`, regardless of `prefer_byte` (the
++    /// canonical strings are all explicit about bit vs byte).
++    #[hegel::test]
++    fn unit_as_str_parse_roundtrip(tc: hegel::TestCase) {
++        let unit = tc.draw(generators::sampled_from(all_units()));
++        let prefer_byte = tc.draw(generators::booleans());
++
++        assert_eq!(
++            Ok(unit),
++            Unit::parse_str(unit.as_str(), false, prefer_byte).map_err(|e| e.to_string())
++        );
++    }
++
++    /// `Unit::parse_str` must never panic on arbitrary input.
++    #[hegel::test]
++    fn unit_parse_str_never_panics(tc: hegel::TestCase) {
++        let s = tc.draw(generators::text());
++        let ignore_case = tc.draw(generators::booleans());
++        let prefer_byte = tc.draw(generators::booleans());
++
++        drop(Unit::parse_str(&s, ignore_case, prefer_byte));
++    }
++}

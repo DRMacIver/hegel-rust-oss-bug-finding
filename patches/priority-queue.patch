@@ -1,0 +1,845 @@
+diff --git a/.gitignore b/.gitignore
+index 983c45f..a66de65 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,4 +2,4 @@ target/
+ **/*.rs.bk
+ Cargo.lock
+ *~
+-.lapce/
+\ No newline at end of file
++.lapce/.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 96c099a..a0d44f0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ serde_json = "1"
+ uuid = {version= "1", features = ["v4", "serde"] }
+ hashbrown = "0.14"
+ twox-hash = { version = "1.5", default-features = false }
++hegeltest = "0.28.2"
+ 
+ [features]
+ default = ["std"]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..98dce28
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,164 @@
++# Hegel Property-Based Testing Report: priority-queue 2.8.0
++
++Property-based tests written with [hegel](https://hegel.dev) (`hegeltest` 0.28.2),
++added to the existing integration test files:
++
++- `tests/priority_queue.rs` — modules `hegel_pqueue_tests` and `hegel_serde_tests`
++- `tests/double_priority_queue.rs` — module `hegel_doublepq_tests`
++
++Note: `hegeltest` was added with `cargo add --dev hegeltest --ignore-rust-version`
++because its MSRV (1.86) is newer than the crate's `rust-version = "1.65.0"`.
++This only affects dev-dependencies; whether that is acceptable upstream is a
++maintainer decision.
++
++## Properties tested
++
++### PriorityQueue (`tests/priority_queue.rs`)
++
++1. **`pq_agrees_with_hashmap_model`** (stateful model test). A
++   `PriorityQueue<i32, i64>` must agree with a `HashMap<i32, i64>` reference
++   model under arbitrary interleavings of `push`, `pop`, `change_priority`,
++   `push_increase`, `push_decrease`, `remove`, `get`/`get_priority`/`contains`.
++   Invariants after every step: `len`/`is_empty` agree with the model, and
++   `peek` returns an item whose priority equals the model maximum (ties are
++   resolved by looking the popped/peeked item up in the model rather than
++   predicting the winner). Evidence: each rule asserts exactly the documented
++   return value of the corresponding method (e.g. `push` returns the replaced
++   priority, `change_priority` returns the old priority or `None`).
++
++2. **`pop_drains_in_non_increasing_priority_order`**. After up to 300 unique
++   pushes followed by up to 50 `change_priority` calls on random existing keys
++   (exercising `up_heapify`/`bubble_up` deep in the heap), a full drain via
++   `pop` yields priorities in non-increasing order and returns every element
++   exactly once. Evidence: `pop` is documented to remove "the item with the
++   greatest priority".
++
++3. **`into_sorted_vec_sorted_by_priority`**. `into_sorted_vec` returns every
++   pushed item exactly once, ordered from highest associated priority to
++   lowest (checked against a `HashMap` of expected priorities). Evidence: doc
++   comment "Returns a `Vec<I>` sorted from the item associated to the highest
++   priority to the lowest".
++
++4. **`push_increase_takes_max`**. On an arbitrary queue, after
++   `push_increase(k, p)` the stored priority is `max(old, p)`; return value is
++   `None` when absent, `Some(old)` when increased, `Some(p)` when not.
++   Evidence: the method's doc comment and doctest spell out exactly this
++   contract.
++
++5. **`push_decrease_takes_min`**. Mirror property for `push_decrease`
++   (stored priority becomes `min(old, p)`, same return-value scheme).
++
++6. **`iter_yields_exact_contents`**. For up to 300 unique-key pushes, `iter`
++   visits exactly the pushed `(item, priority)` pairs, each once (order is
++   documented as arbitrary, so the check is multiset equality via count +
++   `HashMap` equality).
++
++7. **`from_iter_equals_push_loop`**. A queue collected via `FromIterator`
++   from a pair sequence *with duplicate keys allowed* equals (by `PartialEq`,
++   which compares contents) a queue built by pushing every pair in order —
++   the source documents that for repeated items "the item inside the pq is
++   updated", i.e. last pair wins, same as `push`. The `FromIterator`-built
++   queue (which uses the O(N) `heap_build` path instead of per-push
++   `bubble_up`) must also drain in non-increasing priority order.
++
++8. **`serde_json_roundtrip_preserves_queue`** (gated on `--features serde`).
++   `serde_json::from_str(serde_json::to_string(pq))` yields a queue equal to
++   the original, and the deserialized queue's heap is valid: a full drain via
++   `pop` is sorted and returns all elements. Evidence: the crate ships
++   `Serialize`/`Deserialize` impls that rebuild the heap on deserialization.
++
++### DoublePriorityQueue (`tests/double_priority_queue.rs`)
++
++9. **`double_pq_agrees_with_hashmap_model`** (stateful model test). Same
++   scheme as property 1 for the min-max ("interval") heap: rules `push`,
++   `pop_min`, `pop_max`, `change_priority`, `remove`, `get`; invariants that
++   `len` agrees and that `peek_min`/`peek_max` return the model
++   minimum/maximum after every step.
++
++10. **`interleaved_pop_min_pop_max_agree_with_model`**. Build a
++    DoublePriorityQueue with up to 300 unique keys, then perform up to 50
++    random `change_priority`/`remove` operations while the heap is deep, then
++    fully drain it with an arbitrary interleaving of `pop_min`/`pop_max`,
++    asserting each pop returns exactly the current min/max priority of the
++    remaining elements (ties resolved through the model). This targets the
++    stale-heap-index / min-max-level bugs that only appear several levels deep.
++
++11. **`sorted_vecs_agree_with_reference_sort`**. With all-distinct priorities
++    (making the order unique), `into_ascending_sorted_vec` equals the items
++    sorted by priority via `sort_unstable` on `(priority, item)` pairs, and
++    `into_descending_sorted_vec` is exactly its reverse. Evidence: the two
++    methods' doc comments ("sorted from the one associated to the lowest
++    priority to the highest" and vice versa).
++
++### Generator notes
++
++- Priorities are drawn from the **full `i64` range** (no arithmetic is done on
++  them, so boundary values like `i64::MIN`/`MAX` are pure signal).
++- Model-machine keys mix a small `0..=15` range (so duplicate pushes, priority
++  changes and removals of *existing* items happen often) with the full `i32`
++  range, via `one_of!`.
++- Batch tests draw a size up to 300 separately and use `min_size` so heaps get
++  hundreds of elements / 8+ levels deep, per the skill's large-collection
++  guidance. Keys use `.unique(true)` so multiset accounting is unambiguous.
++
++## Test results
++
++- `cargo test`: all 105 tests pass (55 in double_priority_queue.rs including
++  3 hegel tests, 53 in priority_queue.rs including 7 hegel tests, 17 doctests).
++- `cargo test --features serde`: all pass, including the hegel serde
++  round-trip property (11 hegel properties total).
++- **Liveness check**: two properties were temporarily inverted
++  (`pop_drains...` order check, and the `pop_min` model check). Both failed
++  immediately and hegel shrank the model-machine failure to the minimal
++  counterexample `push(0,0); push(1,1); pop_min` — confirming the tests are
++  live and shrinking works. The breaks were reverted and the `.hegel/` failure
++  database removed.
++- **Exploratory 10x run**: all 11 properties were run once with
++  `test_cases = 1000` (10x the default). All passed (~40s total). Committed
++  tests use the default count.
++
++## Suspected bugs
++
++None found. Two areas looked suspicious from reading the source and were
++targeted specifically, but survived the model tests and the 10x run:
++
++- The asymmetry in `src/double_priority_queue/mod.rs` between `pop_min_if`
++  (restores with `heapify`) and `pop_max_if` (restores with `up_heapify`),
++  and the `heapify`-only restoration in `pop_max`, where the leaf swapped
++  into a max-level position could conceivably need to move toward the root.
++  The grandchild/parent swap inside `heapify_min`/`heapify_max` appears to
++  handle this correctly.
++- `Store::remove`'s four-way index-fixup logic (`src/store.rs`), classic
++  stale-index territory, exercised by the `remove` rules and the deep-heap
++  interleaved test.
++
++## Unsound properties abandoned
++
++None were committed and none needed to be abandoned mid-way. Two properties
++were deliberately *designed around* documented non-guarantees rather than
++asserted naively:
++
++- Pop/peek do **not** promise which item wins among equal priorities, so all
++  model comparisons check the returned priority against the model extreme and
++  then look the returned *item* up in the model, instead of predicting the
++  item.
++- `into_ascending_sorted_vec` vs reversed `into_descending_sorted_vec`
++  equality is only sound with distinct priorities (equal-priority items may
++  legitimately come out in different relative orders), so that test generates
++  priorities with `.unique(true)`.
++
++## Skill feedback
++
++- The Rust reference's Setup section predicting the MSRV `cargo add` failure
++  (and the `--ignore-rust-version` fix) was exactly right and saved time.
++- The stateful testing API (`#[hegel::state_machine]`, `#[rule]`,
++  `#[invariant]`, `hegel::stateful::run`) worked first try as documented;
++  the note that invariants run on the initial (empty) state mattered — both
++  peek invariants had to handle the empty queue.
++- The "draw size separately, then `min_size(n)`" pattern for large collections
++  and the `.unique(true)` key guidance mapped directly onto this crate's needs.
++- Shrinking quality was excellent: the deliberately-broken DPQ model shrank to
++  a 3-step, 2-element counterexample with verbose step output.
++- Minor friction: there is no global case-count override (no `PROPTEST_CASES`
++  equivalent), so the 10x exploratory run required a temporary `sed` over the
++  test attributes, as the reference itself suggests.
+diff --git a/tests/double_priority_queue.rs b/tests/double_priority_queue.rs
+index c5bacf4..229b180 100644
+--- a/tests/double_priority_queue.rs
++++ b/tests/double_priority_queue.rs
+@@ -1551,3 +1551,234 @@ mod serde_tests_custom_structs {
+         }
+     }
+ }
++
++// Property-based tests written with hegel (https://hegel.dev).
++#[cfg(feature = "std")]
++#[cfg(test)]
++mod hegel_doublepq_tests {
++    use hegel::TestCase;
++    use hegel::generators;
++    use priority_queue::DoublePriorityQueue;
++    use std::collections::HashMap;
++
++    /// Keys are drawn mostly from a small range so that operations on
++    /// existing items (priority changes, removals, duplicate pushes)
++    /// happen often, mixed with the full i32 range for breadth.
++    fn draw_key(tc: &TestCase) -> i32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i32>().min_value(0).max_value(15),
++            generators::integers::<i32>(),
++        ))
++    }
++
++    /// Stateful model test: DoublePriorityQueue must agree with a HashMap
++    /// (item -> priority) reference model after every operation.
++    /// Ties on priority are resolved by checking the popped item against
++    /// the model instead of predicting which item wins.
++    struct DoublePqModel {
++        pq: DoublePriorityQueue<i32, i64>,
++        model: HashMap<i32, i64>,
++    }
++
++    #[hegel::state_machine]
++    impl DoublePqModel {
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            assert_eq!(self.pq.push(k, p), self.model.insert(k, p));
++        }
++
++        #[rule]
++        fn pop_min(&mut self, _tc: TestCase) {
++            match self.pq.pop_min() {
++                None => assert!(self.model.is_empty()),
++                Some((item, prio)) => {
++                    let min = *self.model.values().min().expect("pq popped, model empty");
++                    assert_eq!(prio, min, "pop_min priority is not the model minimum");
++                    assert_eq!(self.model.remove(&item), Some(prio));
++                }
++            }
++        }
++
++        #[rule]
++        fn pop_max(&mut self, _tc: TestCase) {
++            match self.pq.pop_max() {
++                None => assert!(self.model.is_empty()),
++                Some((item, prio)) => {
++                    let max = *self.model.values().max().expect("pq popped, model empty");
++                    assert_eq!(prio, max, "pop_max priority is not the model maximum");
++                    assert_eq!(self.model.remove(&item), Some(prio));
++                }
++            }
++        }
++
++        #[rule]
++        fn change_priority(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            let expected = self.model.get(&k).copied();
++            assert_eq!(self.pq.change_priority(&k, p), expected);
++            if expected.is_some() {
++                self.model.insert(k, p);
++            }
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let expected = self.model.remove(&k).map(|p| (k, p));
++            assert_eq!(self.pq.remove(&k), expected);
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            assert_eq!(self.pq.get_priority(&k), self.model.get(&k));
++            assert_eq!(self.pq.get(&k), self.model.get_key_value(&k));
++            assert_eq!(self.pq.contains(&k), self.model.contains_key(&k));
++        }
++
++        #[invariant]
++        fn same_length(&self, _tc: TestCase) {
++            assert_eq!(self.pq.len(), self.model.len());
++            assert_eq!(self.pq.is_empty(), self.model.is_empty());
++        }
++
++        #[invariant]
++        fn peeks_are_model_extremes(&self, _tc: TestCase) {
++            match self.pq.peek_min() {
++                None => assert!(self.model.is_empty()),
++                Some((item, &prio)) => {
++                    let min = *self.model.values().min().unwrap();
++                    assert_eq!(prio, min, "peek_min priority is not the model minimum");
++                    assert_eq!(self.model.get(item), Some(&prio));
++                }
++            }
++            match self.pq.peek_max() {
++                None => assert!(self.model.is_empty()),
++                Some((item, &prio)) => {
++                    let max = *self.model.values().max().unwrap();
++                    assert_eq!(prio, max, "peek_max priority is not the model maximum");
++                    assert_eq!(self.model.get(item), Some(&prio));
++                }
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn double_pq_agrees_with_hashmap_model(tc: TestCase) {
++        let machine = DoublePqModel {
++            pq: DoublePriorityQueue::new(),
++            model: HashMap::new(),
++        };
++        hegel::stateful::run(machine, tc);
++    }
++
++    /// Fully draining a large DoublePriorityQueue by an arbitrary
++    /// interleaving of pop_min/pop_max must always yield the current
++    /// minimum/maximum priority of the remaining elements. Hundreds of
++    /// elements force deep min-max heaps.
++    #[hegel::test]
++    fn interleaved_pop_min_pop_max_agree_with_model(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len()),
++        );
++
++        let mut pq: DoublePriorityQueue<i32, i64> = DoublePriorityQueue::new();
++        let mut model: HashMap<i32, i64> = HashMap::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++            model.insert(k, p);
++        }
++
++        // Change priorities and remove some items while the heap is deep,
++        // to exercise up_heapify/remove far from the root.
++        if !keys.is_empty() {
++            let changes = tc.draw(generators::integers::<usize>().max_value(50));
++            for _ in 0..changes {
++                let idx = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++                let k = keys[idx];
++                if tc.draw(generators::booleans()) {
++                    let p = tc.draw(generators::integers::<i64>());
++                    let expected = model.insert(k, p);
++                    if expected.is_none() {
++                        model.remove(&k);
++                    }
++                    assert_eq!(pq.change_priority(&k, p), expected);
++                } else {
++                    let expected = model.remove(&k).map(|p| (k, p));
++                    assert_eq!(pq.remove(&k), expected);
++                }
++            }
++        }
++
++        while !model.is_empty() {
++            let take_max = tc.draw(generators::booleans());
++            let (item, prio) = if take_max {
++                pq.pop_max().expect("model non-empty but pop_max was None")
++            } else {
++                pq.pop_min().expect("model non-empty but pop_min was None")
++            };
++            let expected = if take_max {
++                *model.values().max().unwrap()
++            } else {
++                *model.values().min().unwrap()
++            };
++            assert_eq!(
++                prio, expected,
++                "{} returned wrong priority",
++                if take_max { "pop_max" } else { "pop_min" }
++            );
++            assert_eq!(model.remove(&item), Some(prio));
++        }
++        assert!(pq.is_empty());
++        assert_eq!(pq.pop_min(), None);
++        assert_eq!(pq.pop_max(), None);
++    }
++
++    /// With all-distinct priorities, `into_ascending_sorted_vec` must equal
++    /// the items sorted by priority, and `into_descending_sorted_vec` must be
++    /// exactly its reverse.
++    #[hegel::test]
++    fn sorted_vecs_agree_with_reference_sort(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        // Distinct priorities make the sorted order unique.
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len())
++                .unique(true),
++        );
++
++        let mut pq: DoublePriorityQueue<i32, i64> = DoublePriorityQueue::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++        }
++
++        let mut by_priority: Vec<(i64, i32)> =
++            prios.iter().zip(&keys).map(|(&p, &k)| (p, k)).collect();
++        by_priority.sort_unstable();
++        let expected_ascending: Vec<i32> = by_priority.iter().map(|&(_, k)| k).collect();
++
++        let ascending = pq.clone().into_ascending_sorted_vec();
++        assert_eq!(ascending, expected_ascending);
++
++        let mut descending = pq.into_descending_sorted_vec();
++        descending.reverse();
++        assert_eq!(descending, expected_ascending);
++    }
++}
+diff --git a/tests/priority_queue.rs b/tests/priority_queue.rs
+index 93b3cab..63aefd5 100644
+--- a/tests/priority_queue.rs
++++ b/tests/priority_queue.rs
+@@ -1418,3 +1418,408 @@ mod serde_tests_custom_structs {
+         }
+     }
+ }
++
++// Property-based tests written with hegel (https://hegel.dev).
++#[cfg(feature = "std")]
++#[cfg(test)]
++mod hegel_pqueue_tests {
++    use hegel::TestCase;
++    use hegel::generators;
++    use priority_queue::PriorityQueue;
++    use std::collections::HashMap;
++
++    /// Keys are drawn mostly from a small range so that operations on
++    /// existing items (priority changes, removals, duplicate pushes)
++    /// happen often, mixed with the full i32 range for breadth.
++    fn draw_key(tc: &TestCase) -> i32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i32>().min_value(0).max_value(15),
++            generators::integers::<i32>(),
++        ))
++    }
++
++    /// Stateful model test: PriorityQueue must agree with a HashMap
++    /// (item -> priority) reference model after every operation.
++    /// Ties on priority are resolved by checking the popped item against
++    /// the model instead of predicting which item wins.
++    struct PqModel {
++        pq: PriorityQueue<i32, i64>,
++        model: HashMap<i32, i64>,
++    }
++
++    #[hegel::state_machine]
++    impl PqModel {
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            assert_eq!(self.pq.push(k, p), self.model.insert(k, p));
++        }
++
++        #[rule]
++        fn pop(&mut self, _tc: TestCase) {
++            match self.pq.pop() {
++                None => assert!(self.model.is_empty()),
++                Some((item, prio)) => {
++                    let max = *self.model.values().max().expect("pq popped, model empty");
++                    assert_eq!(prio, max, "popped priority is not the model maximum");
++                    assert_eq!(self.model.remove(&item), Some(prio));
++                }
++            }
++        }
++
++        #[rule]
++        fn change_priority(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            let expected = self.model.get(&k).copied();
++            assert_eq!(self.pq.change_priority(&k, p), expected);
++            if expected.is_some() {
++                self.model.insert(k, p);
++            }
++        }
++
++        #[rule]
++        fn push_increase(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            let old = self.model.get(&k).copied();
++            let ret = self.pq.push_increase(k, p);
++            match old {
++                None => {
++                    assert_eq!(ret, None);
++                    self.model.insert(k, p);
++                }
++                Some(o) if p > o => {
++                    assert_eq!(ret, Some(o));
++                    self.model.insert(k, p);
++                }
++                Some(_) => assert_eq!(ret, Some(p)),
++            }
++        }
++
++        #[rule]
++        fn push_decrease(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            let old = self.model.get(&k).copied();
++            let ret = self.pq.push_decrease(k, p);
++            match old {
++                None => {
++                    assert_eq!(ret, None);
++                    self.model.insert(k, p);
++                }
++                Some(o) if p < o => {
++                    assert_eq!(ret, Some(o));
++                    self.model.insert(k, p);
++                }
++                Some(_) => assert_eq!(ret, Some(p)),
++            }
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let expected = self.model.remove(&k).map(|p| (k, p));
++            assert_eq!(self.pq.remove(&k), expected);
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            assert_eq!(self.pq.get_priority(&k), self.model.get(&k));
++            assert_eq!(self.pq.get(&k), self.model.get_key_value(&k));
++            assert_eq!(self.pq.contains(&k), self.model.contains_key(&k));
++        }
++
++        #[invariant]
++        fn same_length(&self, _tc: TestCase) {
++            assert_eq!(self.pq.len(), self.model.len());
++            assert_eq!(self.pq.is_empty(), self.model.is_empty());
++        }
++
++        #[invariant]
++        fn peek_is_model_max(&self, _tc: TestCase) {
++            match self.pq.peek() {
++                None => assert!(self.model.is_empty()),
++                Some((item, &prio)) => {
++                    let max = *self.model.values().max().unwrap();
++                    assert_eq!(prio, max, "peeked priority is not the model maximum");
++                    assert_eq!(self.model.get(item), Some(&prio));
++                }
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn pq_agrees_with_hashmap_model(tc: TestCase) {
++        let machine = PqModel {
++            pq: PriorityQueue::new(),
++            model: HashMap::new(),
++        };
++        hegel::stateful::run(machine, tc);
++    }
++
++    /// After an arbitrary mix of pushes and priority changes (which exercise
++    /// bubble_up/up_heapify at deep positions), fully draining the queue with
++    /// `pop` must yield priorities in non-increasing order and return every
++    /// element exactly once. Hundreds of elements force deep heaps.
++    #[hegel::test]
++    fn pop_drains_in_non_increasing_priority_order(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len()),
++        );
++
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++        }
++
++        // Change some priorities of existing items to exercise up_heapify.
++        if !keys.is_empty() {
++            let changes = tc.draw(generators::integers::<usize>().max_value(50));
++            for _ in 0..changes {
++                let idx = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++                let p = tc.draw(generators::integers::<i64>());
++                pq.change_priority(&keys[idx], p);
++            }
++        }
++
++        let mut prev: Option<i64> = None;
++        let mut count = 0;
++        while let Some((_, p)) = pq.pop() {
++            if let Some(q) = prev {
++                assert!(q >= p, "pop yielded increasing priorities: {} then {}", q, p);
++            }
++            prev = Some(p);
++            count += 1;
++        }
++        assert_eq!(count, keys.len());
++    }
++
++    /// `into_sorted_vec` must return every pushed item exactly once, ordered
++    /// from the highest associated priority to the lowest.
++    #[hegel::test]
++    fn into_sorted_vec_sorted_by_priority(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len()),
++        );
++
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        let mut expected: HashMap<i32, i64> = HashMap::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++            expected.insert(k, p);
++        }
++
++        let sorted = pq.into_sorted_vec();
++        assert_eq!(sorted.len(), expected.len());
++        let mut prev: Option<i64> = None;
++        for item in &sorted {
++            let p = *expected.get(item).expect("into_sorted_vec invented an item");
++            if let Some(q) = prev {
++                assert!(q >= p, "into_sorted_vec not sorted: {} before {}", q, p);
++            }
++            prev = Some(p);
++        }
++        let mut sorted_items = sorted.clone();
++        sorted_items.sort_unstable();
++        let mut expected_items: Vec<i32> = expected.keys().copied().collect();
++        expected_items.sort_unstable();
++        assert_eq!(sorted_items, expected_items);
++    }
++
++    /// Documented `push_increase` contract: the resulting priority is the max
++    /// of the old and offered priorities; returns None when absent, Some(old)
++    /// when increased, Some(offered) when not increased.
++    #[hegel::test]
++    fn push_increase_takes_max(tc: TestCase) {
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        let n = tc.draw(generators::integers::<usize>().max_value(50));
++        for _ in 0..n {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            pq.push(k, p);
++        }
++        let k = draw_key(&tc);
++        let p = tc.draw(generators::integers::<i64>());
++        let old = pq.get_priority(&k).copied();
++        let ret = pq.push_increase(k, p);
++        match old {
++            None => {
++                assert_eq!(ret, None);
++                assert_eq!(pq.get_priority(&k), Some(&p));
++            }
++            Some(o) => {
++                assert_eq!(pq.get_priority(&k).copied(), Some(o.max(p)));
++                if p > o {
++                    assert_eq!(ret, Some(o));
++                } else {
++                    assert_eq!(ret, Some(p));
++                }
++            }
++        }
++    }
++
++    /// Documented `push_decrease` contract: the resulting priority is the min
++    /// of the old and offered priorities; returns None when absent, Some(old)
++    /// when decreased, Some(offered) when not decreased.
++    #[hegel::test]
++    fn push_decrease_takes_min(tc: TestCase) {
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        let n = tc.draw(generators::integers::<usize>().max_value(50));
++        for _ in 0..n {
++            let k = draw_key(&tc);
++            let p = tc.draw(generators::integers::<i64>());
++            pq.push(k, p);
++        }
++        let k = draw_key(&tc);
++        let p = tc.draw(generators::integers::<i64>());
++        let old = pq.get_priority(&k).copied();
++        let ret = pq.push_decrease(k, p);
++        match old {
++            None => {
++                assert_eq!(ret, None);
++                assert_eq!(pq.get_priority(&k), Some(&p));
++            }
++            Some(o) => {
++                assert_eq!(pq.get_priority(&k).copied(), Some(o.min(p)));
++                if p < o {
++                    assert_eq!(ret, Some(o));
++                } else {
++                    assert_eq!(ret, Some(p));
++                }
++            }
++        }
++    }
++
++    /// `iter` visits exactly the (item, priority) pairs currently in the
++    /// queue, each once (order is documented as arbitrary).
++    #[hegel::test]
++    fn iter_yields_exact_contents(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len()),
++        );
++
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        let mut expected: HashMap<i32, i64> = HashMap::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++            expected.insert(k, p);
++        }
++
++        let visited: Vec<(i32, i64)> = pq.iter().map(|(&k, &p)| (k, p)).collect();
++        assert_eq!(visited.len(), expected.len(), "iter repeated or skipped items");
++        let visited_map: HashMap<i32, i64> = visited.into_iter().collect();
++        assert_eq!(visited_map, expected);
++        assert_eq!(pq.len(), expected.len());
++    }
++
++    /// Building a queue with `FromIterator` (possibly with repeated items,
++    /// where the docs say the item is updated so the last pair wins) is
++    /// equivalent to pushing every pair in order, and the built queue is a
++    /// valid heap: draining it yields non-increasing priorities.
++    #[hegel::test]
++    fn from_iter_equals_push_loop(tc: TestCase) {
++        let pairs: Vec<(i32, i64)> = {
++            let n = tc.draw(generators::integers::<usize>().max_value(300));
++            let mut v = Vec::with_capacity(n);
++            for _ in 0..n {
++                let k = draw_key(&tc);
++                let p = tc.draw(generators::integers::<i64>());
++                v.push((k, p));
++            }
++            v
++        };
++
++        let mut from_iter_pq: PriorityQueue<i32, i64> = pairs.iter().copied().collect();
++        let mut push_pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        for &(k, p) in &pairs {
++            push_pq.push(k, p);
++        }
++        assert_eq!(from_iter_pq, push_pq);
++        assert_eq!(from_iter_pq.len(), push_pq.len());
++
++        // The FromIterator-built heap must also drain in sorted order.
++        let expected_len = from_iter_pq.len();
++        let mut prev: Option<i64> = None;
++        let mut count = 0;
++        while let Some((_, p)) = from_iter_pq.pop() {
++            if let Some(q) = prev {
++                assert!(q >= p, "from_iter heap drained out of order: {} then {}", q, p);
++            }
++            prev = Some(p);
++            count += 1;
++        }
++        assert_eq!(count, expected_len);
++    }
++}
++
++// Property-based serde tests written with hegel (https://hegel.dev).
++#[cfg(all(feature = "serde", feature = "std", test))]
++mod hegel_serde_tests {
++    use hegel::TestCase;
++    use hegel::generators;
++    use priority_queue::PriorityQueue;
++
++    /// serde round-trip: deserializing a serialized queue yields an equal
++    /// queue whose heap is valid (drains in non-increasing priority order).
++    #[hegel::test]
++    fn serde_json_roundtrip_preserves_queue(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(200));
++        let keys: Vec<i32> = tc.draw(
++            generators::vecs(generators::integers::<i32>())
++                .min_size(n)
++                .unique(true),
++        );
++        let prios: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(keys.len())
++                .max_size(keys.len()),
++        );
++
++        let mut pq: PriorityQueue<i32, i64> = PriorityQueue::new();
++        for (&k, &p) in keys.iter().zip(&prios) {
++            pq.push(k, p);
++        }
++
++        let json = serde_json::to_string(&pq).unwrap();
++        let mut back: PriorityQueue<i32, i64> = serde_json::from_str(&json).unwrap();
++        assert_eq!(pq, back);
++
++        let mut prev: Option<i64> = None;
++        let mut count = 0;
++        while let Some((_, p)) = back.pop() {
++            if let Some(q) = prev {
++                assert!(q >= p, "deserialized heap drained out of order");
++            }
++            prev = Some(p);
++            count += 1;
++        }
++        assert_eq!(count, keys.len());
++    }
++}

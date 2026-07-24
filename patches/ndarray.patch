@@ -1,0 +1,1056 @@
+diff --git a/.gitignore b/.gitignore
+index c188555..98f2ea1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,4 @@ target/
+ 
+ # Apple details
+ **/.DS_Store
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index df07302..26f3f5e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -58,6 +58,7 @@ approx = { workspace = true, default-features = true }
+ itertools = { workspace = true }
+ ndarray-gen = { workspace = true }
+ proptest = { workspace = true }
++hegeltest = "0.28.2"
+ 
+ [features]
+ default = ["std"]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..eea15b3
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,108 @@
++# Hegel Property-Based Testing Report: ndarray
++
++## 1. Scope and Approach
++
++Added 23 property-based tests (12 distinct property groups) with `hegeltest`
++0.28.2 (`hegel` crate) against ndarray's public array API, over generated
++small dynamic-dimension arrays: shapes drawn with 0–4 axes and 0–5 elements
++per axis, `i64` data (exact comparisons, no float tolerance) except where a
++property is float-specific (`mean_axis`, `f64` with a norm-scaled tolerance).
++
++ndarray is a mature, hardened crate, so per the hegel skill the tests weight
++**oracle-independent structural invariants** (round-trips, involutions, and
++element checks against the flat data `Vec` the test itself constructed and
++still holds) over differential oracles; where an oracle is used it is a naive
++loop reimplementation (triple-loop matmul, sequential folds), for which a
++disagreement would be a real bug.
++
++Existing generative tests were read first: `quickcheck` properties in
++`src/dimension/mod.rs` cover internal helpers (`can_index_slice`,
++`extended_gcd`, `arith_seq_intersect`, ...) and one `proptest` property covers
++`permute_axes`. Those were left in place (they pin internal invariants
++cheaply); the new tests target the untested public-API surface —
++reshape/transpose/slice/iterate/broadcast/concatenate/reduce/dot — and do not
++duplicate them.
++
++A maintainer AI-consent check found no `CONTRIBUTING`/governance file or
++anti-AI clause in the repository; nothing here is being upstreamed.
++
++## 2. Properties Added
++
++Shared drawing/model helpers live in `tests/hegel_support/mod.rs` (shape and
++array generators, row-major stride computation, lexicographic index
++enumeration, flat-offset model — all independent of ndarray's own indexing).
++Each property was added to the existing test file for its area:
++
++| # | Property | File | Oracle |
++|---|----------|------|--------|
++| 1 | `to_shape` to any same-size shape preserves logical element order; reshaping back restores the array exactly | `tests/reshape.rs` | independent (held data) |
++| 2 | `to_shape` with a mismatched element count returns `Err`, never panics | `tests/reshape.rs` | independent |
++| 3 | 2-D transpose: reversed shape and strides, `t[[j,i]] == a[[i,j]]` vs flat data, `t.t() == a` (involution) | `tests/array.rs` | independent |
++| 4 | n-D `reversed_axes`: reversed shape, element mapping vs flat data, involution | `tests/array.rs` | independent |
++| 5 | Per-axis slicing (`Slice::new`, negative start/end, negative steps) matches a manual index-selection model over the flat data | `tests/array.rs` | independent model of documented semantics |
++| 6 | `iter()` yields logical row-major order on both C-order arrays (== backing data) and non-contiguous reversed-axes views | `tests/iterators.rs` | independent |
++| 7 | `indexed_iter()` indices are exactly the lexicographic enumeration and values match manual flat offsets | `tests/iterators.rs` | independent |
++| 8 | `broadcast` to a compatible shape repeats elements per the index-mapping model; incompatible target (existing axis ≥ 2 changed) returns `None` | `tests/broadcast.rs` | independent |
++| 9 | `&a + &b` co-broadcasting: result shape is the common shape and every element equals `a[map_a(idx)] + b[map_b(idx)]` | `tests/broadcast.rs` | independent |
++| 10 | `concatenate`/`stack` along a drawn axis: result shape and every element vs the source data model; mismatched non-concat axis is `Err`, never a panic | `tests/stacking.rs` | independent |
++| 11 | In-place `append` matches the concatenation model (append does internal layout-shuffling, so it is covered separately); mismatch is `Err` | `tests/append.rs` | independent |
++| 12 | `sum_axis`/`product_axis`/`sum` vs naive sequential folds (i64, exact); `mean_axis` vs naive mean (f64, tolerance `4·ε·n·max|x| + MIN_POSITIVE`, `None` iff the axis is empty) | `tests/numeric.rs` | naive-fold differential |
++| 13 | 1-D `dot` vs sum-of-products; 2-D `dot` (matmul) vs a naive triple loop | `tests/oper.rs` | naive-loop differential |
++| 14 | `insert_axis`/`remove_axis` round-trip (shape, element order, exact equality); `into_dimensionality::<Ix2>` succeeds iff `ndim == 2` and round-trips through `into_dyn` | `tests/dimension.rs` | independent |
++
++Generator notes: `i64` values are full-range except where a bound protects the
++*test's own arithmetic* from inherited primitive overflow (sums, products,
++dot products); each such bound is commented as protecting the test, not a
++library contract. Slice arguments are drawn in-bounds by construction because
++out-of-bounds slicing is a documented panic. Empty axes, 0-dimensional
++arrays, and length-1 axes are all inside the generated space.
++
++## 3. Validation (Run and Reflect)
++
++- **Liveness / mutation check:** all 23 properties were individually mutated
++  (inverted assertions, or a wrong model branch) and every mutation was
++  caught with a shrunk counterexample — 23/23 across two batches.
++- **Guarded branches fire:** the `ndim == 2` branch of the
++  `into_dimensionality` property and the negative-step branch of the slice
++  model were mutated *inside the guard* and both failed, proving the guarded
++  code is actually reached (not vacuously passing).
++- **Case-count confirmation:** an atomic counter inside one test asserted
++  failure at case 1000 under `test_cases = 1000` — it failed with "reached
++  case 1000", confirming the high-count run really executes 10x cases.
++- **Exploratory 10x run:** the full property suite was run once at
++  `test_cases = 1000` (10x the committed default): all green. Committed tests
++  are back at the default count.
++- **Full suite:** `cargo test -p ndarray` (lib tests + all integration test
++  binaries, 33 result blocks) passes with 0 failures; no pre-existing test
++  was modified or broken. The `.hegel` failure database (populated only
++  during deliberate mutation runs) was removed and `.hegel/` added to
++  `.gitignore`.
++
++## 4. Findings
++
++**No bugs found.** All properties hold at the default and at 10x case counts.
++No test is pinned failing and nothing is `#[ignore]`d. This is consistent
++with ndarray being a heavily used, hardened crate; the mutation results show
++the properties are falsifiable, so the green runs are meaningful evidence for
++the core structural contracts (reshape/transpose/slice/iterate/broadcast/
++concatenate/reduce/dot) on small shapes.
++
++One behavior worth noting (verified against docs/source, not a bug): a
++negative slice step walks the `start..end` range anchored at its *back*
++(`end - 1`), not at `start` — the model test encodes and confirms exactly the
++documented `do_slice` semantics.
++
++## 5. Limitations and Future Work
++
++- Shapes are small (≤ 4–5 axes, ≤ 5 per axis) by design brief; overflow-zone
++  shapes (`isize::MAX`-scale strides) are already covered by the crate's own
++  quickcheck tests of `can_index_slice`/`max_abs_offset_check_overflow`.
++- `f32`/`f64` matmul dispatches to `matrixmultiply` (a different code path
++  than the generic i64 loop tested here); a float differential with
++  norm-scaled tolerance, and the `blas` feature path, would extend coverage.
++- Non-default features (`serde` round-trip, `rayon` parallel iterators vs
++  serial results) are untested here and are natural next differentials.
++- A stateful model test of an owned `Array` under interleaved
++  `push_row`/`push_column`/`append`/slice-assign against a `Vec<Vec<_>>`
++  model would exercise the layout-shuffling append machinery more deeply
++  than the single-append property.
+diff --git a/tests/append.rs b/tests/append.rs
+index 40beb0f..e98e936 100644
+--- a/tests/append.rs
++++ b/tests/append.rs
+@@ -451,3 +451,68 @@ fn zero_dimensional_ok()
+     a.push(Axis(0), one).unwrap();
+     assert_eq!(a, array![2, 1, 1]);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: in-place `append` along an axis matches the
++/// concatenation model (append does layout-shuffling internally, so it gets
++/// its own coverage beyond `concatenate`).
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, flat_offset, lex_indices, row_major_strides};
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    #[hegel::test]
++    fn hegel_append_matches_concatenation_model(tc: hegel::TestCase)
++    {
++        let shape_a = draw_shape(&tc, 1, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 1));
++        let mut shape_b = shape_a.clone();
++        shape_b[axis] = tc.draw(generators::integers::<usize>().max_value(5));
++
++        let (mut a, da) = draw_array_i64(&tc, &shape_a, i64::MIN, i64::MAX);
++        let (b, db) = draw_array_i64(&tc, &shape_b, i64::MIN, i64::MAX);
++
++        a.append(Axis(axis), b.view())
++            .expect("appending an array matching on all other axes must succeed");
++
++        let mut expected_shape = shape_a.clone();
++        expected_shape[axis] += shape_b[axis];
++        assert_eq!(a.shape(), &expected_shape[..]);
++
++        let stride_a = row_major_strides(&shape_a);
++        let stride_b = row_major_strides(&shape_b);
++        for idx in lex_indices(&expected_shape) {
++            let expected = if idx[axis] < shape_a[axis] {
++                da[flat_offset(&idx, &stride_a)]
++            } else {
++                let mut j = idx.clone();
++                j[axis] -= shape_a[axis];
++                db[flat_offset(&j, &stride_b)]
++            };
++            assert_eq!(a[IxDyn(&idx)], expected);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_append_shape_mismatch_errors(tc: hegel::TestCase)
++    {
++        let shape_a = draw_shape(&tc, 2, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 1));
++        let j0 = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 2));
++        let j = if j0 >= axis { j0 + 1 } else { j0 };
++        let mut shape_b = shape_a.clone();
++        let mut v = tc.draw(generators::integers::<usize>().max_value(5));
++        if v == shape_a[j] {
++            v = (v + 1) % 6;
++        }
++        shape_b[j] = v;
++
++        let (mut a, _) = draw_array_i64(&tc, &shape_a, i64::MIN, i64::MAX);
++        let (b, _) = draw_array_i64(&tc, &shape_b, i64::MIN, i64::MAX);
++
++        // Mismatch on a non-append axis must be an error, not a panic.
++        assert!(a.append(Axis(axis), b.view()).is_err());
++    }
++}
+diff --git a/tests/array.rs b/tests/array.rs
+index 391f88b..96947fa 100644
+--- a/tests/array.rs
++++ b/tests/array.rs
+@@ -2902,3 +2902,137 @@ fn permute_axes_oob()
+         .unwrap();
+     a.permute_axes([1, 0, 3]);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: transposition and slicing checked against the
++/// flat data buffer the arrays were built from (independent of ndarray's own
++/// indexing).
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, flat_offset, lex_indices, row_major_strides};
++    use hegel::generators;
++    use ndarray::prelude::*;
++    use ndarray::Slice;
++
++    #[hegel::test]
++    fn hegel_transpose_involution_and_element_mapping(tc: hegel::TestCase)
++    {
++        let r = tc.draw(generators::integers::<usize>().max_value(5));
++        let c = tc.draw(generators::integers::<usize>().max_value(5));
++        let data: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>())
++                .min_size(r * c)
++                .max_size(r * c),
++        );
++        let a = Array2::from_shape_vec((r, c), data.clone()).unwrap();
++
++        let t = a.t();
++        assert_eq!(t.shape(), &[c, r]);
++        assert_eq!(t.strides(), &[a.strides()[1], a.strides()[0]]);
++        for i in 0..r {
++            for j in 0..c {
++                assert_eq!(t[[j, i]], data[i * c + j]);
++            }
++        }
++        // Transposition is an involution.
++        assert_eq!(t.t(), a);
++    }
++
++    #[hegel::test]
++    fn hegel_reversed_axes_matches_index_reversal(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        let t = a.view().reversed_axes();
++        let rev_shape: Vec<usize> = shape.iter().rev().cloned().collect();
++        assert_eq!(t.shape(), &rev_shape[..]);
++        assert_eq!(t.view().reversed_axes(), a);
++
++        let strides = row_major_strides(&shape);
++        for idx in lex_indices(&shape) {
++            let ridx: Vec<usize> = idx.iter().rev().cloned().collect();
++            assert_eq!(t[IxDyn(&ridx)], data[flat_offset(&idx, &strides)]);
++        }
++    }
++
++    /// The indices selected by `Slice::new(start, end, step)` on an axis of
++    /// length `len`, per the documented semantics: negative `start`/`end`
++    /// count from the back, `end` is exclusive (`None` = axis end), and a
++    /// negative step walks the `start..end` range from its back.
++    fn model_slice(len: usize, start: isize, end: Option<isize>, step: isize) -> Vec<usize>
++    {
++        let abs = |i: isize| -> usize {
++            if i < 0 {
++                (len as isize + i) as usize
++            } else {
++                i as usize
++            }
++        };
++        let s = abs(start);
++        let mut e = abs(end.unwrap_or(len as isize));
++        if e < s {
++            e = s;
++        }
++        let mut selected = Vec::new();
++        if step > 0 {
++            let mut i = s;
++            while i < e {
++                selected.push(i);
++                i += step as usize;
++            }
++        } else {
++            let mut i = e as isize - 1;
++            while i >= s as isize {
++                selected.push(i as usize);
++                i += step;
++            }
++        }
++        selected
++    }
++
++    #[hegel::test]
++    fn hegel_slice_matches_manual_model(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 1, 4);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        let mut view = a.view();
++        let mut selected: Vec<Vec<usize>> = Vec::new();
++        for (ax, &len) in shape.iter().enumerate() {
++            let l = len as isize;
++            // In-bounds slice arguments (out-of-bounds ones are a documented
++            // panic); negative values index from the back of the axis.
++            let start = tc.draw(generators::integers::<isize>().min_value(-l).max_value(l));
++            let end: Option<isize> = if tc.draw(generators::booleans()) {
++                Some(tc.draw(generators::integers::<isize>().min_value(-l).max_value(l)))
++            } else {
++                None
++            };
++            let step = tc.draw(hegel::one_of!(
++                generators::integers::<isize>().min_value(1).max_value(3),
++                generators::integers::<isize>().min_value(-3).max_value(-1),
++            ));
++            view.slice_axis_inplace(Axis(ax), Slice::new(start, end, step));
++            selected.push(model_slice(len, start, end, step));
++        }
++
++        let out_shape: Vec<usize> = selected.iter().map(|v| v.len()).collect();
++        assert_eq!(view.shape(), &out_shape[..]);
++
++        let strides = row_major_strides(&shape);
++        let expected: Vec<i64> = lex_indices(&out_shape)
++            .into_iter()
++            .map(|idx| {
++                let flat: usize = idx
++                    .iter()
++                    .enumerate()
++                    .map(|(ax, &i)| selected[ax][i] * strides[ax])
++                    .sum();
++                data[flat]
++            })
++            .collect();
++        assert!(view.iter().eq(expected.iter()));
++    }
++}
+diff --git a/tests/broadcast.rs b/tests/broadcast.rs
+index eda9bab..d04300b 100644
+--- a/tests/broadcast.rs
++++ b/tests/broadcast.rs
+@@ -95,3 +95,121 @@ fn test_broadcast_1d()
+     println!("b2=\n{:?}", b2);
+     assert_eq!(b0, b2);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: broadcasting checked against a manual
++/// index-mapping model over the flat data, plus the error case and
++/// co-broadcasting element-wise arithmetic.
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, lex_indices, row_major_strides};
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    #[hegel::test]
++    fn hegel_broadcast_repeats_elements_per_model(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 3);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        // A valid broadcast target: prepend up to 2 new axes, and expand any
++        // length-1 source axis to an arbitrary length.
++        let extra = tc.draw(generators::integers::<usize>().max_value(2));
++        let mut target: Vec<usize> = (0..extra)
++            .map(|_| tc.draw(generators::integers::<usize>().max_value(5)))
++            .collect();
++        for &s in &shape {
++            if s == 1 {
++                target.push(tc.draw(generators::integers::<usize>().max_value(5)));
++            } else {
++                target.push(s);
++            }
++        }
++
++        let b = a
++            .broadcast(IxDyn(&target))
++            .expect("broadcast to a compatible shape must succeed");
++        assert_eq!(b.shape(), &target[..]);
++
++        let strides = row_major_strides(&shape);
++        let offset = target.len() - shape.len();
++        for idx in lex_indices(&target) {
++            let flat: usize = shape
++                .iter()
++                .enumerate()
++                .map(|(i, &s)| (if s == 1 { 0 } else { idx[offset + i] }) * strides[i])
++                .sum();
++            assert_eq!(b[IxDyn(&idx)], data[flat]);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_broadcast_incompatible_shape_is_none(tc: hegel::TestCase)
++    {
++        // Force one source axis to have length >= 2, then request a target
++        // that differs on that axis: broadcasting can never change it.
++        let mut shape = draw_shape(&tc, 1, 3);
++        let p = tc.draw(generators::integers::<usize>().max_value(shape.len() - 1));
++        shape[p] = tc.draw(generators::integers::<usize>().min_value(2).max_value(5));
++        let (a, _) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        let mut target = shape.clone();
++        let mut t_p = tc.draw(generators::integers::<usize>().max_value(5));
++        if t_p == shape[p] {
++            t_p = (t_p + 1) % 6;
++        }
++        target[p] = t_p;
++
++        assert!(a.broadcast(IxDyn(&target)).is_none());
++    }
++
++    #[hegel::test]
++    fn hegel_elementwise_add_cobroadcast_matches_model(tc: hegel::TestCase)
++    {
++        // Draw the common target shape, then derive two operand shapes that
++        // co-broadcast to it: `a` spans all axes, `b` a trailing suffix, and
++        // each axis is kept by at least one operand (the other may be 1).
++        let t = draw_shape(&tc, 0, 3);
++        let q = t.len();
++        let lb = tc.draw(generators::integers::<usize>().max_value(q));
++        let mut sa = Vec::with_capacity(q);
++        let mut sb = Vec::with_capacity(lb);
++        for (i, &dim) in t.iter().enumerate() {
++            let b_has_axis = i >= q - lb;
++            let mut keep_a = tc.draw(generators::booleans());
++            let keep_b = b_has_axis && tc.draw(generators::booleans());
++            if !keep_a && !keep_b {
++                keep_a = true;
++            }
++            sa.push(if keep_a { dim } else { 1 });
++            if b_has_axis {
++                sb.push(if keep_b { dim } else { 1 });
++            }
++        }
++
++        // Value bounds protect the test's `+` from primitive i64 overflow
++        // (inherited behavior, not a library contract).
++        let (a, da) = draw_array_i64(&tc, &sa, i64::MIN / 2, i64::MAX / 2);
++        let (b, db) = draw_array_i64(&tc, &sb, i64::MIN / 2, i64::MAX / 2);
++
++        let sum = &a + &b;
++        assert_eq!(sum.shape(), &t[..]);
++
++        let stride_a = row_major_strides(&sa);
++        let stride_b = row_major_strides(&sb);
++        for idx in lex_indices(&t) {
++            let fa: usize = sa
++                .iter()
++                .enumerate()
++                .map(|(i, &s)| (if s == 1 { 0 } else { idx[i] }) * stride_a[i])
++                .sum();
++            let fb: usize = sb
++                .iter()
++                .enumerate()
++                .map(|(i, &s)| (if s == 1 { 0 } else { idx[q - lb + i] }) * stride_b[i])
++                .sum();
++            assert_eq!(sum[IxDyn(&idx)], da[fa] + db[fb]);
++        }
++    }
++}
+diff --git a/tests/dimension.rs b/tests/dimension.rs
+index 53f204c..7e1445d 100644
+--- a/tests/dimension.rs
++++ b/tests/dimension.rs
+@@ -360,3 +360,48 @@ fn test_all_ndindex()
+     ndindex!(10, 4, 3, 2, 2);
+     ndindex!(10, 4, 3, 2, 2, 2);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: axis insertion/removal round-trips and
++/// `into_dimensionality` shape invariants.
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape};
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    #[hegel::test]
++    fn hegel_insert_remove_axis_roundtrip(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++        let pos = tc.draw(generators::integers::<usize>().max_value(shape.len()));
++
++        let b = a.clone().insert_axis(Axis(pos));
++        let mut expected_shape = shape.clone();
++        expected_shape.insert(pos, 1);
++        assert_eq!(b.shape(), &expected_shape[..]);
++        // Inserting a length-1 axis never changes the elements or their order.
++        assert!(b.iter().eq(data.iter()));
++
++        // remove_axis undoes insert_axis exactly.
++        assert_eq!(b.remove_axis(Axis(pos)), a);
++    }
++
++    #[hegel::test]
++    fn hegel_into_dimensionality_succeeds_iff_ndim_matches(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        let (a, _) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        let res = a.clone().into_dimensionality::<Ix2>();
++        if shape.len() == 2 {
++            let a2 = res.expect("2-axis dynamic array must convert to Ix2");
++            assert_eq!(a2.shape(), &shape[..]);
++            assert_eq!(a2.into_dyn(), a);
++        } else {
++            assert!(res.is_err(), "ndim {} must not convert to Ix2", shape.len());
++        }
++    }
++}
+diff --git a/tests/hegel_support/mod.rs b/tests/hegel_support/mod.rs
+new file mode 100644
+index 0000000..625b675
+--- /dev/null
++++ b/tests/hegel_support/mod.rs
+@@ -0,0 +1,86 @@
++//! Shared helpers for hegel property-based tests.
++//!
++//! Included via `mod hegel_support;` from the integration test files that use
++//! generated small arrays. All model computations here work directly on the
++//! flat data `Vec` and hand-computed row-major strides, so they are
++//! independent of ndarray's own indexing/iteration machinery.
++#![allow(dead_code)]
++
++use hegel::generators;
++use ndarray::{ArrayD, IxDyn};
++
++/// Draw a shape with `min_ndim..=max_ndim` axes and 0..=5 elements per axis.
++pub fn draw_shape(tc: &hegel::TestCase, min_ndim: usize, max_ndim: usize) -> Vec<usize>
++{
++    let ndim = tc.draw(
++        generators::integers::<usize>()
++            .min_value(min_ndim)
++            .max_value(max_ndim),
++    );
++    (0..ndim)
++        .map(|_| tc.draw(generators::integers::<usize>().max_value(5)))
++        .collect()
++}
++
++/// Draw a C-order `ArrayD<i64>` with the given shape and element values in
++/// `min..=max`, returning both the array and the flat row-major data it was
++/// built from (an independent copy the properties can check against).
++pub fn draw_array_i64(tc: &hegel::TestCase, shape: &[usize], min: i64, max: i64) -> (ArrayD<i64>, Vec<i64>)
++{
++    let n: usize = shape.iter().product();
++    let data: Vec<i64> = tc.draw(
++        generators::vecs(generators::integers::<i64>().min_value(min).max_value(max))
++            .min_size(n)
++            .max_size(n),
++    );
++    let a = ArrayD::from_shape_vec(IxDyn(shape), data.clone()).unwrap();
++    (a, data)
++}
++
++/// Row-major (C order) strides, in elements, for `shape`.
++///
++/// If some later axis has length 0 the earlier strides are 0, but in that
++/// case the shape contains no valid indices, so they are never used.
++pub fn row_major_strides(shape: &[usize]) -> Vec<usize>
++{
++    let mut strides = vec![1usize; shape.len()];
++    for i in (0..shape.len().saturating_sub(1)).rev() {
++        strides[i] = strides[i + 1] * shape[i + 1];
++    }
++    strides
++}
++
++/// All indices of `shape`, in lexicographic (row-major) order.
++///
++/// For a 0-dimensional shape this is the single empty index; for any shape
++/// with a zero-length axis it is empty.
++pub fn lex_indices(shape: &[usize]) -> Vec<Vec<usize>>
++{
++    let mut out = Vec::new();
++    if shape.iter().product::<usize>() == 0 {
++        return out;
++    }
++    let mut idx = vec![0usize; shape.len()];
++    loop {
++        out.push(idx.clone());
++        // Odometer increment on the last axis.
++        let mut i = shape.len();
++        loop {
++            if i == 0 {
++                return out;
++            }
++            i -= 1;
++            idx[i] += 1;
++            if idx[i] < shape[i] {
++                break;
++            }
++            idx[i] = 0;
++        }
++    }
++}
++
++/// Flat offset of `idx` given per-axis strides.
++pub fn flat_offset(idx: &[usize], strides: &[usize]) -> usize
++{
++    idx.iter().zip(strides).map(|(&i, &s)| i * s).sum()
++}
+diff --git a/tests/iterators.rs b/tests/iterators.rs
+index 96b0673..5a622d2 100644
+--- a/tests/iterators.rs
++++ b/tests/iterators.rs
+@@ -1083,3 +1083,55 @@ fn test_impl_iter_compiles()
+ 
+     let _ = array_iter_non_empty_indices;
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: iteration follows logical (row-major) order,
++/// for both standard-layout arrays and non-contiguous views, and
++/// `indexed_iter` produces the matching lexicographic indices.
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, flat_offset, lex_indices, row_major_strides};
++    use ndarray::prelude::*;
++    use ndarray::Dimension;
++
++    #[hegel::test]
++    fn hegel_iter_yields_row_major_logical_order(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++
++        // A C-order array iterates exactly in the order of its backing data.
++        assert!(a.iter().eq(data.iter()));
++
++        // A non-contiguous view (reversed axes) still iterates in *its own*
++        // logical row-major order, which we compute from the flat data.
++        let t = a.view().reversed_axes();
++        let rev_shape: Vec<usize> = shape.iter().rev().cloned().collect();
++        let strides = row_major_strides(&shape);
++        let expected: Vec<i64> = lex_indices(&rev_shape)
++            .into_iter()
++            .map(|ridx| {
++                let idx: Vec<usize> = ridx.iter().rev().cloned().collect();
++                data[flat_offset(&idx, &strides)]
++            })
++            .collect();
++        assert!(t.iter().eq(expected.iter()));
++    }
++
++    #[hegel::test]
++    fn hegel_indexed_iter_indices_are_lexicographic_and_correct(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++        let strides = row_major_strides(&shape);
++
++        let items: Vec<(IxDyn, &i64)> = a.indexed_iter().collect();
++        let expected_indices = lex_indices(&shape);
++        assert_eq!(items.len(), expected_indices.len());
++        for ((pattern, value), idx) in items.iter().zip(&expected_indices) {
++            assert_eq!(pattern.slice(), &idx[..]);
++            assert_eq!(**value, data[flat_offset(idx, &strides)]);
++        }
++    }
++}
+diff --git a/tests/numeric.rs b/tests/numeric.rs
+index b82a356..257f4cc 100644
+--- a/tests/numeric.rs
++++ b/tests/numeric.rs
+@@ -475,3 +475,133 @@ fn diff_panic_axis_out_of_bounds()
+     let data = array![1, 2, 4, 7];
+     data.diff(1, Axis(2));
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: axis reductions checked against naive folds
++/// over the flat data (exact in i64; norm-scaled tolerance for f64 mean).
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, flat_offset, lex_indices, row_major_strides};
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    /// Indices of the reduced array (shape with `axis` removed), returned
++    /// with the shape/strides needed to walk the source data.
++    fn reduced_shape(shape: &[usize], axis: usize) -> Vec<usize>
++    {
++        let mut out = shape.to_vec();
++        out.remove(axis);
++        out
++    }
++
++    #[hegel::test]
++    fn hegel_sum_axis_matches_naive_fold(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 1, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape.len() - 1));
++        // Bound protects the naive fold (and the library's inherited `+`)
++        // from primitive i64 overflow: at most 5 addends of magnitude 2^55.
++        let (a, data) = draw_array_i64(&tc, &shape, -(1 << 55), 1 << 55);
++
++        let s = a.sum_axis(Axis(axis));
++        let out_shape = reduced_shape(&shape, axis);
++        assert_eq!(s.shape(), &out_shape[..]);
++
++        let strides = row_major_strides(&shape);
++        for idx in lex_indices(&out_shape) {
++            let mut expected = 0i64;
++            for j in 0..shape[axis] {
++                let mut src = idx.clone();
++                src.insert(axis, j);
++                expected += data[flat_offset(&src, &strides)];
++            }
++            assert_eq!(s[IxDyn(&idx)], expected);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_product_axis_matches_naive_fold(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 1, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape.len() - 1));
++        // Bound protects against i64 overflow: at most 1000^5 < 2^50.
++        let (a, data) = draw_array_i64(&tc, &shape, -1000, 1000);
++
++        let p = a.product_axis(Axis(axis));
++        let out_shape = reduced_shape(&shape, axis);
++        assert_eq!(p.shape(), &out_shape[..]);
++
++        let strides = row_major_strides(&shape);
++        for idx in lex_indices(&out_shape) {
++            let mut expected = 1i64;
++            for j in 0..shape[axis] {
++                let mut src = idx.clone();
++                src.insert(axis, j);
++                expected *= data[flat_offset(&src, &strides)];
++            }
++            assert_eq!(p[IxDyn(&idx)], expected);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_sum_matches_naive_total(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 4);
++        // Bound protects the fold from i64 overflow: <= 625 addends of 2^50.
++        let (a, data) = draw_array_i64(&tc, &shape, -(1 << 50), 1 << 50);
++        assert_eq!(a.sum(), data.iter().sum::<i64>());
++    }
++
++    #[hegel::test]
++    fn hegel_mean_axis_matches_naive_mean(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 1, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape.len() - 1));
++        let n: usize = shape.iter().product();
++        let data: Vec<f64> = tc.draw(
++            generators::vecs(
++                generators::floats::<f64>().min_value(-1e100).max_value(1e100),
++            )
++            .min_size(n)
++            .max_size(n),
++        );
++        let a = ArrayD::from_shape_vec(IxDyn(&shape), data.clone()).unwrap();
++
++        let mean = a.mean_axis(Axis(axis));
++        if shape[axis] == 0 {
++            assert!(mean.is_none(), "mean over an empty axis must be None");
++            return;
++        }
++        let mean = mean.expect("mean over a non-empty axis must be Some");
++        let out_shape = reduced_shape(&shape, axis);
++        assert_eq!(mean.shape(), &out_shape[..]);
++
++        let len = shape[axis] as f64;
++        let strides = row_major_strides(&shape);
++        for idx in lex_indices(&out_shape) {
++            let mut sum = 0.0f64;
++            let mut max_abs = 0.0f64;
++            for j in 0..shape[axis] {
++                let mut src = idx.clone();
++                src.insert(axis, j);
++                let x = data[flat_offset(&src, &strides)];
++                sum += x;
++                max_abs = max_abs.max(x.abs());
++            }
++            let expected = sum / len;
++            // Norm-scaled tolerance: pairwise vs sequential summation may
++            // differ by O(n * eps * max|x|); floor it for subnormal scales.
++            let tol = 4.0 * f64::EPSILON * len * max_abs + f64::MIN_POSITIVE;
++            let actual = mean[IxDyn(&idx)];
++            assert!(
++                (actual - expected).abs() <= tol,
++                "mean mismatch at {:?}: {} vs {} (tol {})",
++                idx,
++                actual,
++                expected,
++                tol
++            );
++        }
++    }
++}
+diff --git a/tests/oper.rs b/tests/oper.rs
+index a6d7054..bce3e0b 100644
+--- a/tests/oper.rs
++++ b/tests/oper.rs
+@@ -869,3 +869,54 @@ fn kron_i64()
+     let r = arr2(&[[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]]);
+     assert_eq!(kron(&a, &b), r);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: `dot` for 1-D and 2-D integer arrays against
++/// naive loop oracles (i64, exact, no float tolerance needed).
++mod hegel_props
++{
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    #[hegel::test]
++    fn hegel_dot_1d_matches_naive_sum_of_products(tc: hegel::TestCase)
++    {
++        let len = tc.draw(generators::integers::<usize>().max_value(8));
++        // Bound protects the products/sum from i64 overflow: 8 * (10^6)^2 < 2^53.
++        let value_gen = || generators::integers::<i64>().min_value(-1_000_000).max_value(1_000_000);
++        let a_data: Vec<i64> = tc.draw(generators::vecs(value_gen()).min_size(len).max_size(len));
++        let b_data: Vec<i64> = tc.draw(generators::vecs(value_gen()).min_size(len).max_size(len));
++        let a = Array1::from_vec(a_data.clone());
++        let b = Array1::from_vec(b_data.clone());
++
++        let expected: i64 = a_data.iter().zip(&b_data).map(|(x, y)| x * y).sum();
++        assert_eq!(a.dot(&b), expected);
++    }
++
++    #[hegel::test]
++    fn hegel_matmul_2d_matches_naive_triple_loop(tc: hegel::TestCase)
++    {
++        let m = tc.draw(generators::integers::<usize>().max_value(5));
++        let k = tc.draw(generators::integers::<usize>().max_value(5));
++        let n = tc.draw(generators::integers::<usize>().max_value(5));
++        // Bound protects from i64 overflow: 5 * (10^4)^2 < 2^33.
++        let value_gen = || generators::integers::<i64>().min_value(-10_000).max_value(10_000);
++        let a_data: Vec<i64> = tc.draw(generators::vecs(value_gen()).min_size(m * k).max_size(m * k));
++        let b_data: Vec<i64> = tc.draw(generators::vecs(value_gen()).min_size(k * n).max_size(k * n));
++        let a = Array2::from_shape_vec((m, k), a_data.clone()).unwrap();
++        let b = Array2::from_shape_vec((k, n), b_data.clone()).unwrap();
++
++        let c = a.dot(&b);
++        assert_eq!(c.shape(), &[m, n]);
++        for i in 0..m {
++            for j in 0..n {
++                let mut expected = 0i64;
++                for l in 0..k {
++                    expected += a_data[i * k + l] * b_data[l * n + j];
++                }
++                assert_eq!(c[[i, j]], expected, "mismatch at ({}, {})", i, j);
++            }
++        }
++    }
++}
+diff --git a/tests/reshape.rs b/tests/reshape.rs
+index a13a5c0..d32f892 100644
+--- a/tests/reshape.rs
++++ b/tests/reshape.rs
+@@ -329,3 +329,69 @@ fn into_shape_clone()
+         assert_eq!(s, array![[1, 5], [2, 6], [3, 7], [4, 8]]);
+     }
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: reshaping to any compatible shape preserves
++/// the elements in logical (row-major) order, and an incompatible total size
++/// is an error, never a panic.
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape};
++    use hegel::generators;
++    use ndarray::prelude::*;
++
++    /// Draw a shape with the same number of elements as `n` by drawing a
++    /// chain of divisors of `n` (plus an explicit zero axis when `n == 0`).
++    fn draw_compatible_shape(tc: &hegel::TestCase, n: usize) -> Vec<usize>
++    {
++        if n == 0 {
++            let mut shape = draw_shape(tc, 1, 4);
++            let pos = tc.draw(generators::integers::<usize>().max_value(shape.len() - 1));
++            shape[pos] = 0;
++            return shape;
++        }
++        let mut dims = Vec::new();
++        let mut rem = n;
++        let extra_axes = tc.draw(generators::integers::<usize>().max_value(3));
++        for _ in 0..extra_axes {
++            let divisors: Vec<usize> = (1..=rem).filter(|d| rem % d == 0).collect();
++            let d = tc.draw(generators::sampled_from(divisors));
++            dims.push(d);
++            rem /= d;
++        }
++        dims.push(rem);
++        dims
++    }
++
++    #[hegel::test]
++    fn hegel_reshape_roundtrip_preserves_logical_order(tc: hegel::TestCase)
++    {
++        let shape1 = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape1, i64::MIN, i64::MAX);
++        let shape2 = draw_compatible_shape(&tc, data.len());
++
++        let b = a
++            .to_shape(IxDyn(&shape2))
++            .expect("reshape to a shape with the same number of elements must succeed");
++        assert_eq!(b.shape(), &shape2[..]);
++        // Row-major reshape of a C-order array preserves logical element order.
++        assert!(b.iter().eq(data.iter()));
++
++        // Reshaping back restores the original array exactly.
++        let c = b.to_shape(IxDyn(&shape1)).unwrap();
++        assert_eq!(c, a);
++    }
++
++    #[hegel::test]
++    fn hegel_reshape_incompatible_size_errors(tc: hegel::TestCase)
++    {
++        let shape1 = draw_shape(&tc, 0, 4);
++        let (a, data) = draw_array_i64(&tc, &shape1, i64::MIN, i64::MAX);
++        let shape2 = draw_shape(&tc, 0, 4);
++        let n2: usize = shape2.iter().product();
++        tc.assume(n2 != data.len());
++        // Mismatched element count must be a ShapeError, not a panic.
++        assert!(a.to_shape(IxDyn(&shape2)).is_err());
++    }
++}
+diff --git a/tests/stacking.rs b/tests/stacking.rs
+index bdfe478..f7b819f 100644
+--- a/tests/stacking.rs
++++ b/tests/stacking.rs
+@@ -53,3 +53,99 @@ fn stacking()
+     let res: Result<Array2<f64>, _> = ndarray::stack::<_, Ix1>(Axis(0), &[]);
+     assert_eq!(res.unwrap_err().kind(), ErrorKind::Unsupported);
+ }
++
++mod hegel_support;
++
++/// Hegel property-based tests: `concatenate` and `stack` checked against a
++/// manual index-mapping model over the source arrays' flat data.
++mod hegel_props
++{
++    use crate::hegel_support::{draw_array_i64, draw_shape, flat_offset, lex_indices, row_major_strides};
++    use hegel::generators;
++    use ndarray::{concatenate, stack, Axis, IxDyn};
++
++    #[hegel::test]
++    fn hegel_concatenate_matches_model(tc: hegel::TestCase)
++    {
++        let shape_a = draw_shape(&tc, 1, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 1));
++        let mut shape_b = shape_a.clone();
++        shape_b[axis] = tc.draw(generators::integers::<usize>().max_value(5));
++
++        let (a, da) = draw_array_i64(&tc, &shape_a, i64::MIN, i64::MAX);
++        let (b, db) = draw_array_i64(&tc, &shape_b, i64::MIN, i64::MAX);
++
++        let c = concatenate(Axis(axis), &[a.view(), b.view()])
++            .expect("concatenating same-shape-except-axis arrays must succeed");
++
++        let mut expected_shape = shape_a.clone();
++        expected_shape[axis] += shape_b[axis];
++        assert_eq!(c.shape(), &expected_shape[..]);
++
++        let stride_a = row_major_strides(&shape_a);
++        let stride_b = row_major_strides(&shape_b);
++        for idx in lex_indices(&expected_shape) {
++            let expected = if idx[axis] < shape_a[axis] {
++                da[flat_offset(&idx, &stride_a)]
++            } else {
++                let mut j = idx.clone();
++                j[axis] -= shape_a[axis];
++                db[flat_offset(&j, &stride_b)]
++            };
++            assert_eq!(c[IxDyn(&idx)], expected);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_concatenate_shape_mismatch_errors(tc: hegel::TestCase)
++    {
++        let shape_a = draw_shape(&tc, 2, 4);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 1));
++        // Pick a *different* axis and make the shapes differ there.
++        let j0 = tc.draw(generators::integers::<usize>().max_value(shape_a.len() - 2));
++        let j = if j0 >= axis { j0 + 1 } else { j0 };
++        let mut shape_b = shape_a.clone();
++        let mut v = tc.draw(generators::integers::<usize>().max_value(5));
++        if v == shape_a[j] {
++            v = (v + 1) % 6;
++        }
++        shape_b[j] = v;
++
++        let (a, _) = draw_array_i64(&tc, &shape_a, i64::MIN, i64::MAX);
++        let (b, _) = draw_array_i64(&tc, &shape_b, i64::MIN, i64::MAX);
++
++        // Mismatch on a non-concatenation axis must be an error, not a panic.
++        assert!(concatenate(Axis(axis), &[a.view(), b.view()]).is_err());
++    }
++
++    #[hegel::test]
++    fn hegel_stack_matches_model(tc: hegel::TestCase)
++    {
++        let shape = draw_shape(&tc, 0, 3);
++        let axis = tc.draw(generators::integers::<usize>().max_value(shape.len()));
++        let n_arrays = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++
++        let mut arrays = Vec::with_capacity(n_arrays);
++        let mut datas = Vec::with_capacity(n_arrays);
++        for _ in 0..n_arrays {
++            let (a, d) = draw_array_i64(&tc, &shape, i64::MIN, i64::MAX);
++            arrays.push(a);
++            datas.push(d);
++        }
++        let views: Vec<_> = arrays.iter().map(|a| a.view()).collect();
++
++        let s = stack(Axis(axis), &views).expect("stacking same-shape arrays must succeed");
++
++        let mut expected_shape = shape.clone();
++        expected_shape.insert(axis, n_arrays);
++        assert_eq!(s.shape(), &expected_shape[..]);
++
++        let strides = row_major_strides(&shape);
++        for idx in lex_indices(&expected_shape) {
++            let which = idx[axis];
++            let mut src = idx.clone();
++            src.remove(axis);
++            assert_eq!(s[IxDyn(&idx)], datas[which][flat_offset(&src, &strides)]);
++        }
++    }
++}

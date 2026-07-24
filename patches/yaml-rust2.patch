@@ -1,0 +1,691 @@
+diff --git a/.gitignore b/.gitignore
+index 02d7464..302cd49 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,5 @@
+ *.swp
++.hegel/
+ /perf.*
+ /target
+ /tools/gen_large_yaml/target
+diff --git a/Cargo.toml b/Cargo.toml
+index 9e211de..df24331 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,8 +32,8 @@ encoding_rs = { version = "0.8.33", optional = true }
+ hashlink = "0.11"
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ libtest-mimic = "0.8"
+-quickcheck = "1.0"
+ 
+ [profile.release-lto]
+ inherits = "release"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..ca3fc7d
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,151 @@
++# Hegel Property-Based Testing Report
++
++Property-based tests were added with [hegel](https://hegel.dev) (`hegeltest`
++dev-dependency). The previous quickcheck suite (`tests/quickcheck.rs`) was
++ported to hegel and the `quickcheck` dev-dependency removed. Note: `hegeltest`
++requires rustc 1.86, above the crate's declared `rust-version = "1.65.0"`; it
++was added with `cargo add --dev --ignore-rust-version` (dev-dependency only —
++whether that MSRV bump for tests is acceptable is a maintainer decision).
++
++## Properties tested
++
++In `tests/test_round_trip.rs`:
++
++1. **`pbt_roundtrip_generated_document`** — any generated `Yaml` document
++   (nested arrays/hashes/scalars; strings drawn from arbitrary Unicode text,
++   number/bool/null lookalikes, radix-prefixed strings, YAML indicator
++   characters, Unicode separators `U+0085`/`U+2028`/`U+2029`/`U+FEFF`; hash
++   keys include complex `?` keys) survives emit → load unchanged.
++2. **`pbt_roundtrip_generated_document_multiline`** — the same roundtrip with
++   `multiline_strings(true)` (literal block scalar emission).
++3. **`pbt_string_scalar_type_and_content_preserved`** — a `Yaml::String`
++   scalar always reloads as a `String` with identical content, however much it
++   looks like a number, boolean, null, date, or YAML syntax.
++4. **`pbt_number_scalar_roundtrip`** — `Yaml::Integer` (full `i64` range) and
++   `Yaml::Real` (loader-canonical float strings, `.inf`/`.nan` forms)
++   roundtrip unchanged.
++5. **`pbt_multi_document_stream_roundtrip`** — a stream of several documents,
++   each emitted with its own `---` header, loads back as the same sequence.
++6. **`pbt_array_of_weird_strings_roundtrip`** — port of the quickcheck
++   property `test_check_weird_keys`: an array of arbitrary strings
++   roundtrips (same 100-case count as the quickcheck default).
++
++In `tests/basic.rs`:
++
++7. **`pbt_load_arbitrary_text_never_panics`** — `YamlLoader::load_from_str`
++   returns `Ok`/`Err` but never panics, on arbitrary Unicode text and on
++   YAML-syntax token soup.
++8. **`pbt_emitted_documents_reparse_to_same_value`** — any document the
++   loader accepts (from arbitrary/YAML-ish text) can be re-emitted, and the
++   emitted YAML parses back to the same value (load → emit → load identity).
++9. **`pbt_alias_resolves_to_anchored_value`** — an alias `*a` resolves to
++   exactly the value of its anchor `&a`.
++10. **`pbt_decoder_never_panics_on_arbitrary_bytes`** — `YamlDecoder` never
++    panics (or hangs) on arbitrary byte input under all three standard
++    decoding traps.
++
++Every property that overlaps a known bug excludes exactly the pinned buggy
++input class, with comments referencing the canonical `known_bug_*` test.
++
++## Test results
++
++- All 10 properties above pass at the default 100 cases and in an exploratory
++  10x run (1000 cases per property).
++- Liveness was verified by temporarily inverting a property:
++  hegel reported and shrank the counterexample to the minimal `Integer(0)`.
++- The full pre-existing suite (unit tests, scanner, emitter, spec tests,
++  yaml-test-suite (402 cases), doc-tests) passes. The `tests/yaml-test-suite`
++  git submodule was not initialized in this checkout and had to be fetched
++  (`git submodule update --init`) for that harness to run at all.
++- **7 pinned known-failure tests fail deliberately and deterministically**
++  (every generated case hits the bug): six `known_bug_*` tests in
++  `tests/test_round_trip.rs` fail on every run, and one hang reproducer in
++  `tests/basic.rs` is `#[ignore]`d (running it hangs forever, which would
++  take the whole suite down). These document the bugs below and must stay
++  failing until the bugs are fixed.
++
++## Suspected bugs
++
++All found by the properties above, none fixed (per instructions); each is
++pinned by a deterministic test:
++
++1. **`0o…` octal-looking strings change type**
++   (`known_bug_octal_like_string_changes_type`): `need_quotes`
++   (src/emitter.rs) quotes `0x`-prefixed strings but not `0o`-prefixed ones,
++   while `Yaml::from_str` parses `0o…` as octal. `String("0o7")` is emitted
++   bare and reloads as `Integer(7)`.
++2. **`+.inf` strings change type**
++   (`known_bug_plus_dot_inf_string_changes_type`): `parse_f64` accepts
++   `+.inf`/`+.Inf`/`+.INF` but `need_quotes` does not quote them.
++   `String("+.inf")` reloads as `Real("+.inf")`.
++3. **Integer-looking `Real` values change type**
++   (`known_bug_integer_looking_real_changes_type`): `Yaml::Real` is emitted
++   verbatim with no check that the text still reads back as a float.
++   `!!float 5` loads as `Real("5")`, which is emitted as bare `5` and reloads
++   as `Integer(5)`.
++4. **Multiline mode: leading-space lines break block scalars**
++   (`known_bug_multiline_leading_space_line`): a literal-block line starting
++   with a space breaks indentation detection. `" a\nb"` produces output that
++   fails to parse ("wrongly indented line in block scalar"); `"\n a"`
++   silently reloads as `"\na"`.
++5. **Multiline mode: trailing newlines lost**
++   (`known_bug_multiline_trailing_newlines_lost`): literal blocks are always
++   emitted with clip chomping (`|`/`|-`, never `|+`), so `"a\n\n\n"` reloads
++   as `"a\n\n"` and `"\n\n"` reloads as `"\n"`.
++6. **Multiline mode: multiline string as mapping key corrupts the document**
++   (`known_bug_multiline_string_as_hash_key`): a scalar key containing `\n`
++   is emitted as a block scalar in key position; `{"a\nb": ~}` emits as
++   `|-\n  a\n  b: ~`, which reloads as the single string `"a\nb: ~"`.
++7. **`YamlDecoder` hangs forever on short expanding input**
++   (`known_bug_decoder_hangs_on_short_expanding_input`, `#[ignore]`d):
++   `decode_loop` (src/yaml.rs) reserves `input.len()` output bytes and grows
++   the output by `input.len() / 10` bytes on `OutputFull`. `String::reserve`
++   only guarantees capacity ≥ len + additional, so when `input.len() / 10` is
++   smaller than the next character's UTF-8 width, the loop makes no progress:
++   inputs shorter than 40 bytes whose UTF-8 output outgrows the reservation
++   hang forever. Minimal reproducer: `FF FE 34 12 34 12 34 12` (UTF-16LE
++   `ሴሴሴ`, 8 bytes in, 9 UTF-8 bytes out). Found by property 10, whose live
++   version now draws `binary().min_size(40)` to stay clear of the hang.
++
++## Unsound properties abandoned
++
++- **Roundtrip of arbitrary `Yaml::Real(String)` values** — unsound as
++  originally conceived: `Real` is emitted verbatim, so only strings the
++  loader itself would classify as `Real` can possibly roundtrip
++  (`Real("hello")` is not a reachable loader value). The generator was
++  constrained to loader-canonical float strings (`format!("{f:?}")` of finite
++  floats plus `.inf`/`.nan` forms). Within that domain the property is sound
++  — and still caught bug 3 via the `!!float 5` loader path.
++- **Roundtrip of documents containing `Yaml::BadValue` or `Yaml::Alias`** —
++  unsound: the emitter has no representation for them (`BadValue` emits `~`,
++  i.e. null; `Alias` emits nothing). Generators never produce them, and the
++  load → emit → load property skips loader-produced `BadValue` documents
++  (empty documents, invalid tagged scalars, unresolved aliases).
++- **`load_from_str` ≡ `load_from_iter` equivalence** — not written:
++  tautological, one delegates to the other.
++
++## Skill feedback
++
++- The workflow paid off in order: reading the emitter's `need_quotes` before
++  writing generators (per "generate at the encode-set boundary") is directly
++  what surfaced the `0o`/`+.inf` holes, and the "cursed strings" angles from
++  the property catalogue (number/bool/null lookalikes, Unicode separators)
++  were the right target list.
++- The Rust reference was accurate throughout: `hegeltest` vs `hegel` naming,
++  `--ignore-rust-version` for the MSRV clash, the recursive-generator
++  `compose!`+`BoxedGenerator` pattern (recursive `#[hegel::composite]` indeed
++  does not compile), and `one_of!` accepting heterogeneous generator types
++  all worked exactly as documented.
++- The guidance on pinning real bugs (boosted generator so every case fails →
++  deterministic red) and on excluding pinned classes from siblings with
++  cross-referencing comments kept the suite in a useful state: 10 live green
++  properties, 7 precise red/ignored pins.
++- The "special case: process-aborting failures" advice generalized well to a
++  *hang* (decoder bug): `#[ignore]` + documented reproducer was the right
++  move since libtest has no per-test timeout. The skill could mention hangs
++  explicitly alongside stack-overflow/OOM aborts, and that a hang inside a
++  property can masquerade as "hegel being slow" — a `timeout`-wrapped run of
++  the single test distinguishes the two quickly.
++- Minor friction: there is no global case-count override, so the 10x
++  exploratory run required a temporary `sed` over the attributes, as the
++  reference itself suggests.
+diff --git a/tests/basic.rs b/tests/basic.rs
+index d980bea..6187e1c 100644
+--- a/tests/basic.rs
++++ b/tests/basic.rs
+@@ -525,3 +525,163 @@ fn test_nominal_float_parse() {
+         assert!(it.as_str().is_some());
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self, BoxedGenerator, Generator};
++
++/// Arbitrary text biased towards YAML syntax: either fully arbitrary Unicode
++/// text or a concatenation of YAML-significant fragments, so the scanner and
++/// parser see plenty of structurally interesting input.
++fn yamlish_text() -> BoxedGenerator<'static, String> {
++    const TOKENS: &[&str] = &[
++        "- ", "-", ": ", ":", "? ", "&a ", "*a", "!!int ", "!!str ", "!!float ", "!!bool ",
++        "!t ", "|", "|-", "|+", ">", ">-", "#c", "\n", "\n  ", "\n\t", " ", "'", "\"", "[",
++        "]", "{", "}", ",", "---", "...", "%YAML 1.2", "%TAG ! !e", "\t", "a", "b", "0", "1.5",
++        "null", "~", "true", "\\", "\"\\n\"", "''", "\u{feff}", "\r\n", "&", "*", "!", "@",
++        "`", "0o7", "+.inf", "e", ".",
++    ];
++    hegel::one_of!(
++        generators::text(),
++        generators::vecs(generators::sampled_from(
++            TOKENS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
++        ))
++        .max_size(30)
++        .map(|v| v.concat()),
++    )
++    .boxed()
++}
++
++/// The loader must return `Ok` or `Err`, but never panic, whatever the input.
++#[hegel::test]
++fn pbt_load_arbitrary_text_never_panics(tc: hegel::TestCase) {
++    let s = tc.draw(yamlish_text());
++    drop(YamlLoader::load_from_str(&s));
++}
++
++/// Whether a loaded value is hit by a known emitter bug. Each class is
++/// pinned by a canonical failing `known_bug_*` test in
++/// `tests/test_round_trip.rs`; see there for details.
++fn hits_known_emitter_bug(doc: &Yaml) -> bool {
++    match doc {
++        // `known_bug_octal_like_string_changes_type` and
++        // `known_bug_plus_dot_inf_string_changes_type`.
++        Yaml::String(s) => {
++            s.strip_prefix("0o")
++                .map_or(false, |rest| i64::from_str_radix(rest, 8).is_ok())
++                || matches!(s.as_str(), "+.inf" | "+.Inf" | "+.INF")
++        }
++        // `!!float 5` loads as `Real("5")`, which is re-emitted as an
++        // integer: `known_bug_integer_looking_real_changes_type`.
++        Yaml::Real(s) => s.parse::<i64>().is_ok(),
++        Yaml::Array(v) => v.iter().any(hits_known_emitter_bug),
++        Yaml::Hash(h) => h
++            .iter()
++            .any(|(k, v)| hits_known_emitter_bug(k) || hits_known_emitter_bug(v)),
++        _ => false,
++    }
++}
++
++/// Whether a loaded value contains `BadValue` (empty documents, invalid
++/// tagged scalars, unresolved aliases). `BadValue` is not representable by
++/// the emitter (it is emitted as `~`), so roundtrip properties skip it.
++fn contains_badvalue(doc: &Yaml) -> bool {
++    match doc {
++        Yaml::BadValue => true,
++        Yaml::Array(v) => v.iter().any(contains_badvalue),
++        Yaml::Hash(h) => h
++            .iter()
++            .any(|(k, v)| contains_badvalue(k) || contains_badvalue(v)),
++        _ => false,
++    }
++}
++
++/// Any document the loader accepts must be re-emittable as valid YAML that
++/// parses back to the same value (load → emit → load is the identity on
++/// loaded values).
++#[hegel::test]
++fn pbt_emitted_documents_reparse_to_same_value(tc: hegel::TestCase) {
++    let s = tc.draw(yamlish_text());
++    let Ok(docs) = YamlLoader::load_from_str(&s) else {
++        tc.reject();
++    };
++    for doc in &docs {
++        if contains_badvalue(doc) || hits_known_emitter_bug(doc) {
++            continue;
++        }
++        let mut emitted = String::new();
++        YamlEmitter::new(&mut emitted).dump(doc).unwrap();
++        let reparsed = YamlLoader::load_from_str(&emitted).unwrap_or_else(|e| {
++            panic!("emitted YAML failed to reparse: {e}\ninput: {s:?}\nemitted: {emitted:?}")
++        });
++        assert_eq!(reparsed.len(), 1, "emitted: {emitted:?}");
++        assert_eq!(&reparsed[0], doc, "emitted: {emitted:?}");
++    }
++}
++
++/// An alias (`*a`) resolves to the same value as its anchor (`&a`).
++#[hegel::test]
++fn pbt_alias_resolves_to_anchored_value(tc: hegel::TestCase) {
++    let items: Vec<i64> = tc.draw(generators::vecs(generators::integers::<i64>()).max_size(5));
++    let body = items
++        .iter()
++        .map(ToString::to_string)
++        .collect::<Vec<_>>()
++        .join(", ");
++    let src = format!("- &a [{body}]\n- *a");
++    let docs = YamlLoader::load_from_str(&src).unwrap();
++    assert_eq!(docs.len(), 1);
++    let expected = Yaml::Array(items.into_iter().map(Yaml::Integer).collect());
++    assert_eq!(docs[0][0], expected);
++    assert_eq!(docs[0][1], expected);
++}
++
++/// The byte-stream decoder must never panic (or hang) on arbitrary bytes,
++/// whichever decoding trap is configured.
++#[cfg(feature = "encoding")]
++#[hegel::test]
++fn pbt_decoder_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++    use yaml_rust2::yaml::{YAMLDecodingTrap, YamlDecoder};
++    // KNOWN BUG exclusion: `decode_loop` (src/yaml.rs) grows the output by
++    // `input.len() / 10` bytes on `OutputFull`, and `String::reserve` only
++    // guarantees capacity >= len + additional. When `input.len() / 10` is
++    // smaller than the next character's UTF-8 width (up to 4 bytes), no
++    // progress is made and decoding spins forever, so inputs shorter than 40
++    // bytes can hang. `.min_size(40)` avoids the hang; the bug is pinned by
++    // the ignored `known_bug_decoder_hangs_on_short_expanding_input` test
++    // below.
++    let bytes: Vec<u8> = tc.draw(generators::binary().min_size(40));
++    let trap = match tc.draw(generators::integers::<u8>().max_value(2)) {
++        0 => YAMLDecodingTrap::Ignore,
++        1 => YAMLDecodingTrap::Strict,
++        _ => YAMLDecodingTrap::Replace,
++    };
++    drop(YamlDecoder::read(bytes.as_slice()).encoding_trap(trap).decode());
++}
++
++/// KNOWN FAILURE (hang): `decode_loop` (src/yaml.rs) reserves `input.len()`
++/// output bytes up front and, whenever the output is full, grows it by
++/// `input.len() / 10` bytes. `String::reserve` only guarantees capacity >=
++/// len + additional, so whenever `input.len() / 10` is smaller than the next
++/// character's UTF-8 width the loop makes no progress and decoding hangs
++/// (inputs shorter than 40 bytes are affected; for inputs shorter than 10
++/// bytes the growth is exactly zero). Minimal reproducer: UTF-16LE BOM +
++/// `ሴሴሴ` (8 bytes in, 9 bytes of UTF-8 out).
++///
++/// This test is `#[ignore]`d rather than left failing because it never
++/// terminates and would hang the whole test suite. Run it manually with
++/// `cargo test -- --ignored known_bug_decoder` to observe the hang.
++#[cfg(feature = "encoding")]
++#[test]
++#[ignore = "hangs forever: decode_loop makes no progress on short expanding input"]
++fn known_bug_decoder_hangs_on_short_expanding_input() {
++    use yaml_rust2::yaml::{YAMLDecodingTrap, YamlDecoder};
++    let bytes: &[u8] = &[0xFF, 0xFE, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12];
++    drop(
++        YamlDecoder::read(bytes)
++            .encoding_trap(YAMLDecodingTrap::Replace)
++            .decode(),
++    );
++}
+diff --git a/tests/quickcheck.rs b/tests/quickcheck.rs
+deleted file mode 100644
+index fdf2549..0000000
+--- a/tests/quickcheck.rs
++++ /dev/null
+@@ -1,21 +0,0 @@
+-extern crate yaml_rust2;
+-#[macro_use]
+-extern crate quickcheck;
+-
+-use quickcheck::TestResult;
+-use yaml_rust2::{Yaml, YamlEmitter, YamlLoader};
+-
+-quickcheck! {
+-    fn test_check_weird_keys(xs: Vec<String>) -> TestResult {
+-        let mut out_str = String::new();
+-        let input = Yaml::Array(xs.into_iter().map(Yaml::String).collect());
+-        {
+-            let mut emitter = YamlEmitter::new(&mut out_str);
+-            emitter.dump(&input).unwrap();
+-        }
+-        match YamlLoader::load_from_str(&out_str) {
+-            Ok(output) => TestResult::from_bool(output.len() == 1 && input == output[0]),
+-            Err(err) => TestResult::error(err.to_string()),
+-        }
+-    }
+-}
+diff --git a/tests/test_round_trip.rs b/tests/test_round_trip.rs
+index 040a909..2c44a86 100644
+--- a/tests/test_round_trip.rs
++++ b/tests/test_round_trip.rs
+@@ -117,3 +117,310 @@ fn test_multiline_leading_newline() {
+     let y = Yaml::Array(vec![Yaml::String("\na".to_owned())]);
+     roundtrip_multiline(&y);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self, BoxedGenerator, Generator};
++use yaml_rust2::yaml::Hash;
++
++/// Characters that sit on the emitter's quoting/escaping boundaries: YAML
++/// indicators, whitespace, and the Unicode separators/specials the scanner
++/// treats specially.
++const TRICKY_CHARS: &[char] = &[
++    ':', '-', '?', '#', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '\'', '"', '%', '@',
++    '`', '\\', '~', '.', '+', '=', '<', ' ', '\t', '\n', '\r', 'a', '0', '\u{7f}', '\u{85}',
++    '\u{a0}', '\u{2028}', '\u{2029}', '\u{feff}',
++];
++
++/// Fixed strings that stress the scalar disambiguation rules: things that
++/// look like booleans, null, numbers in various bases, dates, and YAML
++/// syntax.
++const TRICKY_STRINGS: &[&str] = &[
++    "true", "True", "TRUE", "false", "False", "FALSE", "y", "Y", "n", "N", "yes", "no", "on",
++    "off", "On", "Off", "ON", "OFF", "null", "Null", "NULL", "~", "", " ", "  ", "---", "...",
++    "-", "- ", "?", "? ", ":", ": ", "a: b", "- a", "#c", "a #c", "!t", "&a", "*a", "|", ">",
++    "0x1F", "0o17", "0b101", "+12", "-3", "+0x3", "+0o7", "1_000", "01", "09", "0", "1e5",
++    "9e999", ".inf", "+.inf", "-.inf", ".nan", ".NaN", "+.5", "-.5", "1.0", "2024-12-31",
++    "12:34:56", "\u{85}", "\u{2028}", "\u{2029}", "\u{feff}", "\u{7f}", "\u{a0}",
++];
++
++/// Strings that stress the emitter's decision of whether/how to quote.
++fn tricky_strings() -> BoxedGenerator<'static, String> {
++    hegel::one_of!(
++        generators::text(),
++        generators::sampled_from(TRICKY_STRINGS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()),
++        // Integer-looking strings, up to and beyond i64 range.
++        generators::from_regex(r"[+-]?[0-9]{1,19}").fullmatch(true),
++        // Float-looking strings.
++        generators::from_regex(r"[+-]?[0-9]{0,3}\.[0-9]{0,3}([eE][+-]?[0-9]{1,3})?")
++            .fullmatch(true),
++        // Radix-prefixed strings (hex/octal/binary, either case).
++        generators::from_regex(r"0[xXoObB][0-9a-fA-F]{1,6}").fullmatch(true),
++        // Short strings assembled from boundary characters.
++        generators::vecs(generators::sampled_from(TRICKY_CHARS.to_vec()))
++            .max_size(8)
++            .map(|v| v.into_iter().collect::<String>()),
++    )
++    .boxed()
++}
++
++/// Whether `s` is hit by a known emitter quoting bug. Each class is pinned by
++/// a canonical, deterministically-failing test below; sibling properties
++/// exclude these inputs so they stay green and keep testing everything else.
++fn hits_known_quoting_bug(s: &str) -> bool {
++    // `need_quotes` quotes `0x`-prefixed strings but not `0o`-prefixed ones,
++    // which the loader parses as octal integers.
++    // Canonical test: `known_bug_octal_like_string_changes_type`.
++    if let Some(rest) = s.strip_prefix("0o") {
++        if i64::from_str_radix(rest, 8).is_ok() {
++            return true;
++        }
++    }
++    // `+.inf` is parsed as a float by the loader but not quoted by the
++    // emitter. Canonical test: `known_bug_plus_dot_inf_string_changes_type`.
++    matches!(s, "+.inf" | "+.Inf" | "+.INF")
++}
++
++/// Whether `s` is hit by a known bug of literal block scalar emission
++/// (`multiline_strings(true)`). Slightly conservative on purpose. Canonical
++/// tests: `known_bug_multiline_leading_space_line` and
++/// `known_bug_multiline_trailing_newlines_lost`.
++fn hits_known_multiline_bug(s: &str) -> bool {
++    s.contains('\n')
++        && (s.split('\n').any(|line| line.starts_with(' ')) || s.ends_with("\n\n"))
++}
++
++/// Recursively check a document for strings hit by known quoting bugs.
++fn doc_hits_known_quoting_bug(doc: &Yaml) -> bool {
++    match doc {
++        Yaml::String(s) => hits_known_quoting_bug(s),
++        Yaml::Array(v) => v.iter().any(doc_hits_known_quoting_bug),
++        Yaml::Hash(h) => h
++            .iter()
++            .any(|(k, v)| doc_hits_known_quoting_bug(k) || doc_hits_known_quoting_bug(v)),
++        _ => false,
++    }
++}
++
++/// Recursively check a document for values hit by known multiline-emission
++/// bugs (includes the quoting bugs, which apply in multiline mode too).
++fn ml_doc_hits_known_bug(doc: &Yaml) -> bool {
++    match doc {
++        Yaml::String(s) => hits_known_quoting_bug(s) || hits_known_multiline_bug(s),
++        Yaml::Array(v) => v.iter().any(ml_doc_hits_known_bug),
++        Yaml::Hash(h) => h.iter().any(|(k, v)| {
++            // A multiline string used as a mapping key is emitted as a block
++            // scalar in key position and changes the document. Canonical
++            // test: `known_bug_multiline_string_as_hash_key`.
++            matches!(k, Yaml::String(s) if s.contains('\n'))
++                || ml_doc_hits_known_bug(k)
++                || ml_doc_hits_known_bug(v)
++        }),
++        _ => false,
++    }
++}
++
++/// Strings that the loader would itself classify as `Yaml::Real`, so that
++/// `Yaml::Real(s)` is a value an emit/load roundtrip could possibly preserve.
++fn real_strings() -> BoxedGenerator<'static, String> {
++    hegel::one_of!(
++        generators::floats::<f64>()
++            .allow_nan(false)
++            .allow_infinity(false)
++            .map(|f| format!("{f:?}")),
++        generators::sampled_from(
++            [".inf", "-.inf", ".nan", ".NaN", "+.inf", "6.02e23", "-0.0"]
++                .iter()
++                .map(|s| (*s).to_string())
++                .collect::<Vec<_>>()
++        ),
++    )
++    .boxed()
++}
++
++/// Scalar `Yaml` values as the loader could produce them (no `BadValue`, no
++/// `Alias`, only canonical `Real` strings).
++fn scalar_values() -> BoxedGenerator<'static, Yaml> {
++    hegel::one_of!(
++        tricky_strings().map(Yaml::String),
++        generators::integers::<i64>().map(Yaml::Integer),
++        generators::booleans().map(Yaml::Boolean),
++        generators::just(Yaml::Null),
++        real_strings().map(Yaml::Real),
++    )
++    .boxed()
++}
++
++/// Arbitrary `Yaml` documents: scalars, arrays and hashes nested up to
++/// `depth`. Hash keys draw from the full value space, so scalar and complex
++/// (`? `) keys are both exercised.
++fn yaml_values(depth: u32) -> BoxedGenerator<'static, Yaml> {
++    hegel::compose!(|tc| {
++        // Bias towards scalars so documents stay a manageable size while
++        // still nesting several levels.
++        if depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) > 0 {
++            tc.draw(scalar_values())
++        } else if tc.draw(generators::booleans()) {
++            Yaml::Array(tc.draw(generators::vecs(yaml_values(depth - 1)).max_size(4)))
++        } else {
++            let entries = tc.draw(generators::integers::<usize>().max_value(4));
++            let mut hash = Hash::new();
++            for _ in 0..entries {
++                let key = tc.draw(yaml_values(depth - 1));
++                let value = tc.draw(yaml_values(depth - 1));
++                hash.insert(key, value);
++            }
++            Yaml::Hash(hash)
++        }
++    })
++    .boxed()
++}
++
++/// Any document built from scalars, arrays and hashes survives an emit/load
++/// roundtrip unchanged.
++#[hegel::test]
++fn pbt_roundtrip_generated_document(tc: hegel::TestCase) {
++    let doc = tc.draw(yaml_values(3));
++    tc.assume(!doc_hits_known_quoting_bug(&doc));
++    roundtrip(&doc);
++}
++
++/// Same roundtrip with the multiline-strings (literal block) emitter mode.
++#[hegel::test]
++fn pbt_roundtrip_generated_document_multiline(tc: hegel::TestCase) {
++    let doc = tc.draw(yaml_values(3));
++    tc.assume(!ml_doc_hits_known_bug(&doc));
++    roundtrip_multiline(&doc);
++}
++
++/// A string scalar comes back as `Yaml::String` with identical content, no
++/// matter how much it looks like a number/boolean/null or contains YAML
++/// syntax.
++#[hegel::test]
++fn pbt_string_scalar_type_and_content_preserved(tc: hegel::TestCase) {
++    let s = tc.draw(tricky_strings());
++    tc.assume(!hits_known_quoting_bug(&s));
++    roundtrip(&Yaml::String(s));
++}
++
++/// Number scalars roundtrip unchanged, including `i64` extremes and exotic
++/// float shapes.
++#[hegel::test]
++fn pbt_number_scalar_roundtrip(tc: hegel::TestCase) {
++    let doc = tc.draw(hegel::one_of!(
++        generators::integers::<i64>().map(Yaml::Integer),
++        real_strings().map(Yaml::Real),
++    ));
++    roundtrip(&doc);
++}
++
++/// A stream of several documents, each emitted with its own `---` header,
++/// loads back as the same sequence of documents.
++#[hegel::test]
++fn pbt_multi_document_stream_roundtrip(tc: hegel::TestCase) {
++    let docs: Vec<Yaml> = tc.draw(generators::vecs(yaml_values(2)).min_size(1).max_size(4));
++    tc.assume(!docs.iter().any(doc_hits_known_quoting_bug));
++    let mut out = String::new();
++    for (i, doc) in docs.iter().enumerate() {
++        if i > 0 {
++            out.push('\n');
++        }
++        YamlEmitter::new(&mut out).dump(doc).unwrap();
++    }
++    let reloaded = YamlLoader::load_from_str(&out).unwrap();
++    assert_eq!(reloaded, docs);
++}
++
++/// Port of the quickcheck property `test_check_weird_keys` (formerly in
++/// `tests/quickcheck.rs`): an array of arbitrary strings survives an
++/// emit/load roundtrip.
++#[hegel::test]
++fn pbt_array_of_weird_strings_roundtrip(tc: hegel::TestCase) {
++    let strings: Vec<String> = tc.draw(generators::vecs(generators::text()));
++    // Emitter quoting bugs are pinned by the canonical `known_bug_*` tests
++    // below; `text()` reaching e.g. `0o7` is unlikely but not impossible.
++    tc.assume(strings.iter().all(|s| !hits_known_quoting_bug(s)));
++    let doc = Yaml::Array(strings.into_iter().map(Yaml::String).collect());
++    roundtrip(&doc);
++}
++
++// ---------------------------------------------------------------------------
++// KNOWN FAILURES: each test below pins a real bug found by the properties
++// above. Every generated case hits the bug, so they fail deterministically,
++// and they are expected to keep failing until the bug is fixed. The sibling
++// properties exclude exactly these input classes (see
++// `hits_known_quoting_bug`, `hits_known_multiline_bug`,
++// `ml_doc_hits_known_bug`).
++// ---------------------------------------------------------------------------
++
++/// KNOWN FAILURE: `need_quotes` (src/emitter.rs) quotes strings starting with
++/// `0x` but not `0o`, while the loader (`Yaml::from_str`) parses `0o…` as an
++/// octal integer. `String("0o7")` is emitted as bare `0o7` and reloads as
++/// `Integer(7)`.
++#[hegel::test]
++fn known_bug_octal_like_string_changes_type(tc: hegel::TestCase) {
++    let s = tc.draw(generators::from_regex(r"0o[0-7]{1,10}").fullmatch(true));
++    roundtrip(&Yaml::String(s));
++}
++
++/// KNOWN FAILURE: `+.inf` is parsed as a float by the loader (`parse_f64`)
++/// but not quoted by `need_quotes`. `String("+.inf")` is emitted bare and
++/// reloads as `Real("+.inf")`.
++#[hegel::test]
++fn known_bug_plus_dot_inf_string_changes_type(tc: hegel::TestCase) {
++    let s: String = tc.draw(generators::sampled_from(
++        ["+.inf", "+.Inf", "+.INF"]
++            .iter()
++            .map(|s| (*s).to_string())
++            .collect::<Vec<_>>(),
++    ));
++    roundtrip(&Yaml::String(s));
++}
++
++/// KNOWN FAILURE: `Yaml::Real` nodes are emitted verbatim without checking
++/// that the text still reads back as a float. `!!float 5` loads as
++/// `Real("5")`, which is emitted as bare `5` and reloads as `Integer(5)`.
++#[hegel::test]
++fn known_bug_integer_looking_real_changes_type(tc: hegel::TestCase) {
++    let n = tc.draw(generators::integers::<i64>());
++    let src = format!("!!float {n}");
++    let doc = YamlLoader::load_from_str(&src).unwrap().pop().unwrap();
++    assert_eq!(doc, Yaml::Real(n.to_string()));
++    roundtrip(&doc);
++}
++
++/// KNOWN FAILURE (multiline mode): a literal block scalar line starting with
++/// a space breaks block indentation detection. The emitted document either
++/// fails to parse (`" a\nb"`) or silently drops the space (`"\n a"`).
++#[hegel::test]
++fn known_bug_multiline_leading_space_line(tc: hegel::TestCase) {
++    let first = tc.draw(generators::from_regex(r"[a-z]{0,5}").fullmatch(true));
++    let second = tc.draw(generators::from_regex(r"[a-z]{1,5}").fullmatch(true));
++    let doc = Yaml::Array(vec![Yaml::String(format!(" {first}\n{second}"))]);
++    roundtrip_multiline(&doc);
++}
++
++/// KNOWN FAILURE (multiline mode): literal blocks are emitted with clip
++/// chomping (`|`), so trailing empty lines are lost: `"a\n\n\n"` reloads as
++/// `"a\n\n"` and `"\n\n"` reloads as `"\n"`.
++#[hegel::test]
++fn known_bug_multiline_trailing_newlines_lost(tc: hegel::TestCase) {
++    let stem = tc.draw(generators::from_regex(r"[a-z]{0,5}").fullmatch(true));
++    let doc = Yaml::Array(vec![Yaml::String(format!("{stem}\n\n\n"))]);
++    roundtrip_multiline(&doc);
++}
++
++/// KNOWN FAILURE (multiline mode): a multiline string used as a mapping key
++/// is emitted as a block scalar in key position, which changes the meaning of
++/// the document: `{"a\nb": ~}` is emitted as `|-\n  a\n  b: ~`, which reloads
++/// as the single string `"a\nb: ~"`.
++#[hegel::test]
++fn known_bug_multiline_string_as_hash_key(tc: hegel::TestCase) {
++    let a = tc.draw(generators::from_regex(r"[a-z]{1,5}").fullmatch(true));
++    let b = tc.draw(generators::from_regex(r"[a-z]{1,5}").fullmatch(true));
++    let mut hash = Hash::new();
++    hash.insert(Yaml::String(format!("{a}\n{b}")), Yaml::Null);
++    roundtrip_multiline(&Yaml::Hash(hash));
++}

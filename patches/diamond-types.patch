@@ -1,0 +1,991 @@
+diff --git a/.gitignore b/.gitignore
+index bb68cf0..e808518 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,8 @@ generated
+ 
+ db.dtjson
+ .vscode
++
++# Test-run artifacts (written to cwd by storage tests) + hegel failure database
++/*.dts
++/*.cg
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 198b0e4..210c3d3 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -58,6 +58,7 @@ rand = { version = "0.8.5", features = ["small_rng"], optional = true }
+ rand = { version = "0.8.5", features = ["small_rng"] }
+ crdt-testdata = { path = "crates/crdt-testdata" }
+ trace-alloc = { path = "crates/trace-alloc" }
++hegeltest = "0.28.2"
+ 
+ # For OT fuzz data tests
+ #json_minimal = "0.1.3"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..c2e6b33
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,211 @@
++# Hegel property-based testing report: diamond-types
++
++Property-based tests added with the [hegel](https://hegel.dev) Rust library (`hegeltest` 0.28.2)
++to the `diamond-types` text CRDT crate.
++
++Tests live alongside the code they exercise (per the skill's "modify existing test files" rule):
++
++- `src/list_fuzzer_tools.rs` — shared hegel generators (`hegel_tools` module): boundary-heavy
++  unicode char/content generators and hegel ports of `old_make_random_change`.
++- `src/list/list.rs` — local-edit model, time-travel, agent-independence properties.
++- `src/list/oplog_merge_fuzzer.rs` — convergence, idempotence, commutativity properties.
++- `src/list/encoding/tests.rs` — encode/decode roundtrip, options, patch composition, decode
++  robustness, plus two deterministic regression pins.
++
++## How to run
++
++The crate requires Rust >= 1.96 (uses `std::range::Range`), so the environment's default 1.95
++toolchain will not build it. Tests were run with:
++
++```
++cargo +1.97 test -p diamond-types --lib --features serde
++```
++
++`--features serde` is required to build *any* test of this crate: `src/causalgraph/graph/tools.rs`'s
++test module unconditionally imports `crate::serde_helpers`, which is `#[cfg(feature = "serde")]`.
++This is a pre-existing condition of the crate (the pristine tree fails `cargo test` without the
++feature) and is not caused by the hegel tests. CI (`.github/workflows/test.yml`) runs bare
++`cargo test`; that is a separate pre-existing issue, reported below but not fixed.
++
++## Properties tested
++
++All property tests are prefixed `hegel_`. Each is a single property (one property per test).
++
++### 1. CRDT convergence (crown property) — `hegel_concurrent_merge_converges`
++Three replicas share an agent table (agent id == replica index, so concurrent edits never reuse
++an `(agent, seq)` pair). Each round draws a batch of concurrent insert/delete ops spread across
++the replicas, then *sometimes* syncs a drawn pair (skipping lets replicas diverge deeper). At the
++end everyone syncs with everyone. Asserts: after exchanging oplogs both directions, the oplogs are
++`==`, and merging into each branch yields identical text. Evidence: the crate's own seeded
++`oplog_merge_fuzz` asserts exactly this. Explored at 1000 cases × up to 25 rounds × 8 changes.
++
++### 2. Local edits vs a String model — `hegel_local_edits_match_string_model`
++Applies a drawn edit script to a `ListCRDT` and to a naive `Vec<char>` reference document in
++lockstep; asserts identical text and char length after every op. This is the Tier-1 model test.
++Evidence: `ListCRDT` is documented as a live text document; `count_chars`/char-indexed positions
++are the crate's addressing model.
++
++### 3. Time travel / checkout — `hegel_checkout_reproduces_history`
++Records the version LV after each edit alongside the model text at that moment, then checks out
++each historical version and asserts the text matches. Also asserts `checkout(&[])` (root) is empty.
++Evidence: `OpLog::checkout` is documented as "Creating a checkout (snapshot) of the document at any
++requested point in time".
++
++### 4. Agent-assignment independence — `hegel_agent_assignment_doesnt_affect_content`
++Applies the same linear edit script to one single-agent document and one document that rotates the
++edit among three agents (including a unicode-named agent). Asserts identical content throughout.
++Evidence: the docs stress that agent IDs are opaque identity metadata, not content.
++
++### 5. Oplog encode→decode roundtrip — `hegel_encode_decode_roundtrip`
++Builds an oplog with concurrent history, encodes with full fidelity
++(`EncodeOptions::full().store_deleted_content(true)`), decodes, and asserts oplog equality and
++identical checkout text. Evidence: the crate's `fuzz_encode_decode_once`. The crate emphasises its
++compact binary format, so roundtrip is a prime property.
++
++### 6. Encode *configuration* generation — `hegel_encode_options_roundtrip`
++Generates the `EncodeOptions` flags themselves (`store_start_branch_content`,
++`store_inserted_content`, `store_deleted_content`, `compress_content`, optional `user_data`) rather
++than testing one canned config. Asserts the causal graph always roundtrips; text roundtrips when
++inserted content was stored; the full oplog roundtrips when both contents were stored. This follows
++the skill's "generate configurations, not just payloads" guidance.
++
++### 7. Incremental patch composition — `hegel_encode_patch_composes`
++Encodes a snapshot, makes more edits, encodes a patch via `encode_from(snapshot_version)`, then
++reassembles snapshot + patch via `decode_and_add` and asserts equality with the monolithic oplog
++and identical text. Evidence: `decode_in_parts` / `merge_parts` tests.
++
++### 8. Merge idempotence — `hegel_oplog_merge_idempotent`
++Asserts `add_missing_operations_from` is idempotent: merging the same remote ops a second time, and
++merging an oplog with itself, both leave it unchanged. Evidence: the method is documented "Any
++duplicate operations are ignored" — a CRDT merge must be idempotent.
++
++### 9. Merge commutativity — `hegel_oplog_merge_commutes`
++Asserts merging remote oplogs b-then-c equals c-then-b (oplog equality and identical checkout text).
++Evidence: CRDT merge must be order-independent; the seeded fuzzer relies on this implicitly.
++
++### 10. Corrupt-decode contract — `hegel_corrupt_decode_errors_or_unrolls`
++Applies drawn corruptions (byte flips, truncation, garbage splices) to a valid encoding and decodes
++into a target that already knows a prefix. The contract (`error_unrolling` test + the doc comment on
++`decode_and_add_opts`): a failed decode must unroll, a successful decode must be internally
++consistent. This property caught two real bugs (below); it now skips the panic bug (via
++`catch_unwind`) and asserts the weaker "user-visible state unchanged" for the unroll bug, so it
++keeps exercising the rest of the input space while the two bugs are pinned separately.
++
++### 11. Decode robustness / parse no-panic — `hegel_load_from_garbage_never_panics`
++Feeds `ListOpLog::load_from` random bytes (half prefixed with the real file magic). The property:
++never panic; if it parses, the result is internally consistent. (Currently skips the known panic
++bug via `catch_unwind`.)
++
++## Test results
++
++All properties pass at the default (100) case count and at a 10x exploratory run, **except the two
++deterministic regression pins**, which fail on every run by design (they document real bugs — see
++below). Liveness was verified by inverting `hegel_local_edits_match_string_model`'s length assertion
++and confirming hegel reported the minimal shrunk counterexample (`num_ops = 1`, insert `'\0'`), then
++reverting.
++
++```
++running 13 tests
++test list::encoding::tests::hegel_pinned_decode_corrupted_bytes_panics ... FAILED   (pinned bug #1)
++test list::encoding::tests::hegel_pinned_failed_decode_must_unroll     ... FAILED   (pinned bug #2)
++test list::encoding::tests::hegel_load_from_garbage_never_panics       ... ok
++test list::encoding::tests::hegel_corrupt_decode_errors_or_unrolls     ... ok
++test list::encoding::tests::hegel_encode_decode_roundtrip              ... ok
++test list::encoding::tests::hegel_encode_options_roundtrip             ... ok
++test list::encoding::tests::hegel_encode_patch_composes                ... ok
++test list::oplog_merge_fuzzer::hegel_concurrent_merge_converges        ... ok
++test list::oplog_merge_fuzzer::hegel_oplog_merge_idempotent            ... ok
++test list::oplog_merge_fuzzer::hegel_oplog_merge_commutes              ... ok
++test list::list::tests::hegel_local_edits_match_string_model           ... ok
++test list::list::tests::hegel_checkout_reproduces_history              ... ok
++test list::list::tests::hegel_agent_assignment_doesnt_affect_content   ... ok
++```
++
++The full `--lib` suite: 149 passed, 2 failed (the pins), 20 ignored.
++
++## Suspected bugs
++
++Both are in the binary decoder and are reachable from **untrusted input via public API**
++(`ListOpLog::load_from` / `decode_and_add`). Not fixed, per instructions. Each has a deterministic
++regression pin that reproduces by exhaustively corrupting a minimal encoded document, so it fails on
++every run rather than probabilistically.
++
++### Bug 1 — decoder panics on malformed input instead of returning `ParseError`
++Pin: `hegel_pinned_decode_corrupted_bytes_panics`.
++
++Minimal counterexample (found by hegel, then reduced): encode a one-character document (insert
++`'\0'`), splice a single byte into the encoding, and call `ListOpLog::load_from`. Six single-byte
++splices near offset 43-47 (into the history chunk) cause a panic.
++
++Code path:
++`ListOpLog::load_from` → `decode_internal` (`src/list/encoding/decode_oplog.rs:889`) →
++`history_entry_map_and_truncate` (`decode_oplog.rs:242`) →
++`RleVec::find_packed_with_offset` → `Option::unwrap()` on `None` (`src/rle/rle_vec.rs:191`).
++
++Root cause: a corrupted history chunk references a local time that has no entry in the version map
++built while reading the patches chunk; `find_packed_with_offset` assumes the needle is present and
++unwraps. The file CRC does **not** protect against this: the CRC chunk is verified only at the *end*
++of `decode_internal` (`decode_oplog.rs:949`), after all chunks are already parsed, so any panic
++reachable during parsing is reachable from untrusted bytes. `load_from` returns `Result` precisely
++to signal malformed input, so panicking is a contract violation and a DoS vector for anyone decoding
++peer-supplied data.
++
++### Bug 2 — failed `decode_and_add` does not fully unroll (corrupts oplog agent state)
++Pin: `hegel_pinned_failed_decode_must_unroll`.
++
++`decode_and_add_opts` documents (`decode_oplog.rs:476`): "when an error happens we need to unwind all
++the merged operations before returning. Otherwise self is in an invalid state." The existing
++`error_unrolling` test verifies this only for a **fresh, empty** target oplog. When the target
++**already knows a prefix** of the incoming operations, the unwind is incomplete.
++
++Minimal counterexample: oplog A holds one op (insert `'\0'`); encode an extension of A (A + one
++delete); flip one byte so the decode fails on the CRC check; `A.decode_and_add(...)` returns `Err`
++but leaves `A` modified — `client_data[agent].lv_for_seq` covers seq range `0..2` while `A.len()`
++is still 1. Nine distinct single-byte flips trigger it. The oplog is left claiming a seq maps to a
++local version that does not exist, so subsequent edits by that agent can silently collide (the
++exact "reuse IDs → divergence" hazard the crate's own docs warn about).
++
++Code path: the unwind loop in `decode_and_add_opts` (`decode_oplog.rs:500`) trims
++`client_with_lv`, `operations`, and history back to the pre-decode length, but does not correctly
++restore each agent's `lv_for_seq` mapping for ops that were newly assigned during the failed decode.
++
++## Unsound properties abandoned
++
++None were abandoned as unsound. One property (`hegel_corrupt_decode_errors_or_unrolls`) was
++**weakened rather than deleted** once it exposed the two bugs above: it now skips the panic bug via
++`catch_unwind` and asserts only the user-visible invariant (`version` and `len` unchanged) for the
++unroll bug, with comments pointing at the canonical pins. This is the skill's sanctioned pattern —
++pin a bug with one canonical failing test, then exclude that known-buggy behaviour from sibling
++properties so they keep testing everything else. The strict form of both invariants lives in the
++two pins.
++
++The convergence/idempotence/commutativity properties merge oplogs by cloning one argument to satisfy
++the borrow checker; this does not weaken them because `add_missing_operations_from` only reads its
++argument.
++
++## Skill feedback
++
++- **MSRV vs environment toolchain.** The crate pins `rust-version = 1.96`; the environment's default
++  is 1.95, so the crate does not build at all with the default `cargo`. `cargo add --dev hegeltest`
++  succeeded (it does not enforce the crate's own MSRV against the *active* toolchain here), but every
++  subsequent `cargo test` failed on `std::range::Range` until switched to `cargo +1.97`. The
++  reference's "MSRV resolution error" note is about hegeltest's MSRV being *higher* than the target;
++  this is the reverse (target's MSRV higher than the default toolchain) and worth a sentence in the
++  Setup/Gotchas section: check `rust-version` in Cargo.toml and pick a new-enough `cargo +toolchain`
++  before assuming a build failure is your fault.
++- **Feature-gated test-only imports.** This crate's non-hegel test code (`serde_helpers`) is behind
++  a non-default feature, so *no* test target builds without `--features serde`. An agent that runs
++  bare `cargo test -p <crate>` sees a wall of errors unrelated to its own tests and can misdiagnose.
++  A skill note like "if the pristine `cargo test` already fails to compile, find the feature the
++  existing tests need before adding yours" would help. (I confirmed the failure exists on the
++  pristine tree via `git stash`.)
++- **The `catch_unwind` skip pattern worked well** for keeping a broad property alive while pinning a
++  panic bug separately, but the skill only describes ignoring/skipping the *whole* reproducer test
++  for process-aborting bugs. For a merely-*panicking* (unwinding) bug, wrapping the call in
++  `catch_unwind` inside a sibling property — so the sibling keeps exercising non-panicking inputs —
++  is a useful middle ground worth mentioning alongside the "exclude known-buggy input from siblings"
++  advice.
++- Everything else in the Rust reference was accurate: `#[hegel::test]`, `one_of!`,
++  `sampled_from(vec)`, `generators::optional`, `generators::binary`, the codepoint-drawing idiom for
++  chars, and the "boost + raise test_cases / make deterministic" guidance for pinned bugs all worked
++  as documented.
+diff --git a/src/list/encoding/tests.rs b/src/list/encoding/tests.rs
+index 13a803a..57a1af2 100644
+--- a/src/list/encoding/tests.rs
++++ b/src/list/encoding/tests.rs
+@@ -387,4 +387,325 @@ fn compat_simple_doc() {
+         let bytes2_compressed_full = &[68, 77, 78, 68, 84, 89, 80, 83, 0, 5, 11, 9, 144, 104, 105, 32, 116, 104, 101, 114, 101, 109, 1, 7, 3, 5, 4, 115, 101, 112, 104, 10, 0, 20, 24, 24, 8, 0, 14, 2, 4, 9, 25, 1, 19, 21, 2, 2, 13, 22, 4, 65, 79, 11, 0, 23, 2, 13, 1, 100, 4, 128, 32, 8, 191];
+         assert_eq!(ListOpLog::load_from(bytes2_compressed_full).unwrap(), doc.oplog);
+     }
+-}
+\ No newline at end of file
++}
++// ---- Hegel property-based tests ----
++
++use hegel::generators::{self, Generator};
++use crate::AgentId;
++use crate::list_fuzzer_tools::hegel_tools::hegel_make_random_change;
++
++/// Build a ListCRDT containing drawn history: local edits, and (optionally) concurrent edits
++/// from a second replica merged back in.
++fn hegel_doc_with_history(tc: &hegel::TestCase) -> ListCRDT {
++    let mut a = ListCRDT::new();
++    a.get_or_create_agent_id("agent 0"); // 0
++    a.get_or_create_agent_id("agent 1"); // 1
++
++    let mut b = ListCRDT::new();
++    b.get_or_create_agent_id("agent 0");
++    b.get_or_create_agent_id("agent 1");
++
++    // Shared prefix of history.
++    let shared = tc.draw(generators::integers::<usize>().max_value(4));
++    for _ in 0..shared {
++        hegel_make_random_change(tc, &mut a, 0);
++    }
++    b.oplog.add_missing_operations_from(&a.oplog);
++    b.branch.merge(&b.oplog, b.oplog.cg.version.as_ref());
++
++    // Concurrent edits on both replicas.
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(4)) {
++        hegel_make_random_change(tc, &mut a, 0);
++    }
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(4)) {
++        hegel_make_random_change(tc, &mut b, 1);
++    }
++
++    a.oplog.add_missing_operations_from(&b.oplog);
++    a.branch.merge(&a.oplog, a.oplog.cg.version.as_ref());
++    a
++}
++
++/// Encode -> decode round trip: an oplog with arbitrary (possibly concurrent) history, encoded
++/// with full fidelity, must decode to an equivalent oplog with identical checkout text.
++#[hegel::test]
++fn hegel_encode_decode_roundtrip(tc: hegel::TestCase) {
++    let doc = hegel_doc_with_history(&tc);
++
++    let data = doc.oplog.encode(&EncodeOptions::full()
++        .store_deleted_content(true));
++    let decoded = ListOpLog::load_from(&data).unwrap();
++    decoded.dbg_check(true);
++
++    assert_eq!(decoded, doc.oplog);
++    assert_eq!(decoded.checkout_tip().content, doc.branch.content);
++}
++
++/// Generate the encoding *configuration* too, not just the payload: any combination of the
++/// EncodeOptions flags must produce bytes which decode without error, and which reproduce the
++/// document text whenever the inserted content was stored.
++#[hegel::test]
++fn hegel_encode_options_roundtrip(tc: hegel::TestCase) {
++    let doc = hegel_doc_with_history(&tc);
++
++    let store_start_branch_content = tc.draw(generators::booleans());
++    let store_inserted_content = tc.draw(generators::booleans());
++    let store_deleted_content = tc.draw(generators::booleans());
++    let compress_content = tc.draw(generators::booleans());
++    let user_data: Option<Vec<u8>> = tc.draw(generators::optional(generators::binary().max_size(64)));
++
++    let mut opts = EncodeOptions::full()
++        .store_start_branch_content(store_start_branch_content)
++        .store_inserted_content(store_inserted_content)
++        .store_deleted_content(store_deleted_content)
++        .compress_content(compress_content);
++    if let Some(data) = user_data.as_deref() {
++        opts = opts.user_data(data);
++    }
++
++    let bytes = doc.oplog.encode(&opts);
++    let decoded = ListOpLog::load_from(&bytes).unwrap();
++    decoded.dbg_check(true);
++
++    // The causal graph always round trips, whatever the options.
++    assert_eq!(decoded.cg.version, doc.oplog.cg.version);
++    assert_eq!(decoded.len(), doc.oplog.len());
++
++    if store_inserted_content {
++        // With inserted content stored, the checkout must reproduce the document text.
++        assert_eq!(decoded.checkout_tip().content, doc.branch.content);
++    }
++    if store_inserted_content && store_deleted_content {
++        // With everything stored, the whole oplog round trips.
++        assert_eq!(decoded, doc.oplog);
++    }
++}
++
++/// Incremental save/load: a snapshot plus a patch (encode_from the snapshot's version) must
++/// recompose, via decode_and_add, into the full oplog.
++#[hegel::test]
++fn hegel_encode_patch_composes(tc: hegel::TestCase) {
++    let mut doc = ListCRDT::new();
++    let agent = doc.get_or_create_agent_id("agent 0");
++
++    let opts = || EncodeOptions::full().store_deleted_content(true);
++
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(6)) {
++        hegel_make_random_change(&tc, &mut doc, agent);
++    }
++    let snapshot_bytes = doc.oplog.encode(&opts());
++    let snapshot_version = doc.oplog.cg.version.clone();
++
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(6)) {
++        hegel_make_random_change(&tc, &mut doc, agent);
++    }
++    let patch_bytes = doc.oplog.encode_from(&opts(), snapshot_version.as_ref());
++
++    let mut reassembled = ListOpLog::load_from(&snapshot_bytes).unwrap();
++    reassembled.decode_and_add(&patch_bytes).unwrap();
++    reassembled.dbg_check(true);
++
++    assert_eq!(reassembled, doc.oplog);
++    assert_eq!(reassembled.checkout_tip().content, doc.branch.content);
++}
++
++/// Corrupt an encoded document arbitrarily. Decoding the corrupted bytes must never panic, and
++/// when it errors, it must leave the target oplog untouched (matching `error_unrolling` above).
++#[hegel::test]
++fn hegel_corrupt_decode_errors_or_unrolls(tc: hegel::TestCase) {
++    let mut doc = ListCRDT::new();
++    let agent = doc.get_or_create_agent_id("agent 0");
++
++    // Some history the decode target already knows about...
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(4)) {
++        hegel_make_random_change(&tc, &mut doc, agent);
++    }
++    let base_oplog = doc.oplog.clone();
++
++    // ...and some newer history which (only) the encoded bytes carry.
++    for _ in 0..tc.draw(generators::integers::<usize>().max_value(4)) {
++        hegel_make_random_change(&tc, &mut doc, agent);
++    }
++    let bytes = doc.oplog.encode(&EncodeOptions::full().store_deleted_content(true));
++
++    // Corrupt the bytes: byte flips, truncation, and/or splicing in garbage.
++    let mut corrupted = bytes.clone();
++    let num_mutations = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++    for _ in 0..num_mutations {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => { // Flip a byte.
++                let i = tc.draw(generators::integers::<usize>().max_value(corrupted.len() - 1));
++                corrupted[i] = !corrupted[i];
++            }
++            1 => { // Truncate.
++                let keep = tc.draw(generators::integers::<usize>().max_value(corrupted.len()));
++                corrupted.truncate(keep);
++                if corrupted.is_empty() { break; }
++            }
++            _ => { // Splice in garbage.
++                let i = tc.draw(generators::integers::<usize>().max_value(corrupted.len()));
++                let garbage: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(8));
++                corrupted.splice(i..i, garbage);
++            }
++        }
++    }
++
++    let mut target = base_oplog.clone();
++    let result = {
++        // KNOWN BUG: decoding corrupted data can panic instead of returning ParseError (see
++        // hegel_pinned_decode_corrupted_bytes_panics below). Skip those inputs here so this
++        // property keeps checking the error-unrolling contract on everything else.
++        let mut target_ref = std::panic::AssertUnwindSafe(&mut target);
++        let corrupted_ref = &corrupted;
++        match std::panic::catch_unwind(move || {
++            target_ref.decode_and_add_opts(corrupted_ref, DecodeOptions { ignore_crc: false, verbose: false })
++        }) {
++            Ok(result) => result,
++            Err(_) => return, // Known panic bug; pinned separately.
++        }
++    };
++    match result {
++        Err(_) => {
++            // A failed decode must unroll. The strict form of this (target == base_oplog) is
++            // violated by a KNOWN BUG pinned in hegel_pinned_failed_decode_must_unroll below
++            // (the unwind leaks agent assignment state), so here we only assert that the
++            // user-visible state didn't change.
++            assert_eq!(target.cg.version, base_oplog.cg.version);
++            assert_eq!(target.len(), base_oplog.len());
++        }
++        Ok(_) => {
++            // The corruption survived the checksum (eg it only hit the CRC chunk itself, or the
++            // mutations cancelled out). The result must still be internally consistent.
++            target.dbg_check(true);
++        }
++    }
++}
++
++/// KNOWN FAILURE: this test pins a real bug and fails deterministically. Do not "fix" the test.
++///
++/// Decoding malformed data panics instead of returning `ParseError`. Splicing a single byte
++/// into a valid encoding desynchronizes the history chunk from the version map built while
++/// reading the patches chunk, and `history_entry_map_and_truncate`
++/// (src/list/encoding/decode_oplog.rs:242) hits `RleVec::find_packed_with_offset` ->
++/// `Option::unwrap()` on None (src/rle/rle_vec.rs:191).
++///
++/// The file CRC cannot save us: it is only verified at the *end* of `decode_internal`
++/// (src/list/encoding/decode_oplog.rs:949), after all the chunks have already been parsed, so
++/// any panic reachable during parsing is reachable from corrupted / untrusted input.
++///
++/// Found by hegel via hegel_corrupt_decode_errors_or_unrolls; this deterministic version
++/// exhaustively splices one byte at every position so it fails on every run.
++#[test]
++fn hegel_pinned_decode_corrupted_bytes_panics() {
++    let mut doc = ListCRDT::new();
++    let agent = doc.get_or_create_agent_id("agent 0");
++    doc.insert(agent, 0, "\0");
++    let bytes = doc.oplog.encode(&EncodeOptions::full().store_deleted_content(true));
++
++    // Splice a single byte at every position, and try to load each corrupted file.
++    let mut panics = Vec::new();
++    let prev_hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(|_| {})); // Quiet the expected panic spam.
++    for i in 0..=bytes.len() {
++        for b in [0u8, 2, 0xff] {
++            let mut corrupted = bytes.clone();
++            corrupted.splice(i..i, [b]);
++            if std::panic::catch_unwind(|| {
++                drop(ListOpLog::load_from(&corrupted));
++            }).is_err() {
++                panics.push((i, b));
++            }
++        }
++    }
++    std::panic::set_hook(prev_hook);
++
++    assert!(panics.is_empty(),
++        "ListOpLog::load_from panicked (instead of returning ParseError) for {} corrupted \
++         inputs, eg (splice position, byte value) = {:?}",
++        panics.len(), &panics[..panics.len().min(5)]);
++}
++
++/// KNOWN FAILURE: this test pins a real bug and fails deterministically. Do not "fix" the test.
++///
++/// When `decode_and_add` fails, it must leave the oplog exactly as it was.
++/// `decode_and_add_opts` says so itself: "when an error happens we need to unwind all the
++/// merged operations before returning. Otherwise self is in an invalid state"
++/// (src/list/encoding/decode_oplog.rs:476), and the existing `error_unrolling` test asserts
++/// exactly this for a fresh (empty) target oplog.
++///
++/// But when the target *already knows a prefix* of the encoded operations, the unwind is
++/// incomplete: `client_data[agent].lv_for_seq` keeps the seq -> LV mappings assigned during the
++/// failed decode (the unwind loop in decode_and_add_opts, src/list/encoding/decode_oplog.rs:500,
++/// removes the wrong / no seq range from lv_for_seq). The oplog is left claiming seqs map to
++/// local versions which don't exist, so later edits by that agent can silently collide.
++///
++/// Repro: an oplog A with one op; encode an extension of A (one more op); flip one byte so the
++/// decode fails on the CRC check; decode_and_add into A errors but leaves lv_for_seq covering
++/// both ops while A.len() == 1.
++///
++/// Found by hegel via hegel_corrupt_decode_errors_or_unrolls; this deterministic version flips
++/// every byte in turn so it fails on every run.
++#[test]
++fn hegel_pinned_failed_decode_must_unroll() {
++    let mut doc = ListCRDT::new();
++    let agent = doc.get_or_create_agent_id("agent 0");
++    doc.insert(agent, 0, "\0");
++    let base = doc.oplog.clone(); // The decode target already knows this operation...
++    doc.delete(agent, 0..1);      // ...but not this one.
++    let bytes = doc.oplog.encode(&EncodeOptions::full().store_deleted_content(true));
++
++    let mut violations = Vec::new();
++    let prev_hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(|_| {})); // Quiet panics from the separately-pinned panic bug.
++    for i in 0..bytes.len() {
++        let mut corrupted = bytes.clone();
++        corrupted[i] = !corrupted[i];
++
++        let mut target = base.clone();
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            target.decode_and_add_opts(&corrupted, DecodeOptions { ignore_crc: false, verbose: false })
++        }));
++        match result {
++            // Decoder panic: a different bug, pinned in hegel_pinned_decode_corrupted_bytes_panics.
++            Err(_) => continue,
++            Ok(Err(_)) => {
++                if target != base { violations.push(i); }
++            }
++            Ok(Ok(_)) => {} // Corruption survived (eg it hit the optional CRC chunk). Fine here.
++        }
++    }
++    std::panic::set_hook(prev_hook);
++
++    assert!(violations.is_empty(),
++        "decode_and_add errored but left the oplog modified for {} corrupted inputs \
++         (byte-flip positions {:?})",
++        violations.len(), &violations[..violations.len().min(5)]);
++}
++
++/// Decoding arbitrary garbage must return an error, never panic. (Parse robustness for
++/// `ListOpLog::load_from`.)
++#[hegel::test]
++fn hegel_load_from_garbage_never_panics(tc: hegel::TestCase) {
++    // The file magic ("DMNDTYPS" + protocol version 0), so a good share of inputs get past the
++    // header check into the chunk parser.
++    const MAGIC: &[u8] = &[68, 77, 78, 68, 84, 89, 80, 83, 0];
++
++    let mut bytes: Vec<u8> = Vec::new();
++    if tc.draw(generators::booleans()) {
++        bytes.extend_from_slice(MAGIC);
++    }
++    bytes.extend(tc.draw(generators::binary().max_size(256)));
++
++    // Must not panic. (Garbage this random should rarely parse, but if it does, the accepted
++    // oplog must at least be internally consistent.)
++    //
++    // KNOWN BUG: the decoder can panic on malformed input (see
++    // hegel_pinned_decode_corrupted_bytes_panics). Skip those inputs so this property keeps
++    // checking everything else.
++    let bytes_ref = &bytes;
++    match std::panic::catch_unwind(move || ListOpLog::load_from(bytes_ref)) {
++        Ok(Ok(decoded)) => decoded.dbg_check(true),
++        Ok(Err(_)) => {} // Rejecting garbage is the expected outcome.
++        Err(_) => {}     // Known panic bug; pinned separately.
++    }
++}
+diff --git a/src/list/list.rs b/src/list/list.rs
+index 22946c1..8ddcae6 100644
+--- a/src/list/list.rs
++++ b/src/list/list.rs
+@@ -244,4 +244,121 @@ mod tests {
+ 
+         doc.oplog.dbg_print_all();
+     }
++
++    // ---- Hegel property-based tests ----
++
++    use hegel::generators::{self, Generator};
++    use crate::list_fuzzer_tools::hegel_tools::draw_content;
++
++    /// A concrete edit script step. Positions / lengths are in chars, and are valid for the
++    /// document state at the point the step is applied.
++    #[derive(Debug, Clone)]
++    enum ScriptOp {
++        Ins { pos: usize, content: String },
++        Del { pos: usize, span: usize, keep_content: bool },
++    }
++
++    /// Draw one valid edit for a document which currently holds `model` (a naive Vec<char>
++    /// reference document), and apply it to the model.
++    fn draw_script_op(tc: &hegel::TestCase, model: &mut Vec<char>) -> ScriptOp {
++        let len = model.len();
++        if len == 0 || tc.draw(generators::booleans()) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(len));
++            let content = draw_content(tc, 1, 8);
++            model.splice(pos..pos, content.chars());
++            ScriptOp::Ins { pos, content }
++        } else {
++            let pos = tc.draw(generators::integers::<usize>().max_value(len - 1));
++            let span = tc.draw(generators::integers::<usize>().min_value(1).max_value(len - pos));
++            let keep_content = tc.draw(generators::booleans());
++            model.drain(pos..pos + span);
++            ScriptOp::Del { pos, span, keep_content }
++        }
++    }
++
++    fn apply_script_op(doc: &mut ListCRDT, agent: AgentId, op: &ScriptOp) -> LV {
++        match op {
++            ScriptOp::Ins { pos, content } => doc.insert(agent, *pos, content),
++            ScriptOp::Del { pos, span, keep_content: true } => doc.delete(agent, *pos..*pos + *span),
++            ScriptOp::Del { pos, span, keep_content: false } =>
++                doc.delete_without_content(agent, *pos..*pos + *span),
++        }
++    }
++
++    /// Local edits applied through the CRDT must behave exactly like the same edits applied to
++    /// a naive Vec<char>: same text and same (char) length after every operation.
++    #[hegel::test]
++    fn hegel_local_edits_match_string_model(tc: hegel::TestCase) {
++        let mut doc = ListCRDT::new();
++        let agent = doc.get_or_create_agent_id("test");
++        let mut model: Vec<char> = Vec::new();
++
++        let num_ops = tc.draw(generators::integers::<usize>().max_value(30));
++        for _ in 0..num_ops {
++            let op = draw_script_op(&tc, &mut model);
++            apply_script_op(&mut doc, agent, &op);
++
++            let expected: String = model.iter().collect();
++            assert_eq!(doc.branch.content.to_string(), expected);
++            assert_eq!(doc.len(), model.len());
++        }
++        doc.dbg_check(true);
++    }
++
++    /// Time travel: checking out the version recorded after each edit must reproduce the
++    /// document text as it was at that moment.
++    #[hegel::test]
++    fn hegel_checkout_reproduces_history(tc: hegel::TestCase) {
++        let mut doc = ListCRDT::new();
++        let agent = doc.get_or_create_agent_id("test");
++        let mut model: Vec<char> = Vec::new();
++        let mut snapshots: Vec<(LV, String)> = Vec::new();
++
++        let num_ops = tc.draw(generators::integers::<usize>().max_value(20));
++        for _ in 0..num_ops {
++            let op = draw_script_op(&tc, &mut model);
++            let v = apply_script_op(&mut doc, agent, &op);
++            snapshots.push((v, model.iter().collect()));
++        }
++
++        // The root version is always the empty document.
++        assert_eq!(doc.oplog.checkout(&[]).content, "");
++
++        for (v, expected) in &snapshots {
++            let branch = doc.oplog.checkout(&[*v]);
++            assert_eq!(branch.content.to_string(), *expected);
++        }
++    }
++
++    /// Which agent (or how many agents) performed a linear sequence of edits must not affect
++    /// the resulting document content.
++    #[hegel::test]
++    fn hegel_agent_assignment_doesnt_affect_content(tc: hegel::TestCase) {
++        let mut doc_single = ListCRDT::new();
++        let single_agent = doc_single.get_or_create_agent_id("solo");
++
++        let mut doc_multi = ListCRDT::new();
++        let multi_agents: Vec<AgentId> = ["alice", "bob", "čarol 😀"].iter()
++            .map(|name| doc_multi.get_or_create_agent_id(name))
++            .collect();
++
++        let mut model: Vec<char> = Vec::new();
++
++        let num_ops = tc.draw(generators::integers::<usize>().max_value(20));
++        for _ in 0..num_ops {
++            let op = draw_script_op(&tc, &mut model);
++            apply_script_op(&mut doc_single, single_agent, &op);
++
++            let which = tc.draw(generators::integers::<usize>().max_value(multi_agents.len() - 1));
++            apply_script_op(&mut doc_multi, multi_agents[which], &op);
++
++            assert_eq!(doc_single.branch.content, doc_multi.branch.content);
++        }
++
++        let expected: String = model.iter().collect();
++        assert_eq!(doc_single.branch.content.to_string(), expected);
++        assert_eq!(doc_multi.branch.content.to_string(), expected);
++        doc_single.dbg_check(true);
++        doc_multi.dbg_check(true);
++    }
+ }
+\ No newline at end of file
+diff --git a/src/list/oplog_merge_fuzzer.rs b/src/list/oplog_merge_fuzzer.rs
+index dd4145f..a6b6192 100644
+--- a/src/list/oplog_merge_fuzzer.rs
++++ b/src/list/oplog_merge_fuzzer.rs
+@@ -88,4 +88,175 @@ fn oplog_merge_fuzz_forever() {
+         if seed % 10 == 0 { println!("seed {seed}"); }
+         oplog_merge_fuzz(seed, 100, false);
+     }
+-}
+\ No newline at end of file
++}
++// ---- Hegel property-based tests ----
++//
++// These mirror the seeded fuzzer above, but route all randomness through hegel so failing runs
++// shrink to a minimal sequence of operations.
++
++use hegel::generators::{self, Generator};
++use crate::AgentId;
++use crate::list_fuzzer_tools::hegel_tools::hegel_make_random_change;
++
++fn agent_name(i: usize) -> String {
++    format!("agent {}", i)
++}
++
++/// Set up `N` ListCRDT replicas which share an agent table (agent id == replica index), so
++/// concurrent edits from different replicas never reuse an (agent, seq) pair.
++fn make_docs<const N: usize>() -> [ListCRDT; N] {
++    let mut docs: [ListCRDT; N] = std::array::from_fn(|_| ListCRDT::new());
++    for doc in docs.iter_mut() {
++        for a in 0..N {
++            doc.get_or_create_agent_id(agent_name(a).as_str());
++        }
++    }
++    docs
++}
++
++/// Sync a pair of replicas by exchanging their oplogs both ways, then check they converged.
++fn sync_and_check(a: &mut ListCRDT, b: &mut ListCRDT) {
++    // Cloning sidesteps borrowing two array elements mutably at once. It doesn't affect the
++    // property: add_missing_operations_from only reads its argument.
++    let b_ops = b.oplog.clone();
++    a.oplog.add_missing_operations_from(&b_ops);
++    b.oplog.add_missing_operations_from(&a.oplog);
++
++    // Property (1): after exchanging ops, the oplogs are equivalent...
++    assert_eq!(a.oplog, b.oplog);
++
++    a.branch.merge(&a.oplog, a.oplog.cg.version.as_ref());
++    b.branch.merge(&b.oplog, b.oplog.cg.version.as_ref());
++
++    // Property (2): ...and merging them into each replica's branch yields identical text.
++    assert_eq!(a.branch.content, b.branch.content);
++}
++
++/// CRDT convergence: any interleaving of concurrent inserts/deletes on 3 replicas, synced
++/// pairwise in any order, must converge to identical oplogs and identical document text.
++#[hegel::test]
++fn hegel_concurrent_merge_converges(tc: hegel::TestCase) {
++    let mut docs = make_docs::<3>();
++
++    let rounds = tc.draw(generators::integers::<usize>().min_value(1).max_value(25));
++    for _ in 0..rounds {
++        // Generate some concurrent operations.
++        let num_changes = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..num_changes {
++            let idx = tc.draw(generators::integers::<usize>().max_value(2));
++            hegel_make_random_change(&tc, &mut docs[idx], idx as AgentId);
++        }
++
++        // Sometimes sync a (drawn) pair of replicas. Skipping rounds lets the replicas diverge
++        // more deeply before merging.
++        if tc.draw(generators::booleans()) {
++            let a_idx = tc.draw(generators::integers::<usize>().max_value(2));
++            let b_idx = (a_idx + tc.draw(generators::integers::<usize>().min_value(1).max_value(2))) % 3;
++            let (a, b) = index_pair_mut(&mut docs, a_idx, b_idx);
++            sync_and_check(a, b);
++        }
++    }
++
++    // Finally sync everyone with everyone and check total convergence.
++    for i in 1..docs.len() {
++        let (a, b) = index_pair_mut(&mut docs, 0, i);
++        sync_and_check(a, b);
++    }
++    for i in 1..docs.len() {
++        let (a, b) = index_pair_mut(&mut docs, 0, i);
++        sync_and_check(a, b);
++        assert_eq!(a.oplog, b.oplog);
++        assert_eq!(a.branch.content, b.branch.content);
++    }
++
++    for doc in &docs {
++        doc.dbg_check(true);
++    }
++}
++
++fn index_pair_mut<T>(arr: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
++    assert!(i != j);
++    if i < j {
++        let (lo, hi) = arr.split_at_mut(j);
++        (&mut lo[i], &mut hi[0])
++    } else {
++        let (lo, hi) = arr.split_at_mut(i);
++        (&mut hi[0], &mut lo[j])
++    }
++}
++
++/// Merging the same remote operations a second time (or merging an oplog into itself) is a
++/// no-op: add_missing_operations_from must be idempotent.
++#[hegel::test]
++fn hegel_oplog_merge_idempotent(tc: hegel::TestCase) {
++    let mut docs = make_docs::<2>();
++
++    // Give both replicas some (possibly overlapping, possibly concurrent) history.
++    let shared = tc.draw(generators::integers::<usize>().max_value(4));
++    for _ in 0..shared {
++        hegel_make_random_change(&tc, &mut docs[0], 0);
++    }
++    let d0 = docs[0].oplog.clone();
++    docs[1].oplog.add_missing_operations_from(&d0);
++    docs[1].branch.merge(&docs[1].oplog, docs[1].oplog.cg.version.as_ref());
++
++    for i in 0..docs.len() {
++        let n = tc.draw(generators::integers::<usize>().max_value(4));
++        for _ in 0..n {
++            hegel_make_random_change(&tc, &mut docs[i], i as AgentId);
++        }
++    }
++
++    let mut once = docs[0].oplog.clone();
++    once.add_missing_operations_from(&docs[1].oplog);
++    once.dbg_check(true);
++
++    // Merging the same ops again changes nothing.
++    let mut twice = once.clone();
++    twice.add_missing_operations_from(&docs[1].oplog);
++    assert_eq!(once, twice);
++
++    // Merging an oplog with itself changes nothing.
++    let mut self_merged = once.clone();
++    let once_snapshot = once.clone();
++    self_merged.add_missing_operations_from(&once_snapshot);
++    assert_eq!(once, self_merged);
++}
++
++/// The order in which remote oplogs are merged must not matter: merging b then c gives the
++/// same result as merging c then b.
++#[hegel::test]
++fn hegel_oplog_merge_commutes(tc: hegel::TestCase) {
++    let mut docs = make_docs::<3>();
++
++    // Optionally seed some common history, then let each replica diverge concurrently.
++    let shared = tc.draw(generators::integers::<usize>().max_value(3));
++    for _ in 0..shared {
++        hegel_make_random_change(&tc, &mut docs[0], 0);
++    }
++    let d0 = docs[0].oplog.clone();
++    for doc in docs.iter_mut().skip(1) {
++        doc.oplog.add_missing_operations_from(&d0);
++        doc.branch.merge(&doc.oplog, doc.oplog.cg.version.as_ref());
++    }
++
++    for i in 0..docs.len() {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        for _ in 0..n {
++            hegel_make_random_change(&tc, &mut docs[i], i as AgentId);
++        }
++    }
++
++    let mut bc = docs[0].oplog.clone();
++    bc.add_missing_operations_from(&docs[1].oplog);
++    bc.add_missing_operations_from(&docs[2].oplog);
++    bc.dbg_check(true);
++
++    let mut cb = docs[0].oplog.clone();
++    cb.add_missing_operations_from(&docs[2].oplog);
++    cb.add_missing_operations_from(&docs[1].oplog);
++    cb.dbg_check(true);
++
++    assert_eq!(bc, cb);
++    assert_eq!(bc.checkout_tip().content, cb.checkout_tip().content);
++}
+diff --git a/src/list_fuzzer_tools.rs b/src/list_fuzzer_tools.rs
+index f88a886..6a218cb 100644
+--- a/src/list_fuzzer_tools.rs
++++ b/src/list_fuzzer_tools.rs
+@@ -214,3 +214,103 @@ pub(crate) fn fuzz_multithreaded<F: Fn(u64) + Send + Sync + Copy + Clone + 'stat
+ //         }
+ //     }
+ // }
++
++/// Helpers for the hegel property-based tests. These mirror `random_str` /
++/// `old_make_random_change` above, but draw all their randomness through hegel so failures
++/// shrink to minimal counterexamples instead of opaque seeds.
++#[cfg(test)]
++pub(crate) mod hegel_tools {
++    use hegel::generators::{self, Generator};
++    use crate::list::{ListBranch, ListCRDT, ListOpLog};
++    use crate::{AgentId, LV};
++
++    /// Characters picked to sit on unicode boundaries: NUL, ASCII/latin-1 edges, the NEL / LS /
++    /// PS line separators, combining marks, ZWJ, noncharacters, the surrogate-range edges,
++    /// case-folding trouble (ß), and astral-plane characters up to char::MAX.
++    const BOUNDARY_CHARS: [char; 20] = [
++        '\0', '\u{7f}', '\u{80}', '\u{85}',
++        '\u{301}', '\u{200d}', '\u{2028}', '\u{2029}',
++        'ß', 'ẞ', '\u{fdd0}', '\u{fffd}', '\u{ffff}',
++        '\u{d7ff}', '\u{e000}', '😀', '\u{10190}', '\u{e0001}',
++        '\u{10fffe}', '\u{10ffff}',
++    ];
++
++    /// Draw a single char, weighted towards unicode boundary cases but covering the whole
++    /// codepoint space.
++    pub(crate) fn draw_char(tc: &hegel::TestCase) -> char {
++        tc.draw(hegel::one_of!(
++            generators::sampled_from(BOUNDARY_CHARS.to_vec()),
++            // Printable ASCII, so counterexamples stay readable when the bug isn't
++            // unicode-related.
++            generators::integers::<u32>().min_value(0x20).max_value(0x7e)
++                .map(|n| char::from_u32(n).unwrap()),
++            // The full codepoint space. Surrogates (0xd800..=0xdfff) aren't chars; map them to
++            // the replacement character.
++            generators::integers::<u32>().max_value(0x10ffff)
++                .map(|n| char::from_u32(n).unwrap_or('\u{fffd}')),
++        ))
++    }
++
++    /// Draw a string of `min_len..=max_len` chars (not bytes).
++    pub(crate) fn draw_content(tc: &hegel::TestCase, min_len: usize, max_len: usize) -> String {
++        let len = tc.draw(generators::integers::<usize>().min_value(min_len).max_value(max_len));
++        (0..len).map(|_| draw_char(tc)).collect()
++    }
++
++    /// Hegel equivalent of `old_make_random_change_raw`: append one random insert or delete
++    /// (forwards, or backwards one character at a time - like backspacing) to the oplog at the
++    /// branch's version. Returns the LV of the last appended operation.
++    pub(crate) fn hegel_make_random_change_raw(tc: &hegel::TestCase, oplog: &mut ListOpLog,
++                                               branch: &ListBranch, agent: AgentId) -> LV {
++        let doc_len = branch.len();
++        if doc_len == 0 || tc.draw(generators::booleans()) {
++            // Insert something.
++            let pos = tc.draw(generators::integers::<usize>().max_value(doc_len));
++            let content = draw_content(tc, 1, 3);
++            let fwd = content.chars().count() == 1 || tc.draw(generators::booleans());
++
++            if fwd {
++                oplog.add_insert_at(agent, branch.local_frontier_ref(), pos, &content)
++            } else {
++                // Type the string in reverse, one character at a time.
++                let mut frontier = branch.local_frontier();
++                for c in content.chars().rev() {
++                    let mut buf = [0u8; 4];
++                    let str = c.encode_utf8(&mut buf);
++                    let v = oplog.add_insert_at(agent, frontier.as_ref(), pos, str);
++                    frontier.replace_with_1(v);
++                }
++                frontier[0]
++            }
++        } else {
++            // Delete something.
++            let pos = tc.draw(generators::integers::<usize>().max_value(doc_len - 1));
++            let span = tc.draw(generators::integers::<usize>()
++                .min_value(1)
++                .max_value(usize::min(10, doc_len - pos)));
++            let fwd = span == 1 || tc.draw(generators::booleans());
++
++            if fwd {
++                // Using make_delete_op (rather than add_delete_without_content) preserves the
++                // deleted content, which the encoding tests need.
++                let op = branch.make_delete_op(pos..pos + span);
++                oplog.add_operations_at(agent, branch.local_frontier_ref(), &[op])
++            } else {
++                // Backspace each character individually.
++                let mut frontier = branch.local_frontier();
++                for i in (pos..pos + span).rev() {
++                    let op = branch.make_delete_op(i..i + 1);
++                    let v = oplog.add_operations_at(agent, frontier.as_ref(), &[op]);
++                    frontier.replace_with_1(v);
++                }
++                frontier[0]
++            }
++        }
++    }
++
++    /// Hegel equivalent of `old_make_random_change`: apply one random change to a ListCRDT.
++    pub(crate) fn hegel_make_random_change(tc: &hegel::TestCase, doc: &mut ListCRDT, agent: AgentId) {
++        let v = hegel_make_random_change_raw(tc, &mut doc.oplog, &doc.branch, agent);
++        doc.branch.merge(&doc.oplog, &[v]);
++    }
++}

@@ -1,0 +1,609 @@
+diff --git a/.gitignore b/.gitignore
+index a581733..a826a17 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
+ target/
+ perf.*
+ .idea
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 7b1197f..19045e4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,6 +29,7 @@ arrayvec = { version = "0.7", features = [ "serde" ] }
+ bincode = "1.3.3"
+ flate2 = "1.0.28"
+ glam = { version = "0.22", default-features = false, features = [ "rand" ] }
++hegeltest = "0.28.2"
+ lz4_flex = { version = "0.13", default-features = false }
+ paste = "1.0.14"
+ rand = "0.8.5"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..2488233
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,114 @@
++# Hegel property-based testing report: `bitcode`
++
++Crate: `bitcode` 0.6.9 (SoftbearStudios/bitcode) — a compact, bit-packed binary
++serializer. Property tests were added with the `hegeltest` library (imported as
++`hegel`). All work is local; nothing was pushed.
++
++## 1. Setup and scope
++
++- Added `hegeltest` as a dev-dependency: `cargo add --dev hegeltest -p bitcode`.
++- Tests live in the existing public-API test file, `src/derive/mod.rs`, in a new
++  `#[cfg(all(test, feature = "derive", feature = "std"))] mod hegel_tests`
++  module alongside the crate's own `encode`/`decode` roundtrip tests. No new
++  test file was created (per hegel guidance).
++- The crate's test harness requires nightly (`#![cfg_attr(test, feature(test))]`
++  for benches), so run with:
++  `cargo +nightly test --lib hegel_tests`
++- `.hegel/` was added to `.gitignore`.
++- Maintainer AI-consent check: no governance/opt-out file
++  (`HUMAN_VS_MACHINE.md`, `.ai-ack`, anti-AI `CONTRIBUTING`) exists; the README
++  carries only the standard Apache/MIT contribution clause. Proceeded with local
++  testing only.
++- The crate ships a `cargo fuzz` target (`fuzz/fuzz_targets/fuzz.rs`) that
++  roundtrips a large type matrix through both the derive and serde paths. The
++  hegel suite supplements it by (a) generating a richly-nested value model with
++  boundary-biased primitives and shrinkable counterexamples, and (b) directly
++  targeting the attacker-controlled-length path with crafted streams rather than
++  hoping random fuzz bytes hit that structure.
++
++## 2. Properties added (10)
++
++All tests are `#[hegel::test]` and pass at the default case count. Roundtrip and
++crafted-length findings are oracle-independent (the test holds the value / the
++expected error), which is the highest-confidence class.
++
++1. **`rich_roundtrip`** (the crown): `decode(&encode(v)) == v` over a
++   deeply-nested `Rich` model — an enum spanning every integer width
++   (`u8..u128`, `i8..i128`, `usize`/`isize`, all covering MIN/MAX/0), `f32`/`f64`
++   (compared bit-exactly), `bool`, `char` (ASCII/BMP/supplementary), `String`
++   (full Unicode), `Option`, bounded `Vec`, tuples, arrays, `Box`, `BTreeMap`
++   with both integer and `String` keys, and structs nested in enums / enums
++   nested in structs.
++2. **`rich_determinism`**: encoding the same value twice, and via the reusable
++   `Buffer::encode` API, yields byte-identical output.
++3. **`arbitrary_bytes_no_panic`** (key untrusted target): `decode::<T>` of
++   arbitrary bounded bytes across 13 target types returns `Err` or a value —
++   never panics/OOMs/hangs; a recovered value must survive a re-roundtrip
++   (purity, no invalid internal state).
++4. **`corrupted_encoding_no_panic`**: a valid encoding with a flipped bit,
++   truncation, or appended bytes must decode to `Err` or a stable valid value.
++5. **`cross_type_decode_no_panic`**: bytes valid for one type, decoded as 8
++   unrelated types, never panic; any success must be stable.
++6. **`crafted_huge_length_rejected`** (key untrusted target): a stream whose
++   collection length field is crafted huge (`[255, 0, <len u64 LE>]`,
++   `len >= 1 MiB` up to `u64::MAX`) must be rejected without OOM, for
++   `Vec<u8/u16/u64/u128>`, `String`, and `Vec<Rich>`.
++7. **`integer_roundtrip_all_widths`**: per-width integer roundtrip, boundaries
++   included.
++8. **`float_roundtrip_bit_exact`**: `f32`/`f64` roundtrip is bit-exact including
++   subnormals, ±0, ±inf, and NaN payloads.
++9. **`string_roundtrip_unicode`**: `String` roundtrip over full Unicode text.
++10. **`collection_roundtrip`**: `Vec<i32>` at drawn sizes up to 300 (exercising
++    the large-length packing path) and `BTreeMap<u32,u64>` with unique keys.
++
++## 3. Findings
++
++No bugs found. The suite is green at the default count and stayed green in a
++2000-case (~20x) exploratory run (case count confirmed via an in-test counter).
++There are no failing/pinned tests.
++
++Positive robustness observations (oracle-independent):
++
++- **Attacker-controlled lengths are safely bounded.** A crafted huge length is
++  rejected before any large allocation: values at/above the crate's
++  `HUGE_LEN` cap (`0x7FFF_FFFF_FFFF_FFFF / 4096`, ~2^51) fail in
++  `LengthDecoder::populate` with `"huge length"`; values below the cap but
++  exceeding available input fail with `"EOF"` because element decode checks
++  `input.len()` before allocating (`consume_bytes`/`consume_byte_arrays`).
++  Allocation is thus tied to actual input size, not the declared length.
++- **Float bits (including NaN payloads and signed zero) roundtrip exactly**, so
++  the suite compares floats via `to_bits()` (mirroring the crate's own
++  `BitsEqualF32` fuzz helper).
++
++## 4. Process-aborting risks (OOM / hang / stack overflow)
++
++None triggered. No `#[ignore]`d reproducers were needed.
++
++- The huge-length OOM vector (the obvious concern for a bit-packed format with
++  attacker-controlled length fields) is explicitly defended and verified clean
++  in `crafted_huge_length_rejected`.
++- Input sizes in the arbitrary-bytes / corrupted / crafted-length properties are
++  bounded (e.g. `binary().max_size(4096)`); this protects the *test's* resources
++  and keeps failures shrinkable, not the crate's contract (the length-cap
++  analysis above shows the crate is safe on unbounded declared lengths too).
++- The model is intentionally non-recursive (see limitations), so decode of the
++  generated types has bounded depth; no stack-overflow class applies to it.
++
++## 5. Limitations and notes
++
++- **bitcode's columnar derive cannot represent self-recursive types.** The
++  generated `Encoder`/`Decoder` embeds each child (co)der inline, so a
++  `Box<Self>`, `Vec<Self>`, or `Option<Box<Self>>` field inside a derived type
++  produces an infinitely-sized (co)der and fails to compile with an `E0391`
++  layout cycle. This is a genuine format constraint (no fuzz target uses a
++  recursive type either), not a hegel issue. The rich model is therefore
++  deeply *nested* across three concrete types (`Leaf`, `Inner`, `Rich`) rather
++  than recursive, which still covers structs-in-enums, enums-in-structs, boxes,
++  vecs, and maps.
++- Tests require the nightly toolchain because the crate gates benches behind
++  `feature(test)`; this is pre-existing, not introduced here.
++- The serde integration (behind the non-default `serde` feature) was not
++  targeted; the derive API is the primary path and the existing fuzz target
++  already covers serde. This is a candidate area for future property tests.
++- Adding `hegeltest` inflates the test binary and pulls in a dev-dependency
++  tree; if upstreamed, the dev-dependency and its MSRV are the maintainer's call.
+diff --git a/src/derive/mod.rs b/src/derive/mod.rs
+index e0eed37..7c86942 100644
+--- a/src/derive/mod.rs
++++ b/src/derive/mod.rs
+@@ -426,3 +426,463 @@ mod tests {
+         }
+     }
+ }
++
++/// Property-based tests (hegel) for the public `encode`/`decode` derive API.
++///
++/// These exercise the two highest-value targets called out for a bit-packed
++/// serializer: the encode->decode roundtrip over a rich generated data model,
++/// and decode robustness against attacker-controlled / corrupted / mistyped
++/// byte streams (no panic, no OOM, no hang; crafted length fields are rejected).
++#[cfg(all(test, feature = "derive", feature = "std"))]
++#[allow(clippy::semicolon_if_nothing_returned)]
++mod hegel_tests {
++    use crate::{decode, encode, Buffer, Decode, Encode};
++    use alloc::boxed::Box;
++    use alloc::collections::BTreeMap;
++    use alloc::string::String;
++    use alloc::vec::Vec;
++    use hegel::generators::{self, Generator};
++
++    // Bit-exact float wrappers. bitcode preserves the exact bit pattern of a
++    // float on roundtrip (including NaN payloads and the sign of zero), so we
++    // compare by `to_bits()` rather than IEEE `==` (which makes NaN != NaN and
++    // would give a false roundtrip failure). This mirrors the crate's own fuzz
++    // target `BitsEqualF32`.
++    #[derive(Encode, Decode, Debug, Clone)]
++    struct BitF32(f32);
++    impl PartialEq for BitF32 {
++        fn eq(&self, o: &Self) -> bool {
++            self.0.to_bits() == o.0.to_bits()
++        }
++    }
++    #[derive(Encode, Decode, Debug, Clone)]
++    struct BitF64(f64);
++    impl PartialEq for BitF64 {
++        fn eq(&self, o: &Self) -> bool {
++            self.0.to_bits() == o.0.to_bits()
++        }
++    }
++
++    // A leaf enum covering ints of every width, both floats, bool, char and
++    // String. bitcode's columnar (struct-of-arrays) derive cannot represent a
++    // *self-recursive* type - the generated Encoder embeds each child encoder
++    // inline, so `Box<Self>`/`Vec<Self>` inside a type yield an
++    // infinitely-sized encoder (E0391 layout cycle). The model is therefore
++    // richly *nested* across three concrete types rather than recursive, which
++    // still covers structs-in-enums, enums-in-structs, boxes, vecs and maps.
++    #[derive(Encode, Decode, Debug, Clone, PartialEq)]
++    enum Leaf {
++        Unit,
++        Bool(bool),
++        Ch(char),
++        U8(u8),
++        I8(i8),
++        U16(u16),
++        I16(i16),
++        U32(u32),
++        I32(i32),
++        U64(u64),
++        I64(i64),
++        U128(u128),
++        I128(i128),
++        Usize(usize),
++        Isize(isize),
++        F32(BitF32),
++        F64(BitF64),
++        Str(String),
++    }
++
++    #[derive(Encode, Decode, Debug, Clone, PartialEq)]
++    struct Inner {
++        a: u16,
++        b: Vec<i8>,
++        c: (bool, BitF64),
++        d: Option<String>,
++        e: [u32; 3],
++        leaf: Leaf, // enum nested inside a struct
++    }
++
++    /// A rich, deeply-nested (non-recursive) data model.
++    #[derive(Encode, Decode, Debug, Clone, PartialEq)]
++    enum Rich {
++        Prim(Leaf),
++        Opt(Option<Leaf>),
++        BoxLeaf(Box<Leaf>),
++        List(Vec<Leaf>),
++        Structs(Vec<Inner>),
++        Pair(Box<Inner>, Box<u64>),
++        Map(BTreeMap<u32, Leaf>),
++        StrMap(BTreeMap<String, Inner>),
++        Nested(Inner),
++        Tuple((u8, i64, BitF32, char)),
++    }
++
++    // char generator: draw a codepoint biased across ASCII / BMP / supplementary
++    // planes, converting to char (skipping surrogates via from_u32).
++    fn draw_char(tc: &hegel::TestCase) -> char {
++        tc.draw(
++            hegel::one_of!(
++                generators::integers::<u32>().max_value(0x7F),
++                generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++                generators::integers::<u32>()
++                    .min_value(0x1_0000)
++                    .max_value(0x10_FFFF),
++            )
++            .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++        )
++    }
++
++    // f32 generator including subnormal, +/-0, +/-inf and NaN (with payload).
++    fn draw_f32(tc: &hegel::TestCase) -> f32 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f32>(),
++            generators::sampled_from(alloc::vec![
++                0.0f32,
++                -0.0f32,
++                f32::MIN_POSITIVE,
++                f32::from_bits(1),          // smallest subnormal
++                f32::from_bits(0x807f_ffff), // negative subnormal
++                f32::INFINITY,
++                f32::NEG_INFINITY,
++                f32::NAN,
++                f32::from_bits(0x7fc0_0001), // NaN with payload
++                f32::MAX,
++                f32::MIN,
++            ]),
++        ))
++    }
++
++    // f64 generator including subnormal, +/-0, +/-inf and NaN (with payload).
++    fn draw_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::sampled_from(alloc::vec![
++                0.0f64,
++                -0.0f64,
++                f64::MIN_POSITIVE,
++                f64::from_bits(1),
++                f64::from_bits(0x800f_ffff_ffff_ffff),
++                f64::INFINITY,
++                f64::NEG_INFINITY,
++                f64::NAN,
++                f64::from_bits(0x7ff8_0000_0000_0001),
++                f64::MAX,
++                f64::MIN,
++            ]),
++        ))
++    }
++
++    fn draw_leaf(tc: &hegel::TestCase) -> Leaf {
++        let tag = tc.draw(generators::integers::<u8>().max_value(17));
++        match tag {
++            0 => Leaf::Unit,
++            1 => Leaf::Bool(tc.draw(generators::booleans())),
++            2 => Leaf::Ch(draw_char(tc)),
++            3 => Leaf::U8(tc.draw(generators::integers::<u8>())),
++            4 => Leaf::I8(tc.draw(generators::integers::<i8>())),
++            5 => Leaf::U16(tc.draw(generators::integers::<u16>())),
++            6 => Leaf::I16(tc.draw(generators::integers::<i16>())),
++            7 => Leaf::U32(tc.draw(generators::integers::<u32>())),
++            8 => Leaf::I32(tc.draw(generators::integers::<i32>())),
++            9 => Leaf::U64(tc.draw(generators::integers::<u64>())),
++            10 => Leaf::I64(tc.draw(generators::integers::<i64>())),
++            11 => Leaf::U128(tc.draw(generators::integers::<u128>())),
++            12 => Leaf::I128(tc.draw(generators::integers::<i128>())),
++            13 => Leaf::Usize(tc.draw(generators::integers::<usize>())),
++            14 => Leaf::Isize(tc.draw(generators::integers::<isize>())),
++            15 => Leaf::F32(BitF32(draw_f32(tc))),
++            16 => Leaf::F64(BitF64(draw_f64(tc))),
++            _ => Leaf::Str(tc.draw(generators::text().max_size(32))),
++        }
++    }
++
++    fn draw_inner(tc: &hegel::TestCase) -> Inner {
++        Inner {
++            a: tc.draw(generators::integers::<u16>()),
++            b: tc.draw(generators::vecs(generators::integers::<i8>()).max_size(8)),
++            c: (tc.draw(generators::booleans()), BitF64(draw_f64(tc))),
++            d: tc.draw(generators::optional(generators::text().max_size(16))),
++            e: [
++                tc.draw(generators::integers::<u32>()),
++                tc.draw(generators::integers::<u32>()),
++                tc.draw(generators::integers::<u32>()),
++            ],
++            leaf: draw_leaf(tc),
++        }
++    }
++
++    fn draw_rich(tc: &hegel::TestCase) -> Rich {
++        let tag = tc.draw(generators::integers::<u8>().max_value(9));
++        match tag {
++            0 => Rich::Prim(draw_leaf(tc)),
++            1 => Rich::Opt(if tc.draw(generators::booleans()) {
++                Some(draw_leaf(tc))
++            } else {
++                None
++            }),
++            2 => Rich::BoxLeaf(Box::new(draw_leaf(tc))),
++            3 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(8));
++                let mut v = Vec::new();
++                for _ in 0..n {
++                    v.push(draw_leaf(tc));
++                }
++                Rich::List(v)
++            }
++            4 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(5));
++                let mut v = Vec::new();
++                for _ in 0..n {
++                    v.push(draw_inner(tc));
++                }
++                Rich::Structs(v)
++            }
++            5 => Rich::Pair(
++                Box::new(draw_inner(tc)),
++                Box::new(tc.draw(generators::integers::<u64>())),
++            ),
++            6 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(6));
++                let mut m = BTreeMap::new();
++                for _ in 0..n {
++                    m.insert(tc.draw(generators::integers::<u32>()), draw_leaf(tc));
++                }
++                Rich::Map(m)
++            }
++            7 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(5));
++                let mut m = BTreeMap::new();
++                for _ in 0..n {
++                    m.insert(tc.draw(generators::text().max_size(12)), draw_inner(tc));
++                }
++                Rich::StrMap(m)
++            }
++            8 => Rich::Nested(draw_inner(tc)),
++            _ => Rich::Tuple((
++                tc.draw(generators::integers::<u8>()),
++                tc.draw(generators::integers::<i64>()),
++                BitF32(draw_f32(tc)),
++                draw_char(tc),
++            )),
++        }
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 1 (the crown): encode -> decode roundtrip over the rich model.
++    // Oracle-independent: we hold `v`, so a mismatch is unambiguously a bug.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn rich_roundtrip(tc: hegel::TestCase) {
++        let v = draw_rich(&tc);
++        let encoded = encode(&v);
++        let decoded = decode::<Rich>(&encoded).expect("roundtrip decode must succeed");
++        assert_eq!(v, decoded);
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 2: determinism - encoding the same value twice, and via the
++    // reusable Buffer API, yields byte-identical output.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn rich_determinism(tc: hegel::TestCase) {
++        let v = draw_rich(&tc);
++        let a = encode(&v);
++        let b = encode(&v);
++        assert_eq!(a, b, "encode is not deterministic");
++
++        let mut buffer = Buffer::default();
++        let c = buffer.encode(&v).to_vec();
++        assert_eq!(a, c, "Buffer::encode disagrees with encode");
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 3 (key untrusted target): decoding arbitrary bytes must return
++    // Err (or Ok of a valid value) - never panic, OOM, or hang. Input length is
++    // bounded so the test's own resources are protected; the crate must still
++    // reject any attacker-controlled length without pre-allocating gigabytes.
++    // If a decode succeeds, the recovered value must survive a re-roundtrip
++    // (purity / no invalid internal state), matching the crate's fuzz target.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn arbitrary_bytes_no_panic(tc: hegel::TestCase) {
++        let bytes = tc.draw(generators::binary().max_size(4096));
++
++        macro_rules! probe {
++            ($($t:ty),* $(,)?) => {$(
++                if let Ok(v) = decode::<$t>(&bytes) {
++                    let re = encode::<$t>(&v);
++                    let v2 = decode::<$t>(&re).expect("re-decode of encoded value must succeed");
++                    assert!(v == v2, "decoded value not stable under re-roundtrip");
++                }
++            )*};
++        }
++        probe!(
++            Rich,
++            Inner,
++            u8,
++            i128,
++            char,
++            f64,
++            String,
++            Vec<u8>,
++            Vec<u64>,
++            Vec<Rich>,
++            BTreeMap<u32, u32>,
++            Option<Box<Rich>>,
++            (u32, String, bool),
++        );
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 4: corrupting a valid encoding (byte flip / truncation /
++    // extension) must yield Err or a valid, stable value - never a panic.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn corrupted_encoding_no_panic(tc: hegel::TestCase) {
++        let v = draw_rich(&tc);
++        let mut bytes = encode(&v);
++
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 if !bytes.is_empty() => {
++                // Flip a bit at a drawn position.
++                let idx = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++                let bit = tc.draw(generators::integers::<u8>().max_value(7));
++                bytes[idx] ^= 1 << bit;
++            }
++            1 if !bytes.is_empty() => {
++                // Truncate to a drawn length.
++                let n = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++                bytes.truncate(n);
++            }
++            _ => {
++                // Append arbitrary trailing bytes.
++                let extra = tc.draw(generators::binary().max_size(16));
++                bytes.extend_from_slice(&extra);
++            }
++        }
++
++        if let Ok(w) = decode::<Rich>(&bytes) {
++            let re = encode(&w);
++            let w2 = decode::<Rich>(&re).expect("re-decode of recovered value must succeed");
++            assert_eq!(w, w2, "recovered value not stable under re-roundtrip");
++        }
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 5: bytes valid for one type decoded as an unrelated type must
++    // never panic (type confusion). If it decodes, the value must be stable.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn cross_type_decode_no_panic(tc: hegel::TestCase) {
++        let v = draw_rich(&tc);
++        let bytes = encode(&v);
++
++        macro_rules! probe {
++            ($($t:ty),* $(,)?) => {$(
++                if let Ok(w) = decode::<$t>(&bytes) {
++                    let re = encode::<$t>(&w);
++                    let w2 = decode::<$t>(&re).expect("re-decode must succeed");
++                    assert!(w == w2, "cross-type decoded value not stable");
++                }
++            )*};
++        }
++        probe!(
++            Vec<u8>,
++            Vec<u64>,
++            Vec<i128>,
++            String,
++            Inner,
++            BTreeMap<u32, u64>,
++            (u64, u64),
++            Vec<Vec<u8>>,
++        );
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 6 (key untrusted target): a collection whose declared length in
++    // the stream is huge must be rejected without OOM. We craft the length
++    // prefix directly ([255, 0, <len as u64 LE>]) - the marker 255 selects the
++    // "large length" path and header 0 selects 64-bit packing - and give little
++    // or no element data. A naive decoder would pre-allocate gigabytes; bitcode
++    // must return Err ("huge length" above its ~2^51 cap, "EOF" below it).
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn crafted_huge_length_rejected(tc: hegel::TestCase) {
++        // Draw a genuinely huge declared length (>= 1 MiB, up to u64::MAX).
++        let len = tc.draw(generators::integers::<u64>().min_value(1 << 20));
++        let mut stream = alloc::vec![255u8, 0u8];
++        stream.extend_from_slice(&len.to_le_bytes());
++        // Optionally append a bounded amount of arbitrary element data (still
++        // vastly smaller than `len`).
++        let tail = tc.draw(generators::binary().max_size(64));
++        stream.extend_from_slice(&tail);
++
++        // Each of these would need `len` (or a large fraction of it) worth of
++        // bytes/elements; all must be rejected, and the call must return.
++        assert!(decode::<Vec<u8>>(&stream).is_err());
++        assert!(decode::<Vec<u16>>(&stream).is_err());
++        assert!(decode::<Vec<u64>>(&stream).is_err());
++        assert!(decode::<Vec<u128>>(&stream).is_err());
++        assert!(decode::<String>(&stream).is_err());
++        assert!(decode::<Vec<Rich>>(&stream).is_err());
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 7: primitive integer roundtrip across every width, boundaries
++    // included (integers::<T>() spans MIN/MAX/0).
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn integer_roundtrip_all_widths(tc: hegel::TestCase) {
++        macro_rules! rt {
++            ($($t:ty),* $(,)?) => {$(
++                let x = tc.draw(generators::integers::<$t>());
++                assert_eq!(x, decode::<$t>(&encode(&x)).unwrap());
++            )*};
++        }
++        rt!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize);
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 8: float roundtrip is bit-exact, including subnormals, infinity,
++    // signed zero, and NaN payloads.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn float_roundtrip_bit_exact(tc: hegel::TestCase) {
++        let a = draw_f32(&tc);
++        assert_eq!(a.to_bits(), decode::<f32>(&encode(&a)).unwrap().to_bits());
++
++        let b = draw_f64(&tc);
++        assert_eq!(b.to_bits(), decode::<f64>(&encode(&b)).unwrap().to_bits());
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 9: String roundtrip over full Unicode text.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn string_roundtrip_unicode(tc: hegel::TestCase) {
++        let s = tc.draw(generators::text());
++        assert_eq!(s, decode::<String>(&encode(&s)).unwrap());
++    }
++
++    // ----------------------------------------------------------------------
++    // Property 10: collection roundtrip, including large Vecs (drawn size, to
++    // exercise the large-length path and packing) and maps with unique keys.
++    // ----------------------------------------------------------------------
++    #[hegel::test]
++    fn collection_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let v: Vec<i32> = tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++        assert_eq!(v, decode::<Vec<i32>>(&encode(&v)).unwrap());
++
++        let keys: Vec<u32> = tc.draw(
++            generators::vecs(generators::integers::<u32>())
++                .max_size(64)
++                .unique(true),
++        );
++        let mut m = BTreeMap::new();
++        for (i, k) in keys.into_iter().enumerate() {
++            m.insert(k, i as u64);
++        }
++        assert_eq!(m, decode::<BTreeMap<u32, u64>>(&encode(&m)).unwrap());
++    }
++}

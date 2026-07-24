@@ -1,0 +1,775 @@
+diff --git a/.gitignore b/.gitignore
+index c41a2b9..986e2ad 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
+ .idea
+ /target
+ /Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 9544832..c337d36 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,7 @@ log = "0.4.17"
+ 
+ [dev-dependencies]
+ criterion = "0.5.1"
++hegeltest = "0.28.2"
+ serde = { version = "1.0", default-features = false, features = ["derive"] }
+ serde_json = "1.0"
+ 
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..084259c
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,144 @@
++# Hegel Property-Based Testing Report — `wkt` (georust/wkt @ 0.14.0)
++
++## 1. Scope and approach
++
++Property-based tests were added with `hegeltest` (v0.28.2, dev-dependency) to the
++`wkt` crate's existing unit-test modules — no new test files. The focus, in
++order of value: the write→parse **fixpoint** round-trip over the whole `Wkt`
++geometry tree, **bit-exact coordinate preservation** through the writer,
++**parse robustness** (never panic on arbitrary/adversarial input, including a
++deep-nesting probe), and consistency of the sibling APIs (`infer_type`,
++geo-types conversions).
++
++Maintainer AI-consent check: the repository contains no `HUMAN_VS_MACHINE.md`,
++`.ai-ack`, or anti-AI clause in `CONTRIBUTING`/`README`/`LICENSE`/code of
++conduct. Work was done on the local copy only; nothing is pushed or upstreamed.
++
++## 2. Properties added (10)
++
++In `src/lib.rs` (`mod tests`):
++
++1. `prop_write_parse_roundtrip_is_fixpoint` — arbitrary `Wkt<f64>` (all 7
++   geometry types, nested GeometryCollections, holes in polygons, empty
++   variants, all of XY/XYZ/XYM/XYZM): `to_string` → `from_str` recovers an
++   equal value, and re-serializing is byte-identical (fixpoint).
++2. `prop_point_coordinates_survive_roundtrip_bit_exact` — finite f64
++   coordinates (uniform full-range plus boosted extremes: ±0.0, subnormals
++   down to 5e-324, `f64::MAX`/`MIN`, `MIN_POSITIVE`, `EPSILON`) survive
++   write→parse **bit-for-bit** (`to_bits` comparison), for x/y/z/m in every
++   dimension. The writer uses Rust's shortest-round-trip `Display`, and no
++   precision loss was found.
++3. `prop_parse_arbitrary_text_never_panics` — `Wkt::from_str` on arbitrary
++   Unicode text returns `Err`, never panics.
++4. `prop_parse_wkt_shaped_soup_never_panics` — same, on random concatenations
++   of WKT keywords, parens, commas, numbers, `NaN`/`inf`, NULs, etc.
++5. `prop_parse_is_case_insensitive_and_whitespace_tolerant` — randomly
++   case-toggled keywords and whitespace injected around parens/commas parse to
++   the same geometry as the canonical serialization.
++6. `prop_empty_geometries_roundtrip` — every geometry type × dimension `EMPTY`
++   form serializes ending in `EMPTY` and round-trips to an equal value.
++7. `prop_compact_dimension_headers_parse_identically` — `POINTZ(...)`,
++   `MULTIPOLYGONZM(...)` etc. parse identically to the spaced `POINT Z (...)`
++   forms the writer emits.
++8. `prop_bounded_nested_geometrycollections_parse_and_roundtrip` — nested
++   `GEOMETRYCOLLECTION` up to depth 64 parses, round-trips, and truncated
++   nesting errors cleanly (the bound protects the test from bug #4 below).
++
++In `src/infer_type.rs`:
++
++9. `prop_infer_type_agrees_with_writer_and_parser` — `infer_type` on every
++   writer-emitted string returns the same geometry type and dimension as the
++   full parser.
++
++In `src/geo_types_from_wkt.rs`:
++
++10. `prop_wkt_to_geo_types_and_back_is_identity` — for geo-types-representable
++    geometries (XY, no empty points, closed polygon rings),
++    `Wkt` → `geo_types::Geometry` (`TryFrom`) → `Wkt` (`ToWkt`) is the identity.
++
++Shared generators live in `#[cfg(test)] pub(crate) mod pbt` at the bottom of
++`src/lib.rs`.
++
++## 3. Real bugs found (kept failing / pinned)
++
++All are oracle-independent (panics, aborts, or a writer output the crate's own
++parser rejects). None were fixed, per instructions.
++
++1. **`Display` panics on a MULTIPOINT containing an empty point.**
++   `write_multi_point` (src/to_wkt/geo_trait_impl.rs:161) does
++   `point.coord().unwrap()`. `MultiPoint::new(vec![Point::empty(..)], ..)` is
++   constructible via the public API; `fmt::Display` must not panic.
++   Pinned (failing): `tests::known_failure_display_of_multipoint_containing_empty_point_panics`.
++
++2. **`Display` panics on a MULTIPOLYGON containing an empty polygon.** Same
++   class: `polygon.exterior().unwrap()` in `write_multi_polygon`
++   (src/to_wkt/geo_trait_impl.rs:242).
++   Pinned (failing): `tests::known_failure_display_of_multipolygon_containing_empty_polygon_panics`.
++
++3. **Writer emits WKT its own parser rejects for empty inner linestrings/rings.**
++   A `MultiLineString` containing an empty `LineString` serializes to
++   `MULTILINESTRING(())`, which `from_str` rejects with "Missing closing
++   parenthesis for type". A `Polygon` with an empty interior ring hits the same
++   `write_coord_sequence` path (`POLYGON((1 2),())`). Silent data-loss/round-trip
++   break. Pinned (failing):
++   `tests::known_failure_multilinestring_with_empty_linestring_does_not_roundtrip`.
++
++4. **Stack overflow (process abort) parsing deeply nested GEOMETRYCOLLECTION.**
++   `Wkt::from_word_and_tokens` → `GeometryCollection::from_tokens` recursion has
++   no depth limit; `GEOMETRYCOLLECTION(` repeated ~500 times SIGABRTs the whole
++   test process on a default 2 MiB test thread (debug build; depth 450 still
++   passes). Truncated input (unbalanced opens) triggers it too, so any
++   attacker-controlled string can abort the process. Reproducer kept
++   `#[ignore]`d (it kills the test runner):
++   `tests::known_failure_deeply_nested_geometrycollection_stack_overflow`
++   (`cargo test known_failure_deeply_nested -- --ignored` → SIGABRT).
++
++Observations, not pinned as failures (arguably out of WKT's domain, reported
++for the maintainers to judge):
++
++- **Infinity asymmetry:** `POINT(inf 0)` fails to parse (`inf` tokenizes as a
++  word) but `POINT(-inf 0)` parses to −∞ (leading `-` makes it number-like and
++  `f64::from_str` accepts "-inf"). Meanwhile the writer happily emits
++  `POINT(inf 0)` for an infinite coordinate — output that doesn't re-parse.
++  NaN coordinates likewise serialize to unparseable `POINT(NaN 0)`.
++- `MULTIPOINT(EMPTY)` (empty member points, accepted by e.g. PostGIS) is
++  rejected by the parser — related to bugs 1/3: the crate can neither read nor
++  write empty elements inside multi-geometries.
++- `infer_type`'s doc comment claims EMPTY inputs return `None` for the
++  dimension, but the signature returns a plain `Dimension` (XY). Stale docs.
++
++## 4. Generator design and exclusions
++
++- Coordinates: `one_of!` of unbounded finite `floats::<f64>()` and a boosted
++  extreme set (signed zeros, subnormals, max/min magnitudes) — boundary
++  conjunctions don't arise from uniform draws alone. NaN/∞ excluded because
++  equality-based round-trip properties can't observe them (and see the
++  infinity observation above).
++- One dimension (XY/XYZ/XYM/XYZM) is drawn per geometry tree and used
++  uniformly, matching real data and the writer's header semantics.
++- GeometryCollection nesting is generated recursively with an explicit depth
++  bound (3); deep nesting is probed separately and deterministically (property
++  8 + the ignored reproducer), since uniform recursion never reaches the
++  overflow depth.
++- Exclusions, each protecting against a **pinned known bug** (not narrowing the
++  library's contract silently — every exclusion has a comment referencing its
++  canonical failing test): no empty points inside MultiPoint (bug 1), no empty
++  polygons inside MultiPolygon (bug 2), no empty linestrings/rings inside
++  MultiLineString/Polygon (bug 3).
++- The geo-types generator additionally restricts to XY, non-empty points, and
++  explicitly closed polygon rings, because `geo_types::Polygon::new` closes
++  rings — that is geo-types' documented behavior, not a wkt bug.
++
++## 5. Validation and how to run
++
++- **Liveness:** two mutation checks (inverting the equality assertion in
++  properties 1 and 10) each produced a shrunk minimal counterexample
++  (`POINT EMPTY` / `LINESTRING EMPTY`); reverted, `.hegel/` DB removed.
++- **Exploratory 10x run:** all hegel tests run once at `test_cases = 1000`
++  with a per-case counter (1043 fixpoint cases confirmed executed, not
++  wall-clock-inferred). No new failures; settings reverted to the default 100.
++- **Final state:** `cargo test --lib`: **115 passed, 3 failed (the pinned
++  known-failure tests above, deterministic), 1 ignored (the process-aborting
++  reproducer)**. Doc tests: 20 passed. `.hegel/` added to `.gitignore`.
++- Run everything: `cargo test`. Reproduce the stack overflow:
++  `cargo test known_failure_deeply_nested -- --ignored` (SIGABRT expected).
+diff --git a/src/geo_types_from_wkt.rs b/src/geo_types_from_wkt.rs
+index 0377211..71fbaa3 100644
+--- a/src/geo_types_from_wkt.rs
++++ b/src/geo_types_from_wkt.rs
+@@ -387,6 +387,22 @@ try_from_wkt_impl![
+ mod tests {
+     use super::*;
+ 
++    /// Converting a geo-types-representable Wkt to `geo_types::Geometry` and
++    /// back (via `ToWkt`) must be the identity: no coordinates gained, lost,
++    /// or altered, and the structure preserved.
++    #[hegel::test]
++    fn prop_wkt_to_geo_types_and_back_is_identity(tc: hegel::TestCase) {
++        use crate::ToWkt;
++
++        let wkt = crate::pbt::draw_geo_compatible_wkt(&tc, 2);
++        let geo: geo_types::Geometry<f64> = wkt
++            .clone()
++            .try_into()
++            .unwrap_or_else(|e| panic!("conversion to geo-types failed for {wkt}: {e:?}"));
++        let back: Wkt<f64> = geo.to_wkt();
++        assert_eq!(back, wkt, "wkt -> geo-types -> wkt was not the identity");
++    }
++
+     #[test]
+     fn convert_single_item_wkt() {
+         let wkt = Wkt::from(Point::from_coord(Coord {
+diff --git a/src/infer_type.rs b/src/infer_type.rs
+index 9797edc..acf54be 100644
+--- a/src/infer_type.rs
++++ b/src/infer_type.rs
+@@ -156,6 +156,27 @@ mod test {
+         );
+     }
+ 
++    /// `infer_type` must agree with the full parser on every WKT string the
++    /// crate's own writer emits: same geometry type, same dimension.
++    #[hegel::test]
++    fn prop_infer_type_agrees_with_writer_and_parser(tc: hegel::TestCase) {
++        let wkt = crate::pbt::draw_arbitrary_wkt(&tc);
++        let s = wkt.to_string();
++        let (geom_type, dim) =
++            infer_type(&s).unwrap_or_else(|e| panic!("infer_type failed on {s:?}: {e}"));
++        let expected_type = match &wkt {
++            crate::Wkt::Point(_) => GeometryType::Point,
++            crate::Wkt::LineString(_) => GeometryType::LineString,
++            crate::Wkt::Polygon(_) => GeometryType::Polygon,
++            crate::Wkt::MultiPoint(_) => GeometryType::MultiPoint,
++            crate::Wkt::MultiLineString(_) => GeometryType::MultiLineString,
++            crate::Wkt::MultiPolygon(_) => GeometryType::MultiPolygon,
++            crate::Wkt::GeometryCollection(_) => GeometryType::GeometryCollection,
++        };
++        assert_eq!(geom_type, expected_type, "wrong type inferred from {s:?}");
++        assert_eq!(dim, wkt.dimension(), "wrong dimension inferred from {s:?}");
++    }
++
+     #[test]
+     fn test_empty() {
+         assert_eq!(
+diff --git a/src/lib.rs b/src/lib.rs
+index 5eed5eb..5158783 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -980,4 +980,540 @@ mod tests {
+ 
+         assert_eq!(wktls.to_string(), "LINESTRING(10 20,20 30)");
+     }
++
++    // ------------------------------------------------------------------
++    // Property-based tests (hegel)
++    // ------------------------------------------------------------------
++
++    use crate::pbt;
++    use crate::types::{
++        GeometryCollection, LineString, MultiLineString, MultiPoint, Polygon,
++    };
++    use hegel::generators;
++
++    /// Write→parse must recover an equal geometry, and re-serializing must be a
++    /// fixpoint (the second serialization is byte-identical to the first).
++    #[hegel::test]
++    fn prop_write_parse_roundtrip_is_fixpoint(tc: hegel::TestCase) {
++        let wkt = pbt::draw_arbitrary_wkt(&tc);
++        let s1 = wkt.to_string();
++        let reparsed: Wkt<f64> = Wkt::from_str(&s1)
++            .unwrap_or_else(|e| panic!("failed to re-parse written WKT {s1:?}: {e}"));
++        assert_eq!(reparsed, wkt, "write→parse did not recover the value; wrote {s1:?}");
++        let s2 = reparsed.to_string();
++        assert_eq!(s2, s1, "write→parse→write is not a fixpoint");
++    }
++
++    /// The writer must not lose precision: every finite f64 coordinate
++    /// (including subnormals, ±0.0, and values at the extremes of the range)
++    /// must survive write→parse bit-for-bit.
++    #[hegel::test]
++    fn prop_point_coordinates_survive_roundtrip_bit_exact(tc: hegel::TestCase) {
++        let dim = pbt::draw_dimension(&tc);
++        let coord = pbt::draw_coord(&tc, dim);
++        let point = Wkt::Point(Point::new(Some(coord), dim));
++        let s = point.to_string();
++        let reparsed: Wkt<f64> =
++            Wkt::from_str(&s).unwrap_or_else(|e| panic!("failed to parse {s:?}: {e}"));
++        let Wkt::Point(p) = reparsed else {
++            panic!("expected a POINT back, got {reparsed:?}")
++        };
++        let c = p.coord().expect("expected a non-empty POINT back");
++        assert_eq!(
++            coord.x.to_bits(),
++            c.x.to_bits(),
++            "x: {:?} -> {s:?} -> {:?}",
++            coord.x,
++            c.x
++        );
++        assert_eq!(
++            coord.y.to_bits(),
++            c.y.to_bits(),
++            "y: {:?} -> {s:?} -> {:?}",
++            coord.y,
++            c.y
++        );
++        assert_eq!(
++            coord.z.map(f64::to_bits),
++            c.z.map(f64::to_bits),
++            "z: {:?} -> {s:?} -> {:?}",
++            coord.z,
++            c.z
++        );
++        assert_eq!(
++            coord.m.map(f64::to_bits),
++            c.m.map(f64::to_bits),
++            "m: {:?} -> {s:?} -> {:?}",
++            coord.m,
++            c.m
++        );
++    }
++
++    /// `Wkt::from_str` must never panic on arbitrary text — it returns Err.
++    #[hegel::test]
++    fn prop_parse_arbitrary_text_never_panics(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text().max_size(200));
++        drop(Wkt::<f64>::from_str(&s));
++    }
++
++    /// `Wkt::from_str` must never panic on WKT-shaped token soup either —
++    /// keywords, parens, commas and numbers glued together in random order.
++    #[hegel::test]
++    fn prop_parse_wkt_shaped_soup_never_panics(tc: hegel::TestCase) {
++        let fragments: Vec<&'static str> = vec![
++            "POINT",
++            "LINESTRING",
++            "POLYGON",
++            "MULTIPOINT",
++            "MULTILINESTRING",
++            "MULTIPOLYGON",
++            "GEOMETRYCOLLECTION",
++            "POINTZ",
++            "LINEARRING",
++            "EMPTY",
++            "Z",
++            "M",
++            "ZM",
++            "(",
++            ")",
++            ",",
++            " ",
++            "\t",
++            "\n",
++            "0",
++            "1.5",
++            "-2",
++            ".5",
++            "+3",
++            "1e5",
++            "-1e-300",
++            "NaN",
++            "inf",
++            "-inf",
++            "..",
++            "--",
++            "1.2.3",
++            "\0",
++        ];
++        let n = tc.draw(generators::integers::<usize>().max_value(30));
++        let mut s = String::new();
++        for _ in 0..n {
++            s.push_str(tc.draw(generators::sampled_from(fragments.clone())));
++            if tc.draw(generators::booleans()) {
++                s.push(' ');
++            }
++        }
++        drop(Wkt::<f64>::from_str(&s));
++    }
++
++    /// Parsing is case-insensitive in keywords and tolerant of extra
++    /// whitespace around parens and commas: a mutated serialization parses to
++    /// the same geometry as the canonical one.
++    #[hegel::test]
++    fn prop_parse_is_case_insensitive_and_whitespace_tolerant(tc: hegel::TestCase) {
++        let dim = pbt::draw_dimension(&tc);
++        let wkt = pbt::draw_wkt(&tc, dim, 1);
++        let canonical = wkt.to_string();
++        let mut mutated = String::new();
++        for ch in canonical.chars() {
++            match ch {
++                c if c.is_ascii_alphabetic() => {
++                    if tc.draw(generators::booleans()) {
++                        mutated.push(c.to_ascii_lowercase());
++                    } else {
++                        mutated.push(c.to_ascii_uppercase());
++                    }
++                }
++                '(' | ')' | ',' => {
++                    if tc.draw(generators::booleans()) {
++                        mutated.push_str(
++                            tc.draw(generators::sampled_from(vec![" ", "\t", "\n", "\r", "  "])),
++                        );
++                    }
++                    mutated.push(ch);
++                    if tc.draw(generators::booleans()) {
++                        mutated.push_str(
++                            tc.draw(generators::sampled_from(vec![" ", "\t", "\n", "\r", "  "])),
++                        );
++                    }
++                }
++                c => mutated.push(c),
++            }
++        }
++        let parsed = Wkt::<f64>::from_str(&mutated)
++            .unwrap_or_else(|e| panic!("failed to parse mutated WKT {mutated:?}: {e}"));
++        assert_eq!(parsed, wkt, "mutated form {mutated:?} parsed differently");
++    }
++
++    /// Every geometry type × dimension has an EMPTY form that round-trips.
++    #[hegel::test]
++    fn prop_empty_geometries_roundtrip(tc: hegel::TestCase) {
++        let dim = pbt::draw_dimension(&tc);
++        let empty: Wkt<f64> = match tc.draw(generators::integers::<u8>().max_value(6)) {
++            0 => Point::empty(dim).into(),
++            1 => LineString::empty(dim).into(),
++            2 => Polygon::empty(dim).into(),
++            3 => MultiPoint::empty(dim).into(),
++            4 => MultiLineString::empty(dim).into(),
++            5 => MultiPolygon::empty(dim).into(),
++            _ => GeometryCollection::empty(dim).into(),
++        };
++        let s = empty.to_string();
++        assert!(
++            s.ends_with("EMPTY"),
++            "serialized empty geometry {s:?} should end with EMPTY"
++        );
++        let reparsed = Wkt::<f64>::from_str(&s)
++            .unwrap_or_else(|e| panic!("failed to parse empty geometry {s:?}: {e}"));
++        assert_eq!(reparsed, empty);
++    }
++
++    /// The compact dimension headers (`POINTZ`, `LINESTRINGZM`, ...) must parse
++    /// identically to the spaced forms (`POINT Z`, `LINESTRING ZM`, ...) that
++    /// the writer emits (see `Wkt::from_word_and_tokens`).
++    #[hegel::test]
++    fn prop_compact_dimension_headers_parse_identically(tc: hegel::TestCase) {
++        let dim = tc.draw(generators::sampled_from(vec![
++            Dimension::XYZ,
++            Dimension::XYM,
++            Dimension::XYZM,
++        ]));
++        let wkt = pbt::draw_wkt(&tc, dim, 1);
++        let spaced = wkt.to_string();
++        let compact = spaced
++            .replace(" ZM(", "ZM(")
++            .replace(" Z(", "Z(")
++            .replace(" M(", "M(")
++            .replace(" ZM EMPTY", "ZM EMPTY")
++            .replace(" Z EMPTY", "Z EMPTY")
++            .replace(" M EMPTY", "M EMPTY");
++        let parsed = Wkt::<f64>::from_str(&compact)
++            .unwrap_or_else(|e| panic!("failed to parse compact form {compact:?}: {e}"));
++        assert_eq!(parsed, wkt, "compact form {compact:?} parsed differently");
++    }
++
++    /// Bounded nesting: nested GEOMETRYCOLLECTIONs parse fine and round-trip up
++    /// to depth 64, and truncated input at the same depth errors cleanly.
++    /// The bound protects the test: the parser's recursion overflows the stack
++    /// somewhere between depth 450 and 500 on a default 2 MiB test thread —
++    /// see `known_failure_deeply_nested_geometrycollection_stack_overflow`.
++    #[hegel::test]
++    fn prop_bounded_nested_geometrycollections_parse_and_roundtrip(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++        let s = format!(
++            "{}POINT(1 2){}",
++            "GEOMETRYCOLLECTION(".repeat(depth),
++            ")".repeat(depth)
++        );
++        let parsed = Wkt::<f64>::from_str(&s)
++            .unwrap_or_else(|e| panic!("depth {depth} failed to parse: {e}"));
++        assert_eq!(parsed.to_string(), s);
++
++        let truncated = "GEOMETRYCOLLECTION(".repeat(depth);
++        assert!(
++            Wkt::<f64>::from_str(&truncated).is_err(),
++            "truncated nesting at depth {depth} should be an error"
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // Known failures — real bugs found by the properties above, pinned
++    // deterministically. Do not "fix" the tests; fix the library.
++    // ------------------------------------------------------------------
++
++    /// KNOWN FAILURE: `Display` panics (`Option::unwrap()` on `None` in
++    /// `write_multi_point`, src/to_wkt/geo_trait_impl.rs) when a MULTIPOINT
++    /// contains an empty point. Such a value is constructible with the public
++    /// `MultiPoint::new` API, and `fmt::Display` must not panic.
++    /// The pbt generators exclude empty points inside MultiPoint because of
++    /// this bug (see `pbt::draw_multipoint`).
++    #[test]
++    fn known_failure_display_of_multipoint_containing_empty_point_panics() {
++        let mp: Wkt<f64> = Wkt::MultiPoint(MultiPoint::new(
++            vec![Point::empty(Dimension::XY)],
++            Dimension::XY,
++        ));
++        // Panics today: called `Option::unwrap()` on a `None` value
++        let _ = mp.to_string();
++    }
++
++    /// KNOWN FAILURE: `Display` panics (`Option::unwrap()` on `None` in
++    /// `write_multi_polygon`, src/to_wkt/geo_trait_impl.rs) when a
++    /// MULTIPOLYGON contains an empty polygon (a polygon with no rings).
++    /// The pbt generators exclude empty polygons inside MultiPolygon because
++    /// of this bug (see `pbt::draw_multipolygon`).
++    #[test]
++    fn known_failure_display_of_multipolygon_containing_empty_polygon_panics() {
++        let mp: Wkt<f64> = Wkt::MultiPolygon(MultiPolygon::new(
++            vec![Polygon::empty(Dimension::XY)],
++            Dimension::XY,
++        ));
++        // Panics today: called `Option::unwrap()` on a `None` value
++        let _ = mp.to_string();
++    }
++
++    /// KNOWN FAILURE: a MultiLineString containing an empty LineString
++    /// serializes to `MULTILINESTRING(())`, which the crate's own parser
++    /// rejects ("Missing closing parenthesis for type") — the writer produces
++    /// output it cannot read back. A Polygon with an empty interior ring hits
++    /// the same `write_coord_sequence` code path (`POLYGON((1 2),())`).
++    /// The pbt generators exclude empty rings/linestrings inside multi
++    /// geometries because of this bug (see `pbt::draw_multilinestring`).
++    #[test]
++    fn known_failure_multilinestring_with_empty_linestring_does_not_roundtrip() {
++        let mls: Wkt<f64> = Wkt::MultiLineString(MultiLineString::new(
++            vec![LineString::empty(Dimension::XY)],
++            Dimension::XY,
++        ));
++        let written = mls.to_string();
++        let reparsed = Wkt::<f64>::from_str(&written);
++        assert!(
++            reparsed.is_ok(),
++            "writer output {written:?} is rejected by the parser: {reparsed:?}"
++        );
++    }
++
++    /// KNOWN FAILURE (process-aborting): parsing deeply nested
++    /// GEOMETRYCOLLECTIONs recurses once per nesting level
++    /// (`Wkt::from_word_and_tokens` → `GeometryCollection::from_tokens` →
++    /// `Wkt::from_word_and_tokens` → ...) with no depth limit, and overflows
++    /// the stack — SIGABRT, taking the whole test process down. Measured to
++    /// abort between depth 450 and 500 on a default 2 MiB test thread (debug
++    /// build). Run manually with:
++    ///   cargo test known_failure_deeply_nested -- --ignored
++    #[test]
++    #[ignore = "stack overflow aborts the whole test process; run manually with --ignored"]
++    fn known_failure_deeply_nested_geometrycollection_stack_overflow() {
++        let depth = 100_000;
++        let s = format!(
++            "{}POINT(1 2){}",
++            "GEOMETRYCOLLECTION(".repeat(depth),
++            ")".repeat(depth)
++        );
++        // Aborts with a stack overflow today; should return Ok or a depth error.
++        let _ = Wkt::<f64>::from_str(&s);
++    }
++}
++
++/// Shared value generators for the hegel property-based tests.
++///
++/// These are used by the properties in this file, in `infer_type.rs`, and in
++/// `geo_types_from_wkt.rs`.
++#[cfg(test)]
++pub(crate) mod pbt {
++    use crate::types::{
++        Coord, Dimension, GeometryCollection, LineString, MultiLineString, MultiPoint,
++        MultiPolygon, Point, Polygon,
++    };
++    use crate::Wkt;
++    use hegel::generators;
++
++    /// Boundary/extreme values that uniform generation rarely hits: signed
++    /// zeros, subnormals, and the largest/smallest finite magnitudes.
++    fn extreme_f64s() -> Vec<f64> {
++        vec![
++            0.0,
++            -0.0,
++            1.0,
++            -1.0,
++            0.1,
++            f64::MIN_POSITIVE,
++            -f64::MIN_POSITIVE,
++            5e-324,   // smallest positive subnormal
++            -5e-324,
++            f64::MAX,
++            f64::MIN,
++            f64::EPSILON,
++            1.7e308,
++            2.5e-300,
++            33644952.0,
++        ]
++    }
++
++    pub(crate) fn draw_finite_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>()
++                .allow_nan(false)
++                .allow_infinity(false),
++            generators::sampled_from(extreme_f64s()),
++        ))
++    }
++
++    pub(crate) fn draw_dimension(tc: &hegel::TestCase) -> Dimension {
++        tc.draw(generators::sampled_from(vec![
++            Dimension::XY,
++            Dimension::XYZ,
++            Dimension::XYM,
++            Dimension::XYZM,
++        ]))
++    }
++
++    pub(crate) fn draw_coord(tc: &hegel::TestCase, dim: Dimension) -> Coord<f64> {
++        let has_z = matches!(dim, Dimension::XYZ | Dimension::XYZM);
++        let has_m = matches!(dim, Dimension::XYM | Dimension::XYZM);
++        Coord {
++            x: draw_finite_f64(tc),
++            y: draw_finite_f64(tc),
++            z: if has_z { Some(draw_finite_f64(tc)) } else { None },
++            m: if has_m { Some(draw_finite_f64(tc)) } else { None },
++        }
++    }
++
++    fn draw_coords(
++        tc: &hegel::TestCase,
++        dim: Dimension,
++        min: usize,
++        max: usize,
++    ) -> Vec<Coord<f64>> {
++        let n = tc.draw(generators::integers::<usize>().min_value(min).max_value(max));
++        (0..n).map(|_| draw_coord(tc, dim)).collect()
++    }
++
++    pub(crate) fn draw_point(
++        tc: &hegel::TestCase,
++        dim: Dimension,
++        allow_empty: bool,
++    ) -> Point<f64> {
++        if allow_empty && tc.draw(generators::booleans()) {
++            Point::empty(dim)
++        } else {
++            Point::new(Some(draw_coord(tc, dim)), dim)
++        }
++    }
++
++    pub(crate) fn draw_linestring(
++        tc: &hegel::TestCase,
++        dim: Dimension,
++        allow_empty: bool,
++    ) -> LineString<f64> {
++        let min = if allow_empty { 0 } else { 1 };
++        LineString::new(draw_coords(tc, dim, min, 4), dim)
++    }
++
++    /// Rings are always non-empty: the writer emits `()` for an empty ring,
++    /// which its own parser rejects — pinned in
++    /// `known_failure_multilinestring_with_empty_linestring_does_not_roundtrip`.
++    fn draw_ring(tc: &hegel::TestCase, dim: Dimension) -> LineString<f64> {
++        LineString::new(draw_coords(tc, dim, 1, 4), dim)
++    }
++
++    pub(crate) fn draw_polygon(
++        tc: &hegel::TestCase,
++        dim: Dimension,
++        allow_empty: bool,
++    ) -> Polygon<f64> {
++        let min = if allow_empty { 0 } else { 1 };
++        let n = tc.draw(generators::integers::<usize>().min_value(min).max_value(3));
++        Polygon::new((0..n).map(|_| draw_ring(tc, dim)).collect(), dim)
++    }
++
++    /// Points inside a MULTIPOINT are always non-empty: `Display` panics on an
++    /// empty point inside a MultiPoint — pinned in
++    /// `known_failure_display_of_multipoint_containing_empty_point_panics`.
++    pub(crate) fn draw_multipoint(tc: &hegel::TestCase, dim: Dimension) -> MultiPoint<f64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(4));
++        MultiPoint::new((0..n).map(|_| draw_point(tc, dim, false)).collect(), dim)
++    }
++
++    /// LineStrings inside a MULTILINESTRING are always non-empty — pinned in
++    /// `known_failure_multilinestring_with_empty_linestring_does_not_roundtrip`.
++    pub(crate) fn draw_multilinestring(
++        tc: &hegel::TestCase,
++        dim: Dimension,
++    ) -> MultiLineString<f64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        MultiLineString::new(
++            (0..n).map(|_| draw_linestring(tc, dim, false)).collect(),
++            dim,
++        )
++    }
++
++    /// Polygons inside a MULTIPOLYGON are always non-empty: `Display` panics
++    /// on an empty polygon inside a MultiPolygon — pinned in
++    /// `known_failure_display_of_multipolygon_containing_empty_polygon_panics`.
++    pub(crate) fn draw_multipolygon(tc: &hegel::TestCase, dim: Dimension) -> MultiPolygon<f64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        MultiPolygon::new(
++            (0..n).map(|_| draw_polygon(tc, dim, false)).collect(),
++            dim,
++        )
++    }
++
++    /// Draw an arbitrary geometry of uniform dimension. `depth` bounds
++    /// GeometryCollection nesting.
++    pub(crate) fn draw_wkt(tc: &hegel::TestCase, dim: Dimension, depth: u32) -> Wkt<f64> {
++        let max_choice = if depth == 0 { 5u8 } else { 6 };
++        match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++            0 => Wkt::Point(draw_point(tc, dim, true)),
++            1 => Wkt::LineString(draw_linestring(tc, dim, true)),
++            2 => Wkt::Polygon(draw_polygon(tc, dim, true)),
++            3 => Wkt::MultiPoint(draw_multipoint(tc, dim)),
++            4 => Wkt::MultiLineString(draw_multilinestring(tc, dim)),
++            5 => Wkt::MultiPolygon(draw_multipolygon(tc, dim)),
++            _ => {
++                let n = tc.draw(generators::integers::<usize>().max_value(3));
++                Wkt::GeometryCollection(GeometryCollection::new(
++                    (0..n).map(|_| draw_wkt(tc, dim, depth - 1)).collect(),
++                    dim,
++                ))
++            }
++        }
++    }
++
++    pub(crate) fn draw_arbitrary_wkt(tc: &hegel::TestCase) -> Wkt<f64> {
++        let dim = draw_dimension(tc);
++        draw_wkt(tc, dim, 3)
++    }
++
++    /// Draw a geometry that is representable in geo-types: XY only, no empty
++    /// points (geo-types points cannot be empty), and polygon rings explicitly
++    /// closed (`geo_types::Polygon::new` closes rings, so an unclosed ring
++    /// would come back with an extra coordinate).
++    pub(crate) fn draw_geo_compatible_wkt(tc: &hegel::TestCase, depth: u32) -> Wkt<f64> {
++        let dim = Dimension::XY;
++        let max_choice = if depth == 0 { 5u8 } else { 6 };
++        match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++            0 => Wkt::Point(draw_point(tc, dim, false)),
++            1 => Wkt::LineString(draw_linestring(tc, dim, true)),
++            2 => Wkt::Polygon(draw_closed_polygon(tc)),
++            3 => Wkt::MultiPoint(draw_multipoint(tc, dim)),
++            4 => Wkt::MultiLineString(draw_multilinestring(tc, dim)),
++            5 => Wkt::MultiPolygon(draw_closed_multipolygon(tc)),
++            _ => {
++                let n = tc.draw(generators::integers::<usize>().max_value(3));
++                Wkt::GeometryCollection(GeometryCollection::new(
++                    (0..n)
++                        .map(|_| draw_geo_compatible_wkt(tc, depth - 1))
++                        .collect(),
++                    dim,
++                ))
++            }
++        }
++    }
++
++    fn draw_closed_ring(tc: &hegel::TestCase) -> LineString<f64> {
++        let mut coords = draw_coords(tc, Dimension::XY, 1, 4);
++        coords.push(coords[0]);
++        LineString::new(coords, Dimension::XY)
++    }
++
++    fn draw_closed_polygon(tc: &hegel::TestCase) -> Polygon<f64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        Polygon::new((0..n).map(|_| draw_closed_ring(tc)).collect(), Dimension::XY)
++    }
++
++    fn draw_closed_multipolygon(tc: &hegel::TestCase) -> MultiPolygon<f64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        let polygons = (0..n)
++            .map(|_| {
++                // non-empty: see draw_multipolygon
++                let n_rings = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++                Polygon::new(
++                    (0..n_rings).map(|_| draw_closed_ring(tc)).collect(),
++                    Dimension::XY,
++                )
++            })
++            .collect();
++        MultiPolygon::new(polygons, Dimension::XY)
++    }
+ }

@@ -1,0 +1,841 @@
+diff --git a/.gitignore b/.gitignore
+index 2bcc095..ed9a9fd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -78,3 +78,6 @@ profile.json.gz
+ 
+ # Claude Code personal settings
+ .claude/settings.local.json
++
++# Hegel property-testing failure database
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..d2ef824
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,137 @@
++# Hegel property-based testing report: datafusion (datafusion-common)
++
++Target: `datafusion-common` (leaf member of the apache/datafusion workspace, pinned at 1c8295c).
++Feasibility: full workspace build was out of budget, but `datafusion-common` alone builds fast
++(~55 s cold test binary, ~6-30 s incremental), so all work was scoped with `-p datafusion-common`.
++The `rust-toolchain.toml` pin (1.97.0) auto-installed via rustup. `hegeltest 0.28.2` added as a
++dev-dependency with no friction.
++
++## Properties tested
++
++14 hegel tests (13 properties + 1 deterministic bug pin), added to the existing in-module test
++modules:
++
++`datafusion/common/src/scalar/mod.rs` — built around a `PrimSpec`/`draw_prim_value` generator
++covering 36 `ScalarValue` kinds (all ints, floats drawn from raw bits so NaN payloads/-0.0/
++infinities are reachable, utf8/binary in all three width variants, dates, times, timestamps with
++drawn timezones, durations, all three interval types, valid `Decimal128` precision/scale/value
++combinations, and `Null`), with ~20% nulls everywhere:
++
++1. `prop_scalar_eq_ord_hash_consistency` — manual `PartialEq`/`PartialOrd`/`Hash` impls are
++   mutually consistent: reflexivity (incl. bitwise NaN==NaN), antisymmetry of `partial_cmp`,
++   `eq` implies `Some(Equal)` + equal hashes, `Some(Equal)` implies `eq` within one data type,
++   and different variants are never equal/ordered.
++2. `prop_scalar_to_array_of_size_roundtrip` — `to_array_of_size(n)` yields the right length and
++   `DataType`, and every index round-trips through `try_from_array` back to the scalar.
++3. `prop_scalar_iter_to_array_roundtrip` — `iter_to_array` over same-typed scalars (mixed
++   null/non-null) reads back element-for-element via `try_from_array`.
++4. `prop_scalar_add_checked_matches_native_checked_add` — for all 8 integer kinds incl. nulls:
++   agrees with native `checked_add`, errors exactly on overflow, propagates nulls.
++5. `prop_scalar_sub_checked_matches_native_checked_sub` — same for `sub_checked`/`checked_sub`.
++6. `prop_scalar_add_wrapping_matches_native_wrapping_add` — the wrapping `add` (which has a
++   scalar fast path guarded by `can_use_direct_add` plus an arrow-kernel fallback) agrees with
++   native `wrapping_add`.
++
++`datafusion/common/src/rounding.rs` — floats drawn from raw bits with boundary bit patterns
++boosted (zeros, tiniest subnormals, MAX/MIN, infinities, NaN):
++
++7. `prop_next_up_next_down_match_std` — `next_up`/`next_down` agree bit-for-bit with std's
++   `f64::next_up`/`next_down` (and f32) everywhere except the deliberate signed-zero stepping
++   (`-0.0 -> +0.0 -> TINY`), which is asserted exactly.
++8. `prop_next_up_next_down_are_inverses` — `next_up` is the strict successor in the IEEE total
++   order and `next_down` its exact bitwise inverse (and vice versa), for both f32 and f64.
++
++`datafusion/common/src/table_reference.rs`:
++
++9. `prop_table_reference_quoted_string_roundtrip` — a `TableReference` built from arbitrary
++   non-empty parts (plain identifiers, arbitrary unicode text, and strings dense in `"`/`.`)
++   round-trips through `to_quoted_string` + `parse_str`.
++10. `prop_table_reference_empty_table_part_roundtrip` — KNOWN FAILURE pin, see Suspected bugs.
++
++`datafusion/common/src/stats.rs`:
++
++11. `prop_precision_usize_add_oracle` — `Precision::<usize>::add` is commutative, computes the
++    saturating sum, is `Exact` iff both inputs exact and no native overflow, `Absent` if either
++    input absent.
++12. `prop_precision_usize_sub_oracle` — same shape for `sub` (saturating difference, exactness
++    lost on underflow).
++13. `prop_precision_usize_multiply_oracle` — same shape for `multiply`, with small values
++    boosted so the non-saturating path is exercised too.
++14. `prop_precision_usize_min_max_consistency` — `min`/`max` agree with `std::cmp` on values,
++    are commutative, propagate exactness only when both inputs are exact, and satisfy
++    `min <= max`.
++
++## Test results
++
++- Default run (`cargo test -p datafusion-common --lib prop_`): 13/14 pass; the pinned
++  known-failure test fails deterministically on every run with the minimal counterexample
++  (`Partial { schema: "a", table: "" }` -> `"a."` -> `Bare { table: "a" }`).
++- Exploratory 10x run (`test_cases = 1000` on all 14 tests): identical outcome — no additional
++  failures surfaced; reverted to the default case count afterwards.
++- All-features run (`--all-features`, which switches `TableReference` to the sqlparser-based
++  identifier parser): identical outcome (the pinned failure reproduces there too, with the
++  sql-feature fallback result `Bare { table: "a." }`).
++- Full crate suite (`cargo test -p datafusion-common --lib`): 524 passed, 1 failed (the pin).
++- Liveness verified: temporarily inverting the reflexivity assertion produced a fully shrunk
++  hegel counterexample (`Boolean(NULL)`); reverted.
++- `cargo fmt` clean; `cargo clippy -p datafusion-common --all-targets --all-features
++  -- -D warnings` clean. (The repo's pre-commit guidance asks for *workspace-wide* clippy; that
++  full build exceeds the time budget for this huge workspace, so clippy was scoped to the
++  touched crate. The single pre-existing `unused_imports` warning in `config.rs` tests is not
++  from this work.)
++
++## Suspected bugs
++
++**Empty identifier parts do not survive `to_quoted_string` -> `parse_str`** (pinned by
++`prop_table_reference_empty_table_part_roundtrip`, deliberately left failing):
++
++- `TableReference::partial("a", "")` (constructible; the constructors document "*NO*
++  normalization" and accept any string) serializes via `to_quoted_string()` to `"a."`.
++- Root cause: `quote_identifier("")` in `datafusion/common/src/utils/mod.rs` returns the empty
++  string *unquoted* — `needs_quotes("")` is `false` because the first-char check is skipped for
++  empty input and `chars.all(...)` is vacuously true. An empty identifier can only round-trip
++  if quoted as `""`.
++- Without the `sql` feature, `parse_identifiers` then drops the trailing empty segment
++  (`"a."` -> `["a"]` -> `Bare { table: "a" }`); with the `sql` feature the string fails to
++  parse and falls back to `Bare { table: "a." }`. Both lose the original reference.
++- Severity: low (empty identifier parts are degenerate), but it is a genuine contract break in
++  the quote/parse pair; any code persisting references via `to_quoted_string` silently changes
++  the reference. Not fixed per instructions; the general round-trip property excludes empty
++  parts with a comment referencing the pin.
++
++No other candidate bugs: the remaining 13 properties survived the 10x run under both feature
++configurations.
++
++## Unsound properties abandoned
++
++- **`next_up`/`next_down` == std everywhere**: unsound as stated — the implementation
++  intentionally steps through signed zeros one bit pattern at a time (`next_up(-0.0) == +0.0`,
++  not `TINY` as in std), and the crate's own unit tests pin that. The property was weakened to
++  "matches std except at ±0.0, where the exact documented stepping is asserted".
++- **`partial_cmp == Some(Equal)` implies `eq` across arbitrary type parameters**: unsound for
++  decimals — `partial_cmp` deliberately ignores precision (only scale must match, per the
++  comment about `add_checked` widening precision), while `eq` compares precision. The
++  implication is asserted only when both values share identical type parameters; the
++  `eq => Some(Equal)` direction is asserted unconditionally.
++- Decimal scale generation was constrained to `|scale| <= precision` and values to the
++  precision's digit budget — that protects arrow's documented `Decimal128` validity rules, not
++  the test's resources.
++
++## Skill feedback
++
++- The Rust reference was accurate throughout (imperative draws, `one_of!`, `sampled_from`,
++  `optional`, `from_regex`, macro-in-test-fn pattern all worked first try); the only compile
++  friction was three `unused_imports` warnings from importing `Generator as _` in files that
++  never use combinator methods — the reference's note about importing the trait only when
++  needed is right, worth internalizing.
++- For huge workspaces, the "pick a small leaf member and scope everything with `-p`" strategy
++  worked well: the workspace-level toolchain pin downloaded automatically and iteration stayed
++  in the 5-30 s range. Worth a sentence in the skill's setup section: build feasibility in a
++  mega-workspace is a property of the *member*, not the workspace.
++- The skill's "pair no-panic/roundtrip with a validation/rejection check" and "generate at the
++  grammar's special characters" advice paid off directly: the table-reference bug is exactly a
++  degenerate-input quoting hole that uniform `text()` generation would rarely reach (found by
++  reasoning about the encode set, confirmed by the property).
++- `.hegel/` failure databases appear at the *crate* directory when running `-p` tests in a
++  workspace; the gitignore advice should mention workspaces (added `.hegel/` at workspace
++  root .gitignore, which covers nested dirs).
+diff --git a/datafusion/common/Cargo.toml b/datafusion/common/Cargo.toml
+index 1eb2308..2d491c7 100644
+--- a/datafusion/common/Cargo.toml
++++ b/datafusion/common/Cargo.toml
+@@ -91,6 +91,7 @@ web-time = "1.1.0"
+ [dev-dependencies]
+ chrono = { workspace = true }
+ criterion = { workspace = true }
++hegeltest = "0.28.2"
+ insta = { workspace = true }
+ rand = { workspace = true }
+ sqlparser = { workspace = true }
+diff --git a/datafusion/common/src/rounding.rs b/datafusion/common/src/rounding.rs
+index 1796143..f4bfbbb 100644
+--- a/datafusion/common/src/rounding.rs
++++ b/datafusion/common/src/rounding.rs
+@@ -432,4 +432,133 @@ mod tests {
+         let result = next_down(value);
+         assert_eq!(result, -0.0);
+     }
++
++    // ----------------------------------------------------------------------
++    // hegel property-based tests
++    // ----------------------------------------------------------------------
++
++    use hegel::generators as hg;
++    use std::cmp::Ordering;
++
++    /// Draws an f64 from raw bits, boosting the boundary bit patterns where
++    /// the interesting behavior lives (zeros, tiniest subnormals, infinities,
++    /// NaN, largest finite values).
++    fn draw_f64_bits(tc: &hegel::TestCase) -> f64 {
++        f64::from_bits(tc.draw(hegel::one_of!(
++            hg::integers::<u64>(),
++            hg::sampled_from(vec![
++                0u64,                  // +0.0
++                1,                     // smallest positive subnormal
++                0x8000_0000_0000_0000, // -0.0
++                0x8000_0000_0000_0001, // smallest (magnitude) negative
++                f64::INFINITY.to_bits(),
++                f64::INFINITY.to_bits() - 1, // f64::MAX
++                f64::NEG_INFINITY.to_bits(),
++                f64::NEG_INFINITY.to_bits() - 1, // f64::MIN
++                f64::NAN.to_bits(),
++            ]),
++        )))
++    }
++
++    /// f32 analogue of [`draw_f64_bits`].
++    fn draw_f32_bits(tc: &hegel::TestCase) -> f32 {
++        f32::from_bits(tc.draw(hegel::one_of!(
++            hg::integers::<u32>(),
++            hg::sampled_from(vec![
++                0u32,
++                1,
++                0x8000_0000,
++                0x8000_0001,
++                f32::INFINITY.to_bits(),
++                f32::INFINITY.to_bits() - 1,
++                f32::NEG_INFINITY.to_bits(),
++                f32::NEG_INFINITY.to_bits() - 1,
++                f32::NAN.to_bits(),
++            ]),
++        )))
++    }
++
++    /// Property: `next_up`/`next_down` agree bit-for-bit with the std library
++    /// `f64::next_up`/`f64::next_down` (and the f32 versions), except at
++    /// ±0.0, where this implementation deliberately steps through the signed
++    /// zeros one at a time (`-0.0 -> +0.0 -> TINY`, mirrored for
++    /// `next_down`), which the unit tests above pin.
++    #[hegel::test]
++    fn prop_next_up_next_down_match_std(tc: hegel::TestCase) {
++        fn check64(x: f64) {
++            if x.is_nan() {
++                assert!(next_up(x).is_nan());
++                assert!(next_down(x).is_nan());
++            } else if x == 0.0 {
++                if x.to_bits() == (-0.0f64).to_bits() {
++                    assert_eq!(next_up(x).to_bits(), (0.0f64).to_bits());
++                    assert_eq!(
++                        next_down(x).to_bits(),
++                        f64::from_bits(0x8000_0000_0000_0001).to_bits()
++                    );
++                } else {
++                    assert_eq!(next_up(x).to_bits(), f64::from_bits(0x1).to_bits());
++                    assert_eq!(next_down(x).to_bits(), (-0.0f64).to_bits());
++                }
++            } else {
++                assert_eq!(next_up(x).to_bits(), x.next_up().to_bits());
++                assert_eq!(next_down(x).to_bits(), x.next_down().to_bits());
++            }
++        }
++        fn check32(x: f32) {
++            if x.is_nan() {
++                assert!(next_up(x).is_nan());
++                assert!(next_down(x).is_nan());
++            } else if x == 0.0 {
++                if x.to_bits() == (-0.0f32).to_bits() {
++                    assert_eq!(next_up(x).to_bits(), (0.0f32).to_bits());
++                    assert_eq!(
++                        next_down(x).to_bits(),
++                        f32::from_bits(0x8000_0001).to_bits()
++                    );
++                } else {
++                    assert_eq!(next_up(x).to_bits(), f32::from_bits(0x1).to_bits());
++                    assert_eq!(next_down(x).to_bits(), (-0.0f32).to_bits());
++                }
++            } else {
++                assert_eq!(next_up(x).to_bits(), x.next_up().to_bits());
++                assert_eq!(next_down(x).to_bits(), x.next_down().to_bits());
++            }
++        }
++        check64(draw_f64_bits(&tc));
++        check32(draw_f32_bits(&tc));
++    }
++
++    /// Property: on non-NaN input, `next_up` is the strict successor in the
++    /// IEEE total order (`total_cmp`) and `next_down` its exact inverse, and
++    /// vice versa — so `next_down(next_up(x))` returns `x` bit-for-bit.
++    #[hegel::test]
++    fn prop_next_up_next_down_are_inverses(tc: hegel::TestCase) {
++        let x64 = draw_f64_bits(&tc);
++        if !x64.is_nan() {
++            if x64 != f64::INFINITY {
++                let up = next_up(x64);
++                assert_eq!(up.total_cmp(&x64), Ordering::Greater);
++                assert_eq!(next_down(up).to_bits(), x64.to_bits());
++            }
++            if x64 != f64::NEG_INFINITY {
++                let down = next_down(x64);
++                assert_eq!(down.total_cmp(&x64), Ordering::Less);
++                assert_eq!(next_up(down).to_bits(), x64.to_bits());
++            }
++        }
++        let x32 = draw_f32_bits(&tc);
++        if !x32.is_nan() {
++            if x32 != f32::INFINITY {
++                let up = next_up(x32);
++                assert_eq!(up.total_cmp(&x32), Ordering::Greater);
++                assert_eq!(next_down(up).to_bits(), x32.to_bits());
++            }
++            if x32 != f32::NEG_INFINITY {
++                let down = next_down(x32);
++                assert_eq!(down.total_cmp(&x32), Ordering::Less);
++                assert_eq!(next_up(down).to_bits(), x32.to_bits());
++            }
++        }
++    }
+ }
+diff --git a/datafusion/common/src/scalar/mod.rs b/datafusion/common/src/scalar/mod.rs
+index ddfe32e..79c58be 100644
+--- a/datafusion/common/src/scalar/mod.rs
++++ b/datafusion/common/src/scalar/mod.rs
+@@ -11470,4 +11470,338 @@ mod tests {
+         .unwrap();
+         assert_eq!(s.to_string(), "[]");
+     }
++
++    // ----------------------------------------------------------------------
++    // hegel property-based tests
++    // ----------------------------------------------------------------------
++
++    use hegel::generators::{self as hg, Generator as _};
++    use std::collections::hash_map::DefaultHasher;
++
++    /// Type-level parameters for generating primitive `ScalarValue`s. Two
++    /// values drawn from the same `PrimSpec` always have the same `DataType`
++    /// (including timestamp timezone and decimal precision/scale).
++    #[derive(Debug, Clone, PartialEq)]
++    struct PrimSpec {
++        kind: usize,
++        tz: Option<Arc<str>>,
++        precision: u8,
++        scale: i8,
++    }
++
++    const PRIM_KIND_COUNT: usize = 36;
++    const TIMESTAMP_KINDS: std::ops::RangeInclusive<usize> = 23..=26;
++    const DECIMAL128_KIND: usize = 34;
++    const NULL_KIND: usize = 35;
++
++    fn draw_prim_spec(tc: &hegel::TestCase) -> PrimSpec {
++        let kind = tc.draw(hg::integers::<usize>().max_value(PRIM_KIND_COUNT - 1));
++        let tz: Option<Arc<str>> = if TIMESTAMP_KINDS.contains(&kind) {
++            tc.draw(hg::sampled_from(vec![
++                None,
++                Some("+00:00"),
++                Some("America/New_York"),
++            ]))
++            .map(Arc::from)
++        } else {
++            None
++        };
++        let (precision, scale) = if kind == DECIMAL128_KIND {
++            let precision = tc.draw(hg::integers::<u8>().min_value(1).max_value(38));
++            // Arrow requires |scale| <= precision for Decimal128.
++            let scale = tc.draw(
++                hg::integers::<i8>()
++                    .min_value(-(precision as i8))
++                    .max_value(precision as i8),
++            );
++            (precision, scale)
++        } else {
++            (38, 0)
++        };
++        PrimSpec {
++            kind,
++            tz,
++            precision,
++            scale,
++        }
++    }
++
++    /// Draws a `ScalarValue` matching `spec`, with roughly 1 in 5 values null
++    /// so null handling is exercised everywhere.
++    fn draw_prim_value(tc: &hegel::TestCase, spec: &PrimSpec) -> ScalarValue {
++        let is_null =
++            spec.kind != NULL_KIND && tc.draw(hg::integers::<u8>().max_value(4)) == 0;
++        macro_rules! v {
++            ($gen:expr) => {
++                if is_null { None } else { Some(tc.draw($gen)) }
++            };
++        }
++        match spec.kind {
++            0 => ScalarValue::Boolean(v!(hg::booleans())),
++            1 => ScalarValue::Int8(v!(hg::integers::<i8>())),
++            2 => ScalarValue::Int16(v!(hg::integers::<i16>())),
++            3 => ScalarValue::Int32(v!(hg::integers::<i32>())),
++            4 => ScalarValue::Int64(v!(hg::integers::<i64>())),
++            5 => ScalarValue::UInt8(v!(hg::integers::<u8>())),
++            6 => ScalarValue::UInt16(v!(hg::integers::<u16>())),
++            7 => ScalarValue::UInt32(v!(hg::integers::<u32>())),
++            8 => ScalarValue::UInt64(v!(hg::integers::<u64>())),
++            // Draw floats from raw bits so NaN payloads, -0.0, infinities and
++            // subnormals are all reachable.
++            9 => ScalarValue::Float32(v!(hg::integers::<u32>().map(f32::from_bits))),
++            10 => ScalarValue::Float64(v!(hg::integers::<u64>().map(f64::from_bits))),
++            11 => ScalarValue::Utf8(v!(hg::text().max_size(12))),
++            12 => ScalarValue::LargeUtf8(v!(hg::text().max_size(12))),
++            13 => ScalarValue::Utf8View(v!(hg::text().max_size(20))),
++            14 => ScalarValue::Binary(v!(hg::binary().max_size(12))),
++            15 => ScalarValue::LargeBinary(v!(hg::binary().max_size(12))),
++            16 => ScalarValue::BinaryView(v!(hg::binary().max_size(20))),
++            17 => ScalarValue::Date32(v!(hg::integers::<i32>())),
++            18 => ScalarValue::Date64(v!(hg::integers::<i64>())),
++            19 => ScalarValue::Time32Second(v!(hg::integers::<i32>())),
++            20 => ScalarValue::Time32Millisecond(v!(hg::integers::<i32>())),
++            21 => ScalarValue::Time64Microsecond(v!(hg::integers::<i64>())),
++            22 => ScalarValue::Time64Nanosecond(v!(hg::integers::<i64>())),
++            23 => {
++                ScalarValue::TimestampSecond(v!(hg::integers::<i64>()), spec.tz.clone())
++            }
++            24 => ScalarValue::TimestampMillisecond(
++                v!(hg::integers::<i64>()),
++                spec.tz.clone(),
++            ),
++            25 => ScalarValue::TimestampMicrosecond(
++                v!(hg::integers::<i64>()),
++                spec.tz.clone(),
++            ),
++            26 => ScalarValue::TimestampNanosecond(
++                v!(hg::integers::<i64>()),
++                spec.tz.clone(),
++            ),
++            27 => ScalarValue::DurationSecond(v!(hg::integers::<i64>())),
++            28 => ScalarValue::DurationMillisecond(v!(hg::integers::<i64>())),
++            29 => ScalarValue::DurationMicrosecond(v!(hg::integers::<i64>())),
++            30 => ScalarValue::DurationNanosecond(v!(hg::integers::<i64>())),
++            31 => ScalarValue::IntervalYearMonth(v!(hg::integers::<i32>())),
++            32 => {
++                let value = if is_null {
++                    None
++                } else {
++                    let days = tc.draw(hg::integers::<i32>());
++                    let milliseconds = tc.draw(hg::integers::<i32>());
++                    Some(IntervalDayTime::new(days, milliseconds))
++                };
++                ScalarValue::IntervalDayTime(value)
++            }
++            33 => {
++                let value = if is_null {
++                    None
++                } else {
++                    let months = tc.draw(hg::integers::<i32>());
++                    let days = tc.draw(hg::integers::<i32>());
++                    let nanoseconds = tc.draw(hg::integers::<i64>());
++                    Some(IntervalMonthDayNano::new(months, days, nanoseconds))
++                };
++                ScalarValue::IntervalMonthDayNano(value)
++            }
++            DECIMAL128_KIND => {
++                let value = if is_null {
++                    None
++                } else {
++                    let max = 10i128.pow(spec.precision as u32) - 1;
++                    Some(tc.draw(hg::integers::<i128>().min_value(-max).max_value(max)))
++                };
++                ScalarValue::Decimal128(value, spec.precision, spec.scale)
++            }
++            NULL_KIND => ScalarValue::Null,
++            other => unreachable!("unhandled primitive kind {other}"),
++        }
++    }
++
++    fn scalar_hash(value: &ScalarValue) -> u64 {
++        let mut hasher = DefaultHasher::new();
++        value.hash(&mut hasher);
++        hasher.finish()
++    }
++
++    /// Property: `ScalarValue`'s manual `PartialEq`, `PartialOrd` and `Hash`
++    /// implementations are mutually consistent: `eq` is reflexive (bitwise
++    /// for floats, so this includes NaN), `partial_cmp` is antisymmetric,
++    /// `a == b` implies both `partial_cmp == Some(Equal)` and equal hashes,
++    /// and within a single data type `Some(Equal)` implies `eq`.
++    #[hegel::test]
++    fn prop_scalar_eq_ord_hash_consistency(tc: hegel::TestCase) {
++        let spec_a = draw_prim_spec(&tc);
++        let spec_b = if tc.draw(hg::booleans()) {
++            spec_a.clone()
++        } else {
++            draw_prim_spec(&tc)
++        };
++        let a = draw_prim_value(&tc, &spec_a);
++        let b = draw_prim_value(&tc, &spec_b);
++
++        // Reflexivity (bitwise float equality makes NaN == NaN here).
++        assert_eq!(a, a);
++        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
++
++        // Antisymmetry.
++        assert_eq!(a.partial_cmp(&b), b.partial_cmp(&a).map(Ordering::reverse));
++
++        // Eq implies both ordering-equal and hash-equal.
++        if a == b {
++            assert_eq!(a.partial_cmp(&b), Some(Ordering::Equal));
++            assert_eq!(scalar_hash(&a), scalar_hash(&b));
++        }
++
++        // Within one spec (identical DataType parameters), ordering-equal
++        // implies eq. (Across specs this is deliberately weaker: e.g. decimal
++        // partial_cmp ignores precision while eq does not.)
++        if spec_a == spec_b && a.partial_cmp(&b) == Some(Ordering::Equal) {
++            assert_eq!(a, b);
++        }
++
++        // Different variants never compare equal nor ordered.
++        if spec_a.kind != spec_b.kind {
++            assert_ne!(a, b);
++            assert_eq!(a.partial_cmp(&b), None);
++        }
++    }
++
++    /// Property: `to_array_of_size` produces an array with the scalar's data
++    /// type where every index round-trips back to the original scalar via
++    /// `try_from_array`.
++    #[hegel::test]
++    fn prop_scalar_to_array_of_size_roundtrip(tc: hegel::TestCase) {
++        let spec = draw_prim_spec(&tc);
++        let scalar = draw_prim_value(&tc, &spec);
++        let n = tc.draw(hg::integers::<usize>().max_value(4));
++        let array = scalar.to_array_of_size(n).unwrap();
++        assert_eq!(array.len(), n);
++        assert_eq!(array.data_type(), &scalar.data_type());
++        for i in 0..n {
++            let back = ScalarValue::try_from_array(array.as_ref(), i).unwrap();
++            assert_eq!(back, scalar);
++        }
++    }
++
++    /// Property: `iter_to_array` over same-typed scalars concatenates them in
++    /// order — reading back every index with `try_from_array` returns the
++    /// original scalar.
++    #[hegel::test]
++    fn prop_scalar_iter_to_array_roundtrip(tc: hegel::TestCase) {
++        let spec = draw_prim_spec(&tc);
++        let n = tc.draw(hg::integers::<usize>().min_value(1).max_value(8));
++        let scalars: Vec<ScalarValue> =
++            (0..n).map(|_| draw_prim_value(&tc, &spec)).collect();
++        let array = ScalarValue::iter_to_array(scalars.clone()).unwrap();
++        assert_eq!(array.len(), n);
++        for (i, expected) in scalars.iter().enumerate() {
++            let back = ScalarValue::try_from_array(array.as_ref(), i).unwrap();
++            assert_eq!(&back, expected);
++        }
++    }
++
++    /// Property: `add_checked` on integer scalars matches native
++    /// `checked_add` — same value on success, an error exactly when the
++    /// native operation overflows, and null propagation when either side is
++    /// null.
++    #[hegel::test]
++    fn prop_scalar_add_checked_matches_native_checked_add(tc: hegel::TestCase) {
++        macro_rules! case {
++            ($ty:ty, $variant:ident) => {{
++                let l: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let r: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let result =
++                    ScalarValue::$variant(l).add_checked(ScalarValue::$variant(r));
++                match (l, r) {
++                    (Some(a), Some(b)) => match a.checked_add(b) {
++                        Some(c) => {
++                            assert_eq!(result.unwrap(), ScalarValue::$variant(Some(c)))
++                        }
++                        None => assert!(
++                            result.is_err(),
++                            "expected overflow error for {a} + {b}, got {result:?}"
++                        ),
++                    },
++                    _ => assert_eq!(result.unwrap(), ScalarValue::$variant(None)),
++                }
++            }};
++        }
++        match tc.draw(hg::integers::<u8>().max_value(7)) {
++            0 => case!(i8, Int8),
++            1 => case!(i16, Int16),
++            2 => case!(i32, Int32),
++            3 => case!(i64, Int64),
++            4 => case!(u8, UInt8),
++            5 => case!(u16, UInt16),
++            6 => case!(u32, UInt32),
++            _ => case!(u64, UInt64),
++        }
++    }
++
++    /// Property: `sub_checked` on integer scalars matches native
++    /// `checked_sub`, with error on overflow and null propagation.
++    #[hegel::test]
++    fn prop_scalar_sub_checked_matches_native_checked_sub(tc: hegel::TestCase) {
++        macro_rules! case {
++            ($ty:ty, $variant:ident) => {{
++                let l: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let r: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let result =
++                    ScalarValue::$variant(l).sub_checked(ScalarValue::$variant(r));
++                match (l, r) {
++                    (Some(a), Some(b)) => match a.checked_sub(b) {
++                        Some(c) => {
++                            assert_eq!(result.unwrap(), ScalarValue::$variant(Some(c)))
++                        }
++                        None => assert!(
++                            result.is_err(),
++                            "expected overflow error for {a} - {b}, got {result:?}"
++                        ),
++                    },
++                    _ => assert_eq!(result.unwrap(), ScalarValue::$variant(None)),
++                }
++            }};
++        }
++        match tc.draw(hg::integers::<u8>().max_value(7)) {
++            0 => case!(i8, Int8),
++            1 => case!(i16, Int16),
++            2 => case!(i32, Int32),
++            3 => case!(i64, Int64),
++            4 => case!(u8, UInt8),
++            5 => case!(u16, UInt16),
++            6 => case!(u32, UInt32),
++            _ => case!(u64, UInt64),
++        }
++    }
++
++    /// Property: the wrapping `add` on integer scalars matches native
++    /// `wrapping_add` (this exercises the in-place fast path against the
++    /// arrow kernel fallback), with null propagation.
++    #[hegel::test]
++    fn prop_scalar_add_wrapping_matches_native_wrapping_add(tc: hegel::TestCase) {
++        macro_rules! case {
++            ($ty:ty, $variant:ident) => {{
++                let l: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let r: Option<$ty> = tc.draw(hg::optional(hg::integers::<$ty>()));
++                let result = ScalarValue::$variant(l)
++                    .add(ScalarValue::$variant(r))
++                    .unwrap();
++                let expected = match (l, r) {
++                    (Some(a), Some(b)) => Some(a.wrapping_add(b)),
++                    _ => None,
++                };
++                assert_eq!(result, ScalarValue::$variant(expected));
++            }};
++        }
++        match tc.draw(hg::integers::<u8>().max_value(7)) {
++            0 => case!(i8, Int8),
++            1 => case!(i16, Int16),
++            2 => case!(i32, Int32),
++            3 => case!(i64, Int64),
++            4 => case!(u8, UInt8),
++            5 => case!(u16, UInt16),
++            6 => case!(u32, UInt32),
++            _ => case!(u64, UInt64),
++        }
++    }
+ }
+diff --git a/datafusion/common/src/stats.rs b/datafusion/common/src/stats.rs
+index a2ede7e..0eb5fa7 100644
+--- a/datafusion/common/src/stats.rs
++++ b/datafusion/common/src/stats.rs
+@@ -3303,4 +3303,120 @@ mod tests {
+         precision_add_for_sum_in_place(&mut lhs, &Precision::Absent);
+         assert_eq!(lhs, Precision::Absent);
+     }
++
++    // ----------------------------------------------------------------------
++    // hegel property-based tests
++    // ----------------------------------------------------------------------
++
++    use hegel::generators as hg;
++
++    /// Draws a `Precision<usize>` covering Absent/Inexact/Exact, with the
++    /// value drawn either from the full `usize` range (so saturating paths
++    /// are hit) or from a small range (so non-overflow paths are hit for
++    /// `multiply` too).
++    fn draw_precision_usize(tc: &hegel::TestCase) -> Precision<usize> {
++        let value_gen = hegel::one_of!(
++            hg::integers::<usize>(),
++            hg::integers::<usize>().max_value(1000),
++        );
++        match tc.draw(hg::integers::<u8>().max_value(2)) {
++            0 => Precision::Absent,
++            1 => Precision::Inexact(tc.draw(value_gen)),
++            _ => Precision::Exact(tc.draw(value_gen)),
++        }
++    }
++
++    /// Property: `Precision::<usize>::add` is commutative, computes the
++    /// saturating sum, is `Exact` exactly when both inputs are exact and the
++    /// native addition does not overflow, and is `Absent` when either input
++    /// is absent.
++    #[hegel::test]
++    fn prop_precision_usize_add_oracle(tc: hegel::TestCase) {
++        let a = draw_precision_usize(&tc);
++        let b = draw_precision_usize(&tc);
++        let result = a.add(&b);
++        assert_eq!(result, b.add(&a));
++        match (a.get_value().copied(), b.get_value().copied()) {
++            (Some(x), Some(y)) => {
++                assert_eq!(result.get_value().copied(), Some(x.saturating_add(y)));
++                let expect_exact = a.is_exact() == Some(true)
++                    && b.is_exact() == Some(true)
++                    && x.checked_add(y).is_some();
++                assert_eq!(result.is_exact(), Some(expect_exact));
++            }
++            _ => assert_eq!(result, Precision::Absent),
++        }
++    }
++
++    /// Property: `Precision::<usize>::sub` computes the saturating
++    /// difference, is `Exact` exactly when both inputs are exact and the
++    /// native subtraction does not underflow, and is `Absent` when either
++    /// input is absent.
++    #[hegel::test]
++    fn prop_precision_usize_sub_oracle(tc: hegel::TestCase) {
++        let a = draw_precision_usize(&tc);
++        let b = draw_precision_usize(&tc);
++        let result = a.sub(&b);
++        match (a.get_value().copied(), b.get_value().copied()) {
++            (Some(x), Some(y)) => {
++                assert_eq!(result.get_value().copied(), Some(x.saturating_sub(y)));
++                let expect_exact = a.is_exact() == Some(true)
++                    && b.is_exact() == Some(true)
++                    && x.checked_sub(y).is_some();
++                assert_eq!(result.is_exact(), Some(expect_exact));
++            }
++            _ => assert_eq!(result, Precision::Absent),
++        }
++    }
++
++    /// Property: `Precision::<usize>::multiply` is commutative, computes the
++    /// saturating product, is `Exact` exactly when both inputs are exact and
++    /// the native multiplication does not overflow, and is `Absent` when
++    /// either input is absent.
++    #[hegel::test]
++    fn prop_precision_usize_multiply_oracle(tc: hegel::TestCase) {
++        let a = draw_precision_usize(&tc);
++        let b = draw_precision_usize(&tc);
++        let result = a.multiply(&b);
++        assert_eq!(result, b.multiply(&a));
++        match (a.get_value().copied(), b.get_value().copied()) {
++            (Some(x), Some(y)) => {
++                assert_eq!(result.get_value().copied(), Some(x.saturating_mul(y)));
++                let expect_exact = a.is_exact() == Some(true)
++                    && b.is_exact() == Some(true)
++                    && x.checked_mul(y).is_some();
++                assert_eq!(result.is_exact(), Some(expect_exact));
++            }
++            _ => assert_eq!(result, Precision::Absent),
++        }
++    }
++
++    /// Property: `Precision::min`/`Precision::max` agree with `std::cmp` on
++    /// the wrapped values, are commutative, propagate exactness only when
++    /// both inputs are exact, are `Absent` when either input is absent, and
++    /// satisfy `min <= max`.
++    #[hegel::test]
++    fn prop_precision_usize_min_max_consistency(tc: hegel::TestCase) {
++        let a = draw_precision_usize(&tc);
++        let b = draw_precision_usize(&tc);
++        let min = a.min(&b);
++        let max = a.max(&b);
++        assert_eq!(min, b.min(&a));
++        assert_eq!(max, b.max(&a));
++        match (a.get_value().copied(), b.get_value().copied()) {
++            (Some(x), Some(y)) => {
++                assert_eq!(min.get_value().copied(), Some(std::cmp::min(x, y)));
++                assert_eq!(max.get_value().copied(), Some(std::cmp::max(x, y)));
++                assert!(min.get_value() <= max.get_value());
++                let expect_exact =
++                    a.is_exact() == Some(true) && b.is_exact() == Some(true);
++                assert_eq!(min.is_exact(), Some(expect_exact));
++                assert_eq!(max.is_exact(), Some(expect_exact));
++            }
++            _ => {
++                assert_eq!(min, Precision::Absent);
++                assert_eq!(max, Precision::Absent);
++            }
++        }
++    }
+ }
+diff --git a/datafusion/common/src/table_reference.rs b/datafusion/common/src/table_reference.rs
+index 3163a8b..029d834 100644
+--- a/datafusion/common/src/table_reference.rs
++++ b/datafusion/common/src/table_reference.rs
+@@ -426,4 +426,64 @@ mod tests {
+             table_reference.to_vec()
+         );
+     }
++
++    // ----------------------------------------------------------------------
++    // hegel property-based tests
++    // ----------------------------------------------------------------------
++
++    use hegel::generators as hg;
++
++    /// Draws one identifier part: a mix of plain lowercase identifiers (which
++    /// stay unquoted), arbitrary text, and strings built around the quoting
++    /// grammar's special characters (`"` and `.`), which is where quoting
++    /// bugs live.
++    fn draw_identifier_part(tc: &hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            hg::from_regex(r"[a-z_][a-z0-9_]{0,6}").fullmatch(true),
++            hg::text().min_size(1).max_size(8),
++            hg::from_regex(r#"["a-zA-Z.]{1,6}"#).fullmatch(true),
++        ))
++    }
++
++    /// Property: a `TableReference` built from arbitrary non-empty parts
++    /// round-trips through `to_quoted_string` and `parse_str`: quoting
++    /// escapes everything (including embedded `"` and `.`) such that parsing
++    /// recovers the identical reference.
++    ///
++    /// Empty parts are excluded: they cannot round-trip (see the KNOWN
++    /// FAILURE test `prop_table_reference_empty_table_part_roundtrip` below).
++    #[hegel::test]
++    fn prop_table_reference_quoted_string_roundtrip(tc: hegel::TestCase) {
++        let table = draw_identifier_part(&tc);
++        let reference = match tc.draw(hg::integers::<u8>().min_value(1).max_value(3)) {
++            1 => TableReference::bare(table),
++            2 => TableReference::partial(draw_identifier_part(&tc), table),
++            _ => TableReference::full(
++                draw_identifier_part(&tc),
++                draw_identifier_part(&tc),
++                table,
++            ),
++        };
++        let quoted = reference.to_quoted_string();
++        let parsed = TableReference::parse_str(&quoted);
++        assert_eq!(parsed, reference, "round-trip through {quoted:?}");
++    }
++
++    /// KNOWN FAILURE (bug): `quote_identifier("")` leaves the empty string
++    /// unquoted, so a reference with an empty table part serializes to e.g.
++    /// `"schema."`, which does not parse back: without the `sql` feature the
++    /// trailing empty identifier is dropped (`Partial { schema, table: "" }`
++    /// becomes `Bare { table: "schema" }`), and with the `sql` feature the
++    /// string fails to parse and falls back to `Bare { table: "schema." }`.
++    /// An empty identifier would need to be quoted as `""` to survive the
++    /// round-trip. This test pins the bug deterministically; the general
++    /// round-trip property above excludes empty parts for this reason.
++    #[hegel::test]
++    fn prop_table_reference_empty_table_part_roundtrip(tc: hegel::TestCase) {
++        let schema = tc.draw(hg::from_regex(r"[a-z_][a-z0-9_]{0,6}").fullmatch(true));
++        let reference = TableReference::partial(schema, "");
++        let quoted = reference.to_quoted_string();
++        let parsed = TableReference::parse_str(&quoted);
++        assert_eq!(parsed, reference, "round-trip through {quoted:?}");
++    }
+ }

@@ -1,0 +1,1451 @@
+diff --git a/.gitignore b/.gitignore
+index 84c45ce..a2d3670 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,3 +5,5 @@
+ 
+ /Cargo.lock
+ /tarpaulin-report.html
++
++/.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 6123e58..bb5b4c8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@ smallvec = { version = "1.15.2", features = ["const_generics"] }
+ 
+ [dev-dependencies]
+ criterion = "0.8.2"
++hegeltest = "0.28.2"
+ pretty_assertions = "1.4.1"
+ rand = "0.10.1"
+ # Needed to test serde:
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..464532f
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,213 @@
++# Hegel Property-Based Testing Report — rpds
++
++Hegel (`hegeltest` 0.28.2) property tests were added to the existing per-module
++test files (`src/<structure>/test.rs`), each in a `mod hegel_properties`
++submodule (plus one test evolved inside the existing
++`map::red_black_tree_map::test::internal` module). All tests run under plain
++`cargo test`.
++
++## Properties tested
++
++One property per test. "Evidence" says what in the crate grounds the property.
++
++| # | Property | Test | Evidence |
++|---|----------|------|----------|
++| 1 | `Vector` behaves exactly like `Vec` under arbitrary op sequences (`push_back[_mut]`, `drop_last[_mut]`, `set[_mut]`, `get`, `first`, `last`, `len`, `iter`), with the `bits` trie configuration *generated* (1..=8; bits=1 gives a deep binary trie) and prefilled up to 300 elements for depth | `vector::test::hegel_properties::hegel_vector_model_matches_vec` | `Vector` doc table of operations; `new_with_bits` is public API; skill's "generate configurations" and deep-structure guidance |
++| 2 | Persistence: deriving new vector versions (persistent `push_back`, and `set_mut`/`drop_last_mut`/`push_back_mut` on clones) never changes older versions | `hegel_vector_persistence` | Crate docs: "fully persistent data structures with structural sharing"; `Clone` is Θ(1) sharing the root |
++| 3 | Any `bits` accepted by `Vector::new_with_bits` (its only assert: `bits > 0`) yields a vector that supports basic ops without panicking | `hegel_vector_new_with_bits_no_panic` | The `assert!(bits > 0, ...)` in `new_with_bits` (src/vector/mod.rs:296) is the sole stated precondition — **FAILS, suspected bug 1** |
++| 4 | `List` behaves like `VecDeque` (front ops + reversal) under arbitrary sequences; the struct-cached `last` pointer is checked after every rule (stale-state bug pattern) | `list::test::hegel_properties::hegel_list_model_matches_vec_deque` | `List` struct caches `last: Option<SharedPointer<T,P>>` (src/list/mod.rs:113), maintained manually in `push_front_ptr_mut`/`drop_first_mut`/`reverse_mut` |
++| 5 | `List::reverse` agrees with reversing a `Vec` (implies involution), and leaves the original list untouched | `hegel_list_reverse_matches_vec_reverse` | `reverse()` signature/docs; the hand-rolled pointer loop in `reverse_mut` (src/list/mod.rs:229) |
++| 6 | `Queue` behaves like `VecDeque` under arbitrary enqueue/dequeue sequences, exercising states where elements sit in both internal lists | `queue::test::hegel_properties::hegel_queue_model_matches_vec_deque` | Queue docs (Hood-Melville-style in/out lists, "Immutable Queue" reference); `dequeue_mut` swap+reverse logic |
++| 7 | Queue persistence: draining a version derived from any snapshot leaves all older versions intact, despite `dequeue_mut` swapping/reversing shared lists | `hegel_queue_persistence` | Crate persistence promise; `dequeue_mut` mutates via `mem::swap` + `reverse_mut` on shared `List`s (src/queue/mod.rs:142-155) |
++| 8 | Queue `==`, `cmp`, `partial_cmp`, and `Hash` depend only on logical content, not on the internal in/out-list split | `hegel_queue_eq_and_hash_ignore_internal_structure` | `PartialEq`/`Ord`/`Hash` impls all iterate logically (src/queue/mod.rs:200-245), incl. the Hash comment about hashing length |
++| 9 | `Stack` behaves like `Vec` used as a stack (push/pop/peek/size/iter from top) | `stack::test::hegel_properties::hegel_stack_model_matches_vec` | `Stack` API docs (LIFO; iterator "from the top of the stack") |
++| 10 | `RedBlackTreeMap` behaves like `BTreeMap` under arbitrary op sequences, *and* the red-black invariants (BST order, red-node children, black-height, black root, size) hold after every operation | `map::red_black_tree_map::test::hegel_properties::hegel_rbt_map_model_matches_btree_map` | The crate's own `check_consistent` test helper (src/map/red_black_tree_map/test.rs:107); sorted-iteration docs |
++| 11 | Arbitrary insert-then-remove sequences (any `u32` keys, duplicates, up to 300+ keys) keep the tree consistent — hegel evolution of the seeded-`StdRng` tests `test_insert`/`test_remove` | `map::red_black_tree_map::test::internal::hegel_insert_remove_keeps_tree_consistent` | Existing tests used `StdRng` with a fixed seed shuffling only 0..64 — the skill flags fixed-seed rand tests as prime evolution candidates |
++| 12 | `RedBlackTreeMap::range` returns exactly what `BTreeMap::range` returns for arbitrary bounds, forwards and via `.rev()`; bounds are biased to coincide with existing keys | `hegel_rbt_map_range_matches_btree_map` | `range` docs + documented panic conditions (src/map/red_black_tree_map/mod.rs:952-963); existing `test_range` unit test |
++| 13 | RBT map persistence: every intermediate insert version keeps its exact snapshot content after later versions are emptied/overwritten | `hegel_rbt_map_persistence` | Crate persistence promise; `remove` doc note about "maximum sharing" |
++| 14 | `HashTrieMap` behaves like `HashMap` under arbitrary op sequences with the `degree` configuration generated (2,4,8,16,32,64) | `map::hash_trie_map::test::hegel_properties::hegel_hash_trie_map_model_matches_hash_map` | `new_with_degree` is public, asserts power-of-two and ≤ 64 (src/map/hash_trie_map/mod.rs:752-753) |
++| 15 | Same model property under a deliberately lossy 4-bit hasher, forcing hash exhaustion and `Bucket::Collision` paths at maximum trie depth | `hegel_hash_trie_map_collisions_model_matches_hash_map` | Node invariant docs: "A node with a collision can only exist at the maximum depth" (src/map/hash_trie_map/mod.rs:180); existing `test_iter_high_collision` |
++| 16 | HashTrieMap persistence (both honest and lossy hasher, generated degree) | `hegel_hash_trie_map_persistence` | Crate persistence promise |
++| 17 | `RedBlackTreeSet` `is_subset`/`is_superset`/`is_disjoint`/`==`/`first`/`last`/`contains` agree with `BTreeSet` | `set::red_black_tree_set::test::hegel_properties::hegel_rbt_set_relations_match_btree_set` | Hand-written merge-style algorithms over sorted iterators (src/set/red_black_tree_set/mod.rs:189-253) |
++| 18 | `HashTrieSet` relations agree with `HashSet` | `set::hash_trie_set::test::hegel_properties::hegel_hash_trie_set_relations_match_hash_set` | `is_subset`/`is_disjoint` implementations (src/set/hash_trie_set/mod.rs:204-233) |
++
++Additionally, `map::hash_trie_map::test::hegel_found_degree_one_stack_overflow`
++is a plain `#[test]` reproducer for suspected bug 2, kept `#[ignore]`d because
++it aborts the whole test process (see below).
++
++Supporting change: the existing `insert_test`/`remove_test` helpers in
++`red_black_tree_map/test.rs` computed `2 * v`, which overflows *in the test
++code* for large generated `u32` keys; changed to `v.wrapping_mul(2)` per the
++skill's wrapping-arithmetic guidance (behavior unchanged for the existing
++0..64 callers).
++
++## Test results
++
++`cargo test --lib` (default 100 cases per hegel test):
++
++```
++test result: FAILED. 275 passed; 1 failed; 1 ignored
++```
++
++- 17 of the 18 hegel tests pass; all 257 pre-existing unit tests still pass.
++- `hegel_vector_new_with_bits_no_panic` **fails** (kept failing on purpose —
++  suspected bug 1).
++- `hegel_found_degree_one_stack_overflow` is ignored (suspected bug 2; running
++  it aborts the process).
++
++Liveness check: temporarily inverting an assertion in the `List` model
++invariant made hegel report a shrunk counterexample as expected; the change
++was reverted.
++
++Exploratory high-count run: all hegel tests were temporarily raised to
++`test_cases = 1000` (10x) and run (`cargo test --lib hegel`, 34.7s):
++17 passed, 1 failed (the same `new_with_bits` bug), no new failures. The
++committed tests use the default count.
++
++## Suspected bugs
++
++### 1. `Vector::new_with_bits(bits >= 64)` panics on the first `push_back` (shift overflow)
++
++Hegel's shrunk counterexample:
++
++```
++let bits = 64;
++let values = [0];
++thread ... panicked at src/vector/mod.rs:387:9:
++attempt to shift left with overflow
++```
++
++- **Test:** `hegel_vector_new_with_bits_no_panic` (left in place, failing).
++- **Code path:** `Vector::new_with_bits` (src/vector/mod.rs:295-299) validates
++  only `assert!(bits > 0)`. The first `push_back_mut` calls `is_root_full()`
++  → `root_max_capacity()` (src/vector/mod.rs:379-388), which computes
++  `1 << (self.bits as usize * (self.height() + 1))`. With `bits = 64` and
++  height 0 the shift amount is 64 ≥ `usize::BITS`, which panics in debug
++  builds ("attempt to shift left with overflow"). In release builds Rust
++  masks the shift amount, so `root_max_capacity` would silently compute `1`,
++  i.e. wrong capacity logic rather than a panic (not verified empirically —
++  the release build did not fit on disk in this environment).
++- **Why a library bug, not a test bug:** the constructor's own assert is the
++  only stated precondition on `bits`, and there is no doc comment or README
++  mention imposing an upper bound. A constructor that accepts a configuration
++  value and then panics on the very first insertion violates its implied
++  contract; the assert should be `bits > 0 && (bits as usize) < usize::BITS`
++  (realistically much lower) or the requirement should be documented.
++
++### 2. `HashTrieMap::new_with_degree(1)` causes unbounded recursion / process-aborting stack overflow on the second insert
++
++Reproducer (two lines, no hegel needed once found):
++
++```rust
++let mut m: HashTrieMap<i32, i32> = HashTrieMap::new_with_degree(1);
++m.insert_mut(1, 1);
++m.insert_mut(2, 2); // stack overflow, SIGABRT
++```
++
++- **Test:** `hegel_found_degree_one_stack_overflow` — kept as an `#[ignore]`d
++  test with the reason string "genuine bug: aborts the process with a stack
++  overflow", because a stack overflow SIGABRTs the entire test binary and
++  would destroy all other test results. Run it with
++  `cargo test -- --ignored hegel_found_degree_one_stack_overflow`.
++- **Code path:** `new_with_hasher_and_degree_and_ptr_kind`
++  (src/map/hash_trie_map/mod.rs:748-761) asserts `degree.is_power_of_two()`
++  and `degree <= 64`; `1` passes both. But in `node_utils::index_from_hash`
++  (src/map/hash_trie_map/mod.rs:220-234) the per-level shift is
++  `depth * degree.trailing_zeros()`, which is `depth * 0 = 0` for degree 1,
++  so the hash is never exhausted (`index_from_hash` never returns `None`) and
++  every key maps to index 0 at every depth. `Node::insert`
++  (src/map/hash_trie_map/mod.rs:299-355) then keeps splitting a
++  `Bucket::Single` into ever-deeper single-child branches, recursing forever.
++- **Why a library bug:** degree 1 satisfies every asserted precondition. The
++  assert should be `degree >= 2` (or `degree.trailing_zeros() >= 1`), or the
++  constructor should document that degree 1 is unsupported.
++- **How found:** by reading `index_from_hash` while writing the degree
++  generator for the model tests (which consequently draw degree from
++  {2,...,64}), then confirmed with the isolated reproducer above.
++
++## Unsound properties abandoned
++
++None were abandoned — no property I tried turned out to be something the code
++never promised. Three deliberate scoping decisions short of abandonment:
++
++- **Range bounds are constructed valid** in the range oracle test: the two
++  panic conditions (`start > end`; equal endpoints with both bounds excluded)
++  are explicitly documented panics in rpds (and in `BTreeMap`), i.e. outside
++  the function's domain, so the generator constructs valid ranges directly
++  instead of asserting no-panic there.
++- **Set-relation tests draw from a small domain (0..=15)** so that
++  subset/superset/disjoint relations actually occur; with full-range `i32`
++  two random sets would almost never intersect and the property would only
++  ever exercise the trivial branches. This biases the distribution without
++  narrowing the property's claimed domain.
++- **Model tests draw `degree` from {2,...,64}, not {1,...,64}**: degree 1 is
++  arguably inside the constructor's asserted contract, but including it makes
++  every run abort the whole test binary (bug 2). The bug is instead pinned by
++  the dedicated `#[ignore]`d reproducer.
++
++## Skill feedback
++
++Overall the skill and Rust reference were accurate; the two bugs found and the
++whole stateful-testing workflow came straight from following them. Specifics:
++
++1. **MSRV gotcha in the reference was spot-on.** `cargo add --dev hegeltest`
++   failed with exactly the predicted error ("no version of crate `hegeltest`
++   can maintain rpds's rust-version of 1.85.0"), and the documented fix
++   (`--ignore-rust-version`) worked first try. Having that in the Setup
++   section saved real time.
++
++2. **Missing gotcha: `assert_eq` ambiguity (E0659) with `pretty_assertions`.**
++   Adding a child `mod hegel_properties { use super::*; ... }` inside a test
++   module whose top level does `use pretty_assertions::assert_eq;` produced
++   76 instances of:
++   ```
++   error[E0659]: `assert_eq` is ambiguous
++   note: ambiguous because of a conflict between a name from a glob import and
++   an outer scope during import or macro resolution
++   ```
++   Fix: add an explicit `use pretty_assertions::assert_eq;` inside the new
++   child module. Since the skill explicitly tells you to add tests to
++   existing test files (which very commonly use `pretty_assertions`), this is
++   worth a Gotchas entry in the Rust reference.
++
++3. **Generic state machines work but are undocumented.** I wrote
++   `#[hegel::state_machine] impl<H: BuildHasher + Clone> HtMapMachine<H>`
++   so one machine could serve both the honest and the collision-forcing
++   hasher. It compiled and ran fine, but the Stateful Testing section shows
++   only non-generic impls, so I only found out by trying. A sentence
++   confirming generic impl blocks are supported would help.
++
++4. **Shrinking of the "draw size, then `min_size(n)`" pattern can leave large
++   collections in the counterexample.** During the liveness check the
++   deliberately broken List invariant shrank to `n = 0` but
++   `init = [0, 0, ... (445 zeros) ..., 32767]` — a 446-element vector where a
++   2-element one would demonstrate the failure. The size draw shrank; the
++   vector length apparently could not follow it back down. Worth a note next
++   to the "Getting Large Collections" advice that counterexamples under this
++   pattern may not be minimal in collection length (the genuinely failing
++   test in this project shrank beautifully: `bits = 64; values = [0]`).
++
++5. **No guidance for process-aborting failures.** SKILL.md says to keep tests
++   for real bugs failing, but a stack-overflow bug (bug 2) SIGABRTs the whole
++   test binary, taking every other test's results with it — "keep the failing
++   test in the suite" is not actionable there. I settled on
++   `#[ignore = "..."]` plus a comment and report entry. A recommended
++   convention for crash/hang bugs (ignore-with-reason, a separate binary,
++   `#[should_panic]` being unusable for aborts, etc.) would be useful in the
++   skill.
++
++6. **Invariants run on the initial state.** Failure output during the
++   liveness check printed "Initial invariant check." before any rule ran.
++   That is good behavior (my machines are prefilled with hundreds of
++   elements), but the Stateful Testing section only says invariants are
++   "checked after every successful rule" — technically wrong on the initial
++   check; worth one clarifying line.
++
++7. **What just worked:** `#[hegel::test]` with the standard test runner;
++   draw-site variable naming in counterexample output (`let bits = 64;`)
++   which made the vector bug instantly readable; `one_of!` +
++   `sampled_from(vec)` + `integers` composition for present-vs-absent key
++   mixes; `hegel::stateful::run` consuming the machine (the documented
++   "assertions must live in an invariant" note anticipated exactly the design
++   I needed); the `.hegel/` directory appearing on first failure exactly as
++   gotcha 3 predicts (added to `.gitignore`).
+diff --git a/src/list/test.rs b/src/list/test.rs
+index 317afc2..66fb050 100644
+--- a/src/list/test.rs
++++ b/src/list/test.rs
+@@ -403,3 +403,117 @@ fn test_serde() {
+ 
+     assert_eq!(list, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++    use std::collections::VecDeque;
++
++    struct ListMachine {
++        subject: List<i32>,
++        model: VecDeque<i32>,
++    }
++
++    #[hegel::state_machine]
++    impl ListMachine {
++        #[rule]
++        fn push_front_mut(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject.push_front_mut(v);
++            self.model.push_front(v);
++        }
++
++        #[rule]
++        fn push_front(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject = self.subject.push_front(v);
++            self.model.push_front(v);
++        }
++
++        #[rule]
++        fn drop_first_mut(&mut self, _: TestCase) {
++            let dropped = self.subject.drop_first_mut();
++            assert_eq!(dropped, self.model.pop_front().is_some());
++        }
++
++        #[rule]
++        fn drop_first(&mut self, _: TestCase) {
++            match self.subject.drop_first() {
++                Some(shorter) => {
++                    assert!(self.model.pop_front().is_some());
++                    self.subject = shorter;
++                }
++                None => assert!(self.model.is_empty()),
++            }
++        }
++
++        #[rule]
++        fn reverse_mut(&mut self, _: TestCase) {
++            self.subject.reverse_mut();
++            let reversed: VecDeque<i32> = self.model.iter().rev().copied().collect();
++            self.model = reversed;
++        }
++
++        #[rule]
++        fn reverse(&mut self, _: TestCase) {
++            self.subject = self.subject.reverse();
++            let reversed: VecDeque<i32> = self.model.iter().rev().copied().collect();
++            self.model = reversed;
++        }
++
++        // The `last` pointer is cached in the `List` struct, so it is a prime
++        // candidate for stale-state bugs: check it after every rule.
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.subject.len(), self.model.len());
++            assert_eq!(self.subject.is_empty(), self.model.is_empty());
++            assert_eq!(self.subject.first(), self.model.front());
++            assert_eq!(self.subject.last(), self.model.back());
++            assert!(self.subject.iter().eq(self.model.iter()));
++        }
++    }
++
++    // Model test: a `List` must behave like `VecDeque` (front operations
++    // only) under any sequence of operations, including interleaved reversals.
++    #[hegel::test]
++    fn hegel_list_model_matches_vec_deque(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: List<i32> = List::new();
++        let mut model: VecDeque<i32> = VecDeque::new();
++        for v in init {
++            subject.push_front_mut(v);
++            model.push_front(v);
++        }
++
++        hegel::stateful::run(ListMachine { subject, model }, tc);
++    }
++
++    // Oracle: `List::reverse` must agree with reversing a `Vec`. (This also
++    // implies reverse is an involution.)
++    #[hegel::test]
++    fn hegel_list_reverse_matches_vec_reverse(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let values: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        // push_front-built list contains `values` reversed.
++        let mut list: List<i32> = List::new();
++        for v in &values {
++            list.push_front_mut(*v);
++        }
++
++        let reversed = list.reverse();
++        assert_eq!(reversed.len(), values.len());
++        assert!(reversed.iter().eq(values.iter()));
++        assert_eq!(reversed.first(), values.first());
++        assert_eq!(reversed.last(), values.last());
++
++        // The original list must be untouched (persistence).
++        assert!(list.iter().eq(values.iter().rev()));
++    }
++}
+diff --git a/src/map/hash_trie_map/test.rs b/src/map/hash_trie_map/test.rs
+index 81c83af..9d422d2 100644
+--- a/src/map/hash_trie_map/test.rs
++++ b/src/map/hash_trie_map/test.rs
+@@ -1236,3 +1236,238 @@ fn test_serde() {
+ 
+     assert_eq!(map, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use core::hash::{BuildHasher, Hasher};
++    use pretty_assertions::assert_eq;
++    use hegel::TestCase;
++    use hegel::generators;
++    use std::collections::HashMap;
++    use std::collections::hash_map::DefaultHasher;
++
++    // A hasher that throws away all but the low 4 bits of the hash. This
++    // forces massive hash collisions, so the trie is driven into its
++    // hash-exhaustion/`Bucket::Collision` code paths (which an honest 64-bit
++    // hasher would essentially never reach).
++    #[derive(Clone, Default)]
++    struct LossyBuildHasher;
++
++    struct LossyHasher(DefaultHasher);
++
++    impl BuildHasher for LossyBuildHasher {
++        type Hasher = LossyHasher;
++
++        fn build_hasher(&self) -> LossyHasher {
++            LossyHasher(DefaultHasher::new())
++        }
++    }
++
++    impl Hasher for LossyHasher {
++        fn write(&mut self, bytes: &[u8]) {
++            self.0.write(bytes);
++        }
++
++        fn finish(&self) -> u64 {
++            self.0.finish() & 0xf
++        }
++    }
++
++    fn model_key_or_any(tc: &TestCase, model: &HashMap<i32, i64>) -> i32 {
++        if !model.is_empty() && tc.draw(generators::booleans()) {
++            let keys: Vec<i32> = model.keys().copied().collect();
++            tc.draw(generators::sampled_from(keys))
++        } else {
++            tc.draw(generators::integers::<i32>())
++        }
++    }
++
++    fn check_against_model<H: BuildHasher + Clone>(
++        subject: &HashTrieMap<i32, i64, RcK, H>,
++        model: &HashMap<i32, i64>,
++    ) {
++        assert_eq!(subject.size(), model.len());
++        assert_eq!(subject.is_empty(), model.is_empty());
++        // Every entry the subject yields must be in the model, and the sizes
++        // agree, so the maps are equal as sets of entries.
++        let mut seen = 0;
++        for (k, v) in subject.iter() {
++            assert_eq!(model.get(k), Some(v));
++            seen += 1;
++        }
++        assert_eq!(seen, model.len());
++        assert_eq!(subject.keys().count(), model.len());
++        assert_eq!(subject.values().count(), model.len());
++    }
++
++    struct HtMapMachine<H: BuildHasher + Clone> {
++        subject: HashTrieMap<i32, i64, RcK, H>,
++        model: HashMap<i32, i64>,
++    }
++
++    #[hegel::state_machine]
++    impl<H: BuildHasher + Clone> HtMapMachine<H> {
++        #[rule]
++        fn insert_mut(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let v = tc.draw(generators::integers::<i64>());
++            self.subject.insert_mut(k, v);
++            self.model.insert(k, v);
++        }
++
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let v = tc.draw(generators::integers::<i64>());
++            self.subject = self.subject.insert(k, v);
++            self.model.insert(k, v);
++        }
++
++        #[rule]
++        fn remove_mut(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let removed = self.subject.remove_mut(&k);
++            assert_eq!(removed, self.model.remove(&k).is_some());
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            self.subject = self.subject.remove(&k);
++            self.model.remove(&k);
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            assert_eq!(self.subject.get(&k), self.model.get(&k));
++            assert_eq!(
++                self.subject.get_key_value(&k),
++                self.model.get_key_value(&k)
++            );
++            assert_eq!(self.subject.contains_key(&k), self.model.contains_key(&k));
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            check_against_model(&self.subject, &self.model);
++        }
++    }
++
++    // Model test: a `HashTrieMap` must behave like `HashMap` under any
++    // sequence of operations. The trie's `degree` configuration is generated
++    // too (`new_with_degree` is public API): small degrees make deep tries.
++    #[hegel::test]
++    fn hegel_hash_trie_map_model_matches_hash_map(tc: TestCase) {
++        let degree = tc.draw(generators::sampled_from(vec![2u8, 4, 8, 16, 32, 64]));
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: HashTrieMap<i32, i64> = HashTrieMap::new_with_degree(degree);
++        let mut model: HashMap<i32, i64> = HashMap::new();
++        for (i, k) in init.into_iter().enumerate() {
++            subject.insert_mut(k, i as i64);
++            model.insert(k, i as i64);
++        }
++
++        hegel::stateful::run(HtMapMachine { subject, model }, tc);
++    }
++
++    // Same model property, but with a hasher that only produces 16 distinct
++    // hash values, so that collision buckets at the maximum trie depth are
++    // actually exercised.
++    #[hegel::test]
++    fn hegel_hash_trie_map_collisions_model_matches_hash_map(tc: TestCase) {
++        let degree = tc.draw(generators::sampled_from(vec![2u8, 4, 8, 16, 32, 64]));
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: HashTrieMap<i32, i64, RcK, LossyBuildHasher> =
++            HashTrieMap::new_with_hasher_and_degree_and_ptr_kind(LossyBuildHasher, degree);
++        let mut model: HashMap<i32, i64> = HashMap::new();
++        for (i, k) in init.into_iter().enumerate() {
++            subject.insert_mut(k, i as i64);
++            model.insert(k, i as i64);
++        }
++
++        hegel::stateful::run(HtMapMachine { subject, model }, tc);
++    }
++
++    // Persistence: every intermediate version must stay intact when later
++    // versions are derived from it. Run with both the honest and the lossy
++    // hasher so collision buckets are covered as well.
++    #[hegel::test]
++    fn hegel_hash_trie_map_persistence(tc: TestCase) {
++        fn run<H: BuildHasher + Clone>(
++            tc: &TestCase,
++            empty: HashTrieMap<i32, usize, RcK, H>,
++            keys: &[i32],
++        ) {
++            let mut versions: Vec<HashTrieMap<i32, usize, RcK, H>> =
++                Vec::with_capacity(keys.len() + 1);
++            let mut snapshots: Vec<HashMap<i32, usize>> = Vec::with_capacity(keys.len() + 1);
++            versions.push(empty);
++            snapshots.push(HashMap::new());
++            for (i, k) in keys.iter().enumerate() {
++                versions.push(versions.last().unwrap().insert(*k, i));
++                let mut snapshot = snapshots.last().unwrap().clone();
++                snapshot.insert(*k, i);
++                snapshots.push(snapshot);
++            }
++
++            // Derive an emptied version from a randomly chosen version.
++            let chosen = tc
++                .draw(generators::integers::<usize>().max_value(versions.len() - 1));
++            let mut emptied = versions[chosen].clone();
++            for k in keys {
++                emptied.remove_mut(k);
++            }
++            assert!(emptied.is_empty());
++
++            // No old version may have changed.
++            for (version, snapshot) in versions.iter().zip(snapshots.iter()) {
++                assert_eq!(version.size(), snapshot.len());
++                let mut seen = 0;
++                for (k, v) in version.iter() {
++                    assert_eq!(snapshot.get(k), Some(v));
++                    seen += 1;
++                }
++                assert_eq!(seen, snapshot.len());
++            }
++        }
++
++        let degree = tc.draw(generators::sampled_from(vec![2u8, 4, 8, 16, 32, 64]));
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        if tc.draw(generators::booleans()) {
++            run(&tc, HashTrieMap::new_with_degree(degree), &keys);
++        } else {
++            run(
++                &tc,
++                HashTrieMap::new_with_hasher_and_degree_and_ptr_kind(LossyBuildHasher, degree),
++                &keys,
++            );
++        }
++    }
++}
++
++// SUSPECTED BUG (found while writing the hegel model tests, see
++// HEGEL_REPORT.md): `new_with_degree(1)` passes the constructor's
++// validation (1 is a power of two and <= 64), but with degree 1
++// `node_utils::index_from_hash` never consumes any hash bits (a shift of
++// `depth * 0`), so inserting two distinct keys recurses forever and crashes
++// with a stack overflow (SIGABRT). Ignored by default because the abort
++// would kill the whole test binary; run explicitly with
++// `cargo test -- --ignored temp_probe_degree_one` to reproduce.
++#[test]
++#[ignore = "genuine bug: aborts the process with a stack overflow"]
++fn hegel_found_degree_one_stack_overflow() {
++    let mut m: HashTrieMap<i32, i32> = HashTrieMap::new_with_degree(1);
++    m.insert_mut(1, 1);
++    m.insert_mut(2, 2);
++    assert_eq!(m.size(), 2);
++}
+diff --git a/src/map/red_black_tree_map/test.rs b/src/map/red_black_tree_map/test.rs
+index 73996f3..0f06b79 100644
+--- a/src/map/red_black_tree_map/test.rs
++++ b/src/map/red_black_tree_map/test.rs
+@@ -1003,12 +1003,13 @@ mod internal {
+         let mut map = RedBlackTreeMap::new();
+ 
+         for (i, &v) in values.iter().enumerate() {
+-            map.insert_mut(v, 2 * v);
++            // Wrapping so that the *test* does not overflow for large keys.
++            map.insert_mut(v, v.wrapping_mul(2));
+ 
+             let other_v = values[i / 2];
+ 
+-            assert_eq!(map.get(&v), Some(&(2 * v)));
+-            assert_eq!(map.get(&other_v), Some(&(2 * other_v)));
++            assert_eq!(map.get(&v), Some(&v.wrapping_mul(2)));
++            assert_eq!(map.get(&other_v), Some(&other_v.wrapping_mul(2)));
+ 
+             if let Err(error) = map.check_consistent() {
+                 panic!(
+@@ -1059,7 +1060,7 @@ mod internal {
+         let mut map = RedBlackTreeMap::new();
+ 
+         for &v in values_insert {
+-            map.insert_mut(v, 2 * v);
++            map.insert_mut(v, v.wrapping_mul(2));
+         }
+ 
+         for (i, v) in values_remove.iter().enumerate() {
+@@ -1116,6 +1117,38 @@ mod internal {
+             remove_test(&permutation_insert, &permutation_remove);
+         }
+     }
++
++    // Hegel evolution of `test_insert`/`test_remove` above: instead of a
++    // seeded `StdRng` shuffling a fixed permutation of 0..64, let hegel pick
++    // arbitrary key sequences (any u32, duplicates included, up to hundreds of
++    // keys so the tree gets several levels deep) so failures shrink to a
++    // minimal insertion/removal sequence. The red-black tree invariants are
++    // checked by `check_consistent` after every operation.
++    #[hegel::test]
++    fn hegel_insert_remove_keeps_tree_consistent(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let values_insert: Vec<u32> =
++            tc.draw(generators::vecs(generators::integers::<u32>()).min_size(n));
++
++        insert_test(&values_insert);
++
++        // Remove a mix of present and absent keys.
++        let values_remove: Vec<u32> = if values_insert.is_empty() {
++            tc.draw(generators::vecs(generators::integers::<u32>()))
++        } else {
++            tc.draw(
++                generators::vecs(hegel::one_of!(
++                    generators::sampled_from(values_insert.clone()),
++                    generators::integers::<u32>()
++                ))
++                .min_size(values_insert.len()),
++            )
++        };
++
++        remove_test(&values_insert, &values_remove);
++    }
+ }
+ 
+ mod iter {
+@@ -1838,3 +1871,216 @@ fn test_serde() {
+ 
+     assert_eq!(map, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++    use std::collections::BTreeMap;
++
++    // Draw a key that often already exists in the model, so that updates and
++    // removals of present keys actually happen.
++    fn model_key_or_any(tc: &TestCase, model: &BTreeMap<i32, i64>) -> i32 {
++        if !model.is_empty() && tc.draw(generators::booleans()) {
++            let keys: Vec<i32> = model.keys().copied().collect();
++            tc.draw(generators::sampled_from(keys))
++        } else {
++            tc.draw(generators::integers::<i32>())
++        }
++    }
++
++    struct RbtMapMachine {
++        subject: RedBlackTreeMap<i32, i64>,
++        model: BTreeMap<i32, i64>,
++    }
++
++    #[hegel::state_machine]
++    impl RbtMapMachine {
++        #[rule]
++        fn insert_mut(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let v = tc.draw(generators::integers::<i64>());
++            self.subject.insert_mut(k, v);
++            self.model.insert(k, v);
++        }
++
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let v = tc.draw(generators::integers::<i64>());
++            self.subject = self.subject.insert(k, v);
++            self.model.insert(k, v);
++        }
++
++        #[rule]
++        fn remove_mut(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            let removed = self.subject.remove_mut(&k);
++            assert_eq!(removed, self.model.remove(&k).is_some());
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            self.subject = self.subject.remove(&k);
++            self.model.remove(&k);
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let k = model_key_or_any(&tc, &self.model);
++            assert_eq!(self.subject.get(&k), self.model.get(&k));
++            assert_eq!(
++                self.subject.get_key_value(&k),
++                self.model.get_key_value(&k)
++            );
++            assert_eq!(self.subject.contains_key(&k), self.model.contains_key(&k));
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.subject.size(), self.model.len());
++            assert_eq!(self.subject.is_empty(), self.model.is_empty());
++            assert_eq!(self.subject.first(), self.model.first_key_value());
++            assert_eq!(self.subject.last(), self.model.last_key_value());
++            // Iteration must be in sorted key order with the same content.
++            assert!(self.subject.iter().eq(self.model.iter()));
++        }
++
++        // The red-black tree invariants themselves (evidence: the crate's own
++        // `check_consistent` used by the unit tests).
++        #[invariant]
++        fn red_black_invariants_hold(&self, _: TestCase) {
++            self.subject.check_consistent().unwrap();
++        }
++    }
++
++    // Model test: a `RedBlackTreeMap` must behave like `BTreeMap` under any
++    // sequence of operations.
++    #[hegel::test]
++    fn hegel_rbt_map_model_matches_btree_map(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: RedBlackTreeMap<i32, i64> = RedBlackTreeMap::new();
++        let mut model: BTreeMap<i32, i64> = BTreeMap::new();
++        for (i, k) in init.into_iter().enumerate() {
++            subject.insert_mut(k, i as i64);
++            model.insert(k, i as i64);
++        }
++
++        hegel::stateful::run(RbtMapMachine { subject, model }, tc);
++    }
++
++    // Oracle: `range` must return exactly what `BTreeMap::range` returns, in
++    // both directions, for arbitrary bounds. Bounds are often sampled from the
++    // map's own keys so that Included/Excluded boundaries coincide with
++    // existing keys.
++    #[hegel::test]
++    fn hegel_rbt_map_range_matches_btree_map(tc: TestCase) {
++        use core::ops::Bound::{self, Excluded, Included, Unbounded};
++
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut map: RedBlackTreeMap<i32, usize> = RedBlackTreeMap::new();
++        let mut model: BTreeMap<i32, usize> = BTreeMap::new();
++        for (i, k) in keys.iter().enumerate() {
++            map.insert_mut(*k, i);
++            model.insert(*k, i);
++        }
++
++        let draw_endpoint = || -> i32 {
++            if !keys.is_empty() && tc.draw(generators::booleans()) {
++                tc.draw(generators::sampled_from(keys.clone()))
++            } else {
++                tc.draw(generators::integers::<i32>())
++            }
++        };
++
++        let mut lo = draw_endpoint();
++        let mut hi = draw_endpoint();
++        if lo > hi {
++            core::mem::swap(&mut lo, &mut hi);
++        }
++
++        let start: Bound<i32> = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => Included(lo),
++            1 => Excluded(lo),
++            _ => Unbounded,
++        };
++        let mut end: Bound<i32> = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => Included(hi),
++            1 => Excluded(hi),
++            _ => Unbounded,
++        };
++
++        // Both ends excluded on the same key is documented to panic (in rpds
++        // and in std alike), so construct a valid range instead.
++        if lo == hi && matches!((&start, &end), (Excluded(_), Excluded(_))) {
++            end = Included(hi);
++        }
++
++        let forward: Vec<(i32, usize)> =
++            map.range((start, end)).map(|(k, v)| (*k, *v)).collect();
++        let expected_forward: Vec<(i32, usize)> =
++            model.range((start, end)).map(|(k, v)| (*k, *v)).collect();
++        assert_eq!(forward, expected_forward);
++
++        let backward: Vec<(i32, usize)> =
++            map.range((start, end)).rev().map(|(k, v)| (*k, *v)).collect();
++        let expected_backward: Vec<(i32, usize)> =
++            model.range((start, end)).rev().map(|(k, v)| (*k, *v)).collect();
++        assert_eq!(backward, expected_backward);
++    }
++
++    // Persistence: every intermediate version of the map must stay intact
++    // when later versions are derived from it (by persistent inserts/removes
++    // and by copy-on-write `_mut` operations on clones).
++    #[hegel::test]
++    fn hegel_rbt_map_persistence(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let keys: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        // versions[i] contains the first i insertions; snapshots[i] is the
++        // expected content of versions[i].
++        let mut versions: Vec<RedBlackTreeMap<i32, usize>> =
++            Vec::with_capacity(keys.len() + 1);
++        let mut snapshots: Vec<BTreeMap<i32, usize>> = Vec::with_capacity(keys.len() + 1);
++        versions.push(RedBlackTreeMap::new());
++        snapshots.push(BTreeMap::new());
++        for (i, k) in keys.iter().enumerate() {
++            versions.push(versions.last().unwrap().insert(*k, i));
++            let mut snapshot = snapshots.last().unwrap().clone();
++            snapshot.insert(*k, i);
++            snapshots.push(snapshot);
++        }
++
++        // Derive an emptied version from a randomly chosen version, and a
++        // heavily overwritten one from another.
++        let chosen = tc
++            .draw(generators::integers::<usize>().max_value(versions.len() - 1));
++        let mut emptied = versions[chosen].clone();
++        for k in &keys {
++            emptied.remove_mut(k);
++        }
++        assert!(emptied.is_empty());
++
++        let chosen2 = tc
++            .draw(generators::integers::<usize>().max_value(versions.len() - 1));
++        let mut overwritten = versions[chosen2].clone();
++        for k in &keys {
++            overwritten.insert_mut(*k, usize::MAX);
++        }
++
++        // No old version may have changed.
++        for (version, snapshot) in versions.iter().zip(snapshots.iter()) {
++            assert_eq!(version.size(), snapshot.len());
++            assert!(version.iter().eq(snapshot.iter()));
++        }
++    }
++}
+diff --git a/src/queue/test.rs b/src/queue/test.rs
+index 25406c0..340f5e9 100644
+--- a/src/queue/test.rs
++++ b/src/queue/test.rs
+@@ -427,3 +427,153 @@ fn test_serde() {
+ 
+     assert_eq!(queue, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++    use std::collections::VecDeque;
++    use std::collections::hash_map::DefaultHasher;
++    use std::hash::{Hash, Hasher};
++
++    struct QueueMachine {
++        subject: Queue<i32>,
++        model: VecDeque<i32>,
++    }
++
++    #[hegel::state_machine]
++    impl QueueMachine {
++        #[rule]
++        fn enqueue_mut(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject.enqueue_mut(v);
++            self.model.push_back(v);
++        }
++
++        #[rule]
++        fn enqueue(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject = self.subject.enqueue(v);
++            self.model.push_back(v);
++        }
++
++        #[rule]
++        fn dequeue_mut(&mut self, _: TestCase) {
++            let dequeued = self.subject.dequeue_mut();
++            assert_eq!(dequeued, self.model.pop_front().is_some());
++        }
++
++        #[rule]
++        fn dequeue(&mut self, _: TestCase) {
++            match self.subject.dequeue() {
++                Some(shorter) => {
++                    assert!(self.model.pop_front().is_some());
++                    self.subject = shorter;
++                }
++                None => assert!(self.model.is_empty()),
++            }
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.subject.len(), self.model.len());
++            assert_eq!(self.subject.is_empty(), self.model.is_empty());
++            assert_eq!(self.subject.peek(), self.model.front());
++            assert!(self.subject.iter().eq(self.model.iter()));
++        }
++    }
++
++    // Model test: a `Queue` must behave like `VecDeque` under any sequence of
++    // enqueue/dequeue operations. The queue is implemented as an in-list and
++    // an out-list with lazy reversal, so the interesting states are the ones
++    // where elements sit in both lists.
++    #[hegel::test]
++    fn hegel_queue_model_matches_vec_deque(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: Queue<i32> = Queue::new();
++        let mut model: VecDeque<i32> = VecDeque::new();
++        for v in init {
++            subject.enqueue_mut(v);
++            model.push_back(v);
++        }
++
++        hegel::stateful::run(QueueMachine { subject, model }, tc);
++    }
++
++    // Persistence: dequeuing from a derived version must not change older
++    // versions, even though `dequeue_mut` internally swaps and reverses the
++    // shared in/out lists.
++    #[hegel::test]
++    fn hegel_queue_persistence(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let values: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        // versions[i] contains values[..i]; interleave dequeues on the side to
++        // move elements between the internal in/out lists of later versions.
++        let mut versions: Vec<Queue<i32>> = Vec::with_capacity(values.len() + 1);
++        versions.push(Queue::new());
++        for v in &values {
++            versions.push(versions.last().unwrap().enqueue(*v));
++        }
++
++        // Derive a fully drained version from a randomly chosen version.
++        let chosen = tc
++            .draw(generators::integers::<usize>().max_value(versions.len() - 1));
++        let mut drained = versions[chosen].clone();
++        while drained.dequeue_mut() {}
++        assert!(drained.is_empty());
++
++        // No old version may have changed.
++        for (i, version) in versions.iter().enumerate() {
++            assert_eq!(version.len(), i);
++            assert!(version.iter().eq(values[..i].iter()));
++            assert_eq!(version.peek(), values[..i].first());
++        }
++    }
++
++    // Equality, ordering, and hashing must depend only on the queue's logical
++    // content, not on how the elements are split between the internal in/out
++    // lists (evidence: `PartialEq`/`Ord`/`Hash` impls all iterate logically).
++    #[hegel::test]
++    fn hegel_queue_eq_and_hash_ignore_internal_structure(tc: TestCase) {
++        fn hash_of(q: &Queue<i32>) -> u64 {
++            let mut hasher = DefaultHasher::new();
++            q.hash(&mut hasher);
++            hasher.finish()
++        }
++
++        let values: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()));
++        let junk: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(1));
++
++        // q1: enqueue the values directly (everything in the in-list).
++        let mut q1: Queue<i32> = Queue::new();
++        for v in &values {
++            q1.enqueue_mut(*v);
++        }
++
++        // q2: same logical content, but reached through extra enqueue/dequeue
++        // churn, so the elements are distributed differently internally.
++        let mut q2: Queue<i32> = Queue::new();
++        for j in &junk {
++            q2.enqueue_mut(*j);
++        }
++        for v in &values {
++            q2.enqueue_mut(*v);
++        }
++        for _ in &junk {
++            assert!(q2.dequeue_mut());
++        }
++
++        assert_eq!(q1, q2);
++        assert_eq!(q1.cmp(&q2), core::cmp::Ordering::Equal);
++        assert_eq!(q1.partial_cmp(&q2), Some(core::cmp::Ordering::Equal));
++        assert_eq!(hash_of(&q1), hash_of(&q2));
++    }
++}
+diff --git a/src/set/hash_trie_set/test.rs b/src/set/hash_trie_set/test.rs
+index 262c1b4..755dd0c 100644
+--- a/src/set/hash_trie_set/test.rs
++++ b/src/set/hash_trie_set/test.rs
+@@ -340,3 +340,60 @@ fn test_serde() {
+ 
+     assert_eq!(set, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++    use std::collections::HashSet;
++
++    // Oracle: `is_subset`/`is_superset`/`is_disjoint`/`==` must agree with
++    // `HashSet`. Elements come from a small domain so that subset/disjoint
++    // relations actually occur (with full-range i32 two random sets would
++    // almost never intersect).
++    #[hegel::test]
++    fn hegel_hash_trie_set_relations_match_hash_set(tc: TestCase) {
++        let a_vals: Vec<i8> =
++            tc.draw(generators::vecs(generators::integers::<i8>().min_value(0).max_value(15)));
++        // Sometimes build b on top of a's elements so subset relations occur.
++        let mut b_vals: Vec<i8> = if tc.draw(generators::booleans()) {
++            a_vals.clone()
++        } else {
++            Vec::new()
++        };
++        b_vals.extend(tc.draw(
++            generators::vecs(generators::integers::<i8>().min_value(0).max_value(15)),
++        ));
++
++        let mut a: HashTrieSet<i8> = HashTrieSet::new();
++        let mut model_a: HashSet<i8> = HashSet::new();
++        for v in &a_vals {
++            a.insert_mut(*v);
++            model_a.insert(*v);
++        }
++
++        let mut b: HashTrieSet<i8> = HashTrieSet::new();
++        let mut model_b: HashSet<i8> = HashSet::new();
++        for v in &b_vals {
++            b.insert_mut(*v);
++            model_b.insert(*v);
++        }
++
++        assert_eq!(a.size(), model_a.len());
++        assert_eq!(b.size(), model_b.len());
++
++        assert_eq!(a.is_subset(&b), model_a.is_subset(&model_b));
++        assert_eq!(b.is_subset(&a), model_b.is_subset(&model_a));
++        assert_eq!(a.is_superset(&b), model_a.is_superset(&model_b));
++        assert_eq!(b.is_superset(&a), model_b.is_superset(&model_a));
++        assert_eq!(a.is_disjoint(&b), model_a.is_disjoint(&model_b));
++        assert_eq!(b.is_disjoint(&a), model_b.is_disjoint(&model_a));
++        assert_eq!(a == b, model_a == model_b);
++
++        for v in 0..=15i8 {
++            assert_eq!(a.contains(&v), model_a.contains(&v));
++            assert_eq!(a.get(&v), model_a.get(&v));
++        }
++    }
++}
+diff --git a/src/set/red_black_tree_set/test.rs b/src/set/red_black_tree_set/test.rs
+index 4984655..82f2cc0 100644
+--- a/src/set/red_black_tree_set/test.rs
++++ b/src/set/red_black_tree_set/test.rs
+@@ -455,3 +455,64 @@ fn test_serde() {
+ 
+     assert_eq!(set, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++    use std::collections::BTreeSet;
++
++    // Oracle: `is_subset`/`is_superset`/`is_disjoint`/`==` must agree with
++    // `BTreeSet`. These are hand-written merge-style algorithms over the
++    // sorted iterators, so boundary interleavings are the interesting inputs.
++    // Elements come from a small domain so that subset/disjoint relations
++    // actually occur (with full-range i32 two random sets would almost never
++    // intersect); this biases the input distribution but does not narrow the
++    // property's domain.
++    #[hegel::test]
++    fn hegel_rbt_set_relations_match_btree_set(tc: TestCase) {
++        let a_vals: Vec<i8> =
++            tc.draw(generators::vecs(generators::integers::<i8>().min_value(0).max_value(15)));
++        // Sometimes build b on top of a's elements so subset relations occur.
++        let mut b_vals: Vec<i8> = if tc.draw(generators::booleans()) {
++            a_vals.clone()
++        } else {
++            Vec::new()
++        };
++        b_vals.extend(tc.draw(
++            generators::vecs(generators::integers::<i8>().min_value(0).max_value(15)),
++        ));
++
++        let mut a: RedBlackTreeSet<i8> = RedBlackTreeSet::new();
++        let mut model_a: BTreeSet<i8> = BTreeSet::new();
++        for v in &a_vals {
++            a.insert_mut(*v);
++            model_a.insert(*v);
++        }
++
++        let mut b: RedBlackTreeSet<i8> = RedBlackTreeSet::new();
++        let mut model_b: BTreeSet<i8> = BTreeSet::new();
++        for v in &b_vals {
++            b.insert_mut(*v);
++            model_b.insert(*v);
++        }
++
++        assert!(a.iter().eq(model_a.iter()));
++        assert!(b.iter().eq(model_b.iter()));
++
++        assert_eq!(a.is_subset(&b), model_a.is_subset(&model_b));
++        assert_eq!(b.is_subset(&a), model_b.is_subset(&model_a));
++        assert_eq!(a.is_superset(&b), model_a.is_superset(&model_b));
++        assert_eq!(b.is_superset(&a), model_b.is_superset(&model_a));
++        assert_eq!(a.is_disjoint(&b), model_a.is_disjoint(&model_b));
++        assert_eq!(b.is_disjoint(&a), model_b.is_disjoint(&model_a));
++        assert_eq!(a == b, model_a == model_b);
++
++        assert_eq!(a.first(), model_a.first());
++        assert_eq!(a.last(), model_a.last());
++        for v in 0..=15i8 {
++            assert_eq!(a.contains(&v), model_a.contains(&v));
++        }
++    }
++}
+diff --git a/src/stack/test.rs b/src/stack/test.rs
+index 9ca3fd5..ccaa587 100644
+--- a/src/stack/test.rs
++++ b/src/stack/test.rs
+@@ -264,3 +264,76 @@ fn test_serde() {
+ 
+     assert_eq!(stack, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++
++    struct StackMachine {
++        subject: Stack<i32>,
++        model: Vec<i32>,
++    }
++
++    #[hegel::state_machine]
++    impl StackMachine {
++        #[rule]
++        fn push_mut(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject.push_mut(v);
++            self.model.push(v);
++        }
++
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject = self.subject.push(v);
++            self.model.push(v);
++        }
++
++        #[rule]
++        fn pop_mut(&mut self, _: TestCase) {
++            let popped = self.subject.pop_mut();
++            assert_eq!(popped, self.model.pop().is_some());
++        }
++
++        #[rule]
++        fn pop(&mut self, _: TestCase) {
++            match self.subject.pop() {
++                Some(shorter) => {
++                    assert!(self.model.pop().is_some());
++                    self.subject = shorter;
++                }
++                None => assert!(self.model.is_empty()),
++            }
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.subject.size(), self.model.len());
++            assert_eq!(self.subject.is_empty(), self.model.is_empty());
++            assert_eq!(self.subject.peek(), self.model.last());
++            // Stack iterates from the top (LIFO order).
++            assert!(self.subject.iter().eq(self.model.iter().rev()));
++        }
++    }
++
++    // Model test: a `Stack` must behave like a `Vec` used as a stack under
++    // any sequence of push/pop operations.
++    #[hegel::test]
++    fn hegel_stack_model_matches_vec(tc: TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: Stack<i32> = Stack::new();
++        let mut model: Vec<i32> = Vec::new();
++        for v in init {
++            subject.push_mut(v);
++            model.push(v);
++        }
++
++        hegel::stateful::run(StackMachine { subject, model }, tc);
++    }
++}
+diff --git a/src/vector/test.rs b/src/vector/test.rs
+index a9222cf..f1dcc29 100644
+--- a/src/vector/test.rs
++++ b/src/vector/test.rs
+@@ -728,3 +728,181 @@ fn test_serde() {
+ 
+     assert_eq!(vector, decoded);
+ }
++
++mod hegel_properties {
++    use super::*;
++    use hegel::TestCase;
++    use pretty_assertions::assert_eq;
++    use hegel::generators;
++
++    struct VectorMachine {
++        subject: Vector<i32>,
++        model: Vec<i32>,
++    }
++
++    #[hegel::state_machine]
++    impl VectorMachine {
++        #[rule]
++        fn push_back_mut(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject.push_back_mut(v);
++            self.model.push(v);
++        }
++
++        #[rule]
++        fn push_back(&mut self, tc: TestCase) {
++            let v = tc.draw(generators::integers::<i32>());
++            self.subject = self.subject.push_back(v);
++            self.model.push(v);
++        }
++
++        // Push a whole batch so the trie grows several levels deep within a
++        // single run (see "Deep structure bugs" in the property catalogue).
++        #[rule]
++        fn push_back_many(&mut self, tc: TestCase) {
++            let vs: Vec<i32> =
++                tc.draw(generators::vecs(generators::integers::<i32>()).max_size(64));
++            for v in vs {
++                self.subject.push_back_mut(v);
++                self.model.push(v);
++            }
++        }
++
++        #[rule]
++        fn drop_last_mut(&mut self, _: TestCase) {
++            let dropped = self.subject.drop_last_mut();
++            assert_eq!(dropped, self.model.pop().is_some());
++        }
++
++        #[rule]
++        fn drop_last(&mut self, _: TestCase) {
++            match self.subject.drop_last() {
++                Some(shorter) => {
++                    assert!(self.model.pop().is_some());
++                    self.subject = shorter;
++                }
++                None => assert!(self.model.is_empty()),
++            }
++        }
++
++        #[rule]
++        fn set_mut(&mut self, tc: TestCase) {
++            // Deliberately allow out-of-range indexes: `set_mut` must return
++            // `false` for those.
++            let index =
++                tc.draw(generators::integers::<usize>().max_value(self.model.len() + 1));
++            let v = tc.draw(generators::integers::<i32>());
++            let updated = self.subject.set_mut(index, v);
++            assert_eq!(updated, index < self.model.len());
++            if updated {
++                self.model[index] = v;
++            }
++        }
++
++        #[rule]
++        fn set(&mut self, tc: TestCase) {
++            let index =
++                tc.draw(generators::integers::<usize>().max_value(self.model.len() + 1));
++            let v = tc.draw(generators::integers::<i32>());
++            match self.subject.set(index, v) {
++                Some(updated) => {
++                    assert!(index < self.model.len());
++                    self.subject = updated;
++                    self.model[index] = v;
++                }
++                None => assert!(index >= self.model.len()),
++            }
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let index =
++                tc.draw(generators::integers::<usize>().max_value(self.model.len() + 1));
++            assert_eq!(self.subject.get(index), self.model.get(index));
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.subject.len(), self.model.len());
++            assert_eq!(self.subject.is_empty(), self.model.is_empty());
++            assert_eq!(self.subject.first(), self.model.first());
++            assert_eq!(self.subject.last(), self.model.last());
++            assert!(self.subject.iter().eq(self.model.iter()));
++        }
++    }
++
++    // Model test: a `Vector` must behave exactly like `Vec` under any sequence
++    // of operations. The vector's `bits` configuration is generated too
++    // (`new_with_bits` is public API): small values of `bits` produce deep
++    // tries with few elements (bits = 1 makes the trie binary).
++    #[hegel::test]
++    fn hegel_vector_model_matches_vec(tc: TestCase) {
++        let bits = tc.draw(generators::integers::<u8>().min_value(1).max_value(8));
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let init: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        let mut subject: Vector<i32> = Vector::new_with_bits(bits);
++        let mut model: Vec<i32> = Vec::new();
++        for v in init {
++            subject.push_back_mut(v);
++            model.push(v);
++        }
++
++        hegel::stateful::run(VectorMachine { subject, model }, tc);
++    }
++
++    // Persistence: deriving new versions from a vector (through both the
++    // persistent API and the copy-on-write `_mut` API on clones) must never
++    // change any older version. This is the crate's core promise
++    // ("persistent data structures with structural sharing").
++    #[hegel::test]
++    fn hegel_vector_persistence(tc: TestCase) {
++        let bits = tc.draw(generators::integers::<u8>().min_value(1).max_value(8));
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let values: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()).min_size(n));
++
++        // versions[i] contains values[..i].
++        let mut versions: Vec<Vector<i32>> = Vec::with_capacity(values.len() + 1);
++        versions.push(Vector::new_with_bits(bits));
++        for v in &values {
++            versions.push(versions.last().unwrap().push_back(*v));
++        }
++
++        // Derive heavily-mutated versions from a randomly chosen version.
++        let chosen = tc
++            .draw(generators::integers::<usize>().max_value(versions.len() - 1));
++        let mut drained = versions[chosen].clone();
++        while drained.drop_last_mut() {}
++
++        let mut overwritten = versions[chosen].clone();
++        for i in 0..overwritten.len() {
++            assert!(overwritten.set_mut(i, i32::MIN));
++        }
++        overwritten.push_back_mut(i32::MAX);
++
++        // No old version may have changed.
++        for (i, version) in versions.iter().enumerate() {
++            assert_eq!(version.len(), i);
++            assert!(version.iter().eq(values[..i].iter()));
++        }
++    }
++
++    // `new_with_bits` accepts any positive `bits` (that is the only
++    // documented/asserted requirement), so a vector created with any positive
++    // `bits` should support basic operations without panicking.
++    #[hegel::test]
++    fn hegel_vector_new_with_bits_no_panic(tc: TestCase) {
++        let bits = tc.draw(generators::integers::<u8>().min_value(1));
++        let values: Vec<i32> =
++            tc.draw(generators::vecs(generators::integers::<i32>()));
++
++        let mut v: Vector<i32> = Vector::new_with_bits(bits);
++        for x in &values {
++            v.push_back_mut(*x);
++        }
++        assert_eq!(v.len(), values.len());
++        assert!(v.iter().eq(values.iter()));
++    }
++}

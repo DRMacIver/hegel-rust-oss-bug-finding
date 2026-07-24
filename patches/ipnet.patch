@@ -1,0 +1,832 @@
+diff --git a/.gitignore b/.gitignore
+index 6aa1064..b5207a5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
+ /target/
+ **/*.rs.bk
+ Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 2e929ac..82ae6b5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,7 @@ schemars1 = { package = "schemars", version = "1", optional = true, default-feat
+ heapless = { version = "0", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ serde_test = "1"
+ 
+ [badges]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..1b1642d
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,207 @@
++# Hegel property-based testing report for `ipnet`
++
++Hegel (`hegeltest` 0.28.2) property tests were added to the existing unit-test
++modules in `src/ipnet.rs` (15 tests) and `src/mask.rs` (2 tests). Three tests
++fail; they pin two genuine library bugs and are deliberately left failing (see
++**Suspected bugs**).
++
++## Properties tested
++
++All properties are grounded in the crate's rustdoc contracts, doc examples, or
++independent mathematical facts about CIDR blocks. Evidence noted per property.
++
++In `src/ipnet.rs::tests`:
++
++1. **`hegel_ipv4net_display_parse_roundtrip`** — `s.parse::<Ipv4Net>() == Ok(net)`
++   for `s = net.to_string()`, all prefix lengths 0–32, arbitrary (boundary-boosted)
++   addresses. Evidence: `Display` writes `"{addr}/{prefix}"`; `FromStr` documented
++   to parse CIDR notation (RFC 4632).
++2. **`hegel_ipv6net_display_parse_roundtrip`** — same for `Ipv6Net`, prefix 0–128,
++   exercising the custom IPv6 parser in `src/parser.rs` (zero compression,
++   IPv4-mapped forms).
++3. **`hegel_ipnet_display_parse_roundtrip`** — same for the `IpNet` enum
++   (exercises the `read_or` v4-then-v6 dispatch path).
++4. **`hegel_from_str_never_panics`** — `FromStr` for all three types returns
++   `Err`, never panics, on arbitrary unicode text, near-miss CIDR-alphabet
++   strings, and valid displays. Evidence: `FromStr` returns `Result`; parser
++   calls `Ipv4Net::new(..).unwrap()` internally, so this checks the parser's
++   prefix bound (`read_number(10, 2, 33)`) really protects that unwrap.
++5. **`hegel_ipnet_parse_agrees_with_concrete_types`** — `IpNet::from_str`
++   succeeds iff `Ipv4Net::from_str` or `Ipv6Net::from_str` succeeds, with V4
++   taking precedence and equal values. Evidence: `Parser::read_ip_net` tries v4
++   then v6.
++6. **`hegel_netmask_hostmask_are_complementary`** — `netmask ^ hostmask == !0`,
++   `netmask.leading_ones() == prefix_len == netmask.count_ones()`, and neither
++   changes IP family. Evidence: netmask/hostmask doc examples; definition of a
++   prefix mask.
++7. **`hegel_ipv4_hosts_count_and_endpoints_match_docs`** — host count is
++   `2^(32-p) - 2` for `p < 31` (network/broadcast excluded, per `hosts()` docs),
++   `2` for `/31`, `1` for `/32`; first/last hosts match the documented endpoints.
++   Checked for **all** prefix lengths including 0 (the `count()` override is O(1)).
++8. **`hegel_ipv6_hosts_count_and_endpoints_match_docs`** — IPv6 `hosts()` spans
++   `network()..=broadcast()` (docs: no exclusion for IPv6); count is `2^(128-p)`
++   for `p >= 65` (bound protects the test from the *documented* count overflow,
++   not the library's contract).
++9. **`hegel_contains_addr_matches_prefix_bits_oracle`** — `net.contains(&addr)`
++   agrees with an independent oracle: the first `prefix_len` bits of `addr` and
++   `net.addr()` agree; cross-family containment is `false` (documented). Draws
++   are boosted so ~half the addresses are snapped inside the net.
++10. **`hegel_contains_net_iff_longer_prefix_and_network_inside`** — CIDR fact:
++    `a.contains(&b)` iff `b.prefix_len() >= a.prefix_len()` and `b.network()`
++    lies in `a` (checked with the bit oracle). v4 and v6.
++11. **`hegel_supernet_is_unique_immediate_parent`** — `supernet()` is `None` iff
++    `prefix_len == 0`; otherwise it is truncated, has `prefix_len - 1`, and
++    contains the net — which uniquely determines it. Evidence: `supernet()` docs.
++12. **`hegel_subnets_partition_their_network`** — `net.subnets(np)` yields exactly
++    `2^(np-p)` subnets of prefix `np` that tile `[network(), broadcast()]`
++    contiguously in order; `np < p` and `np > max` return `Err(PrefixLenError)`.
++    Evidence: `subnets()` docs and examples. (Prefix delta capped at 8 to bound
++    test time, not a library limit.)
++13. **`hegel_ipv4_subnets_iterator_covers_exact_range`** — `Ipv4Subnets::new(start,
++    end, min_prefix_len)` yields subnets with `prefix_len >= min_prefix_len` that
++    tile exactly `[start, end]` (empty when `start > end`). Evidence: `Ipv4Subnets`
++    doc: "Generates the subnets between the provided `start` and `end` IP
++    addresses inclusive of `end`... using a prefix length not less than
++    `min_prefix_len`." **FAILS — real bug, see below.**
++14. **`hegel_ipv6_subnets_iterator_covers_exact_range`** — IPv6 analog.
++    **FAILS — real bug, see below.**
++15. **`hegel_aggregate_preserves_address_membership`** — `IpNet::aggregate`
++    returns truncated nets covering exactly the same address set as the inputs;
++    membership probed at arbitrary addresses plus every input's boundary and
++    one-past-boundary addresses. Evidence: `aggregate()` docs/examples merge
++    without changing coverage; `test_aggregate_issue44` shows exact-coverage
++    intent. **FAILS — real bug, see below.**
++16. **`hegel_ord_consistent_with_contains`** — for truncated nets, a strict
++    superset sorts strictly before its subsets (`Ord` derived on
++    `(addr, prefix_len)`); structural consistency between ordering and
++    containment.
++17. **`hegel_trunc_preserves_range_and_is_idempotent`** — `trunc()` keeps
++    prefix/network/broadcast, sets `addr == network`, and is idempotent.
++    Evidence: `trunc()` docs.
++
++In `src/mask.rs::tests`:
++
++18. **`hegel_prefix_netmask_roundtrip`** — a mask built independently
++    (`!0 << (bits - p)`) converts back via `ipv{4,6}_mask_to_prefix` to `Ok(p)`,
++    and `with_netmask(addr, mask) == new(addr, p)`. Evidence: mask function docs
++    and `with_netmask` examples.
++19. **`hegel_mask_to_prefix_accepts_exactly_contiguous_masks`** — an arbitrary
++    u32/u128 is accepted iff it is a contiguous run of ones then zeros
++    (independent check: `leading_ones() + trailing_zeros() == bits`), and the
++    returned prefix equals `leading_ones()`. Evidence: "If the mask is invalid
++    this will return an `PrefixLenError`."
++
++Supporting generators (in `src/ipnet.rs::tests`): boundary-boosted address bits
++(`0`, `1`, `MAX-1`, `MAX` mixed with the full range), boundary-boosted prefix
++lengths, net-inside-net constructors, and a CIDR-ish string generator.
++
++## Test results
++
++- `cargo test`: **49 passed, 3 failed** (plus 56 doc-tests passing when run
++  separately). The three failures are deliberate — they pin real library bugs
++  (below) and are marked `KNOWN BUG` in the source.
++- Liveness check performed per the skill: temporarily inverting the v4
++  roundtrip assertion produced a shrunk minimal counterexample (`0.0.0.0/0`),
++  then was reverted and the `.hegel/` database removed.
++- Exploratory high-count run performed per the skill: at the default 100 cases
++  the whole suite initially passed; at `test_cases = 1000` the three failures
++  appeared. The failing tests keep `test_cases = 1000` (with boundary-boosted
++  generators) so the failures reproduce reliably; verified on repeated runs
++  from a clean `.hegel/` state — same three tests fail every time, all others
++  pass every time.
++
++## Suspected bugs
++
++Both bugs were confirmed with standalone (non-hegel) reproducers before being
++attributed to the library. Tests kept failing as instructed.
++
++### Bug 1: `Ipv4Subnets`/`Ipv6Subnets` emit subnets outside the requested range when the range is one address short of the full space
++
++- **Minimal counterexamples** (shrunk by hegel, confirmed standalone):
++  - `Ipv4Subnets::new("0.0.0.0", "255.255.255.254", 0)` yields `[0.0.0.0/0]`,
++    which contains `255.255.255.255` — one past the inclusive `end`.
++  - `Ipv4Subnets::new("0.0.0.1", "255.255.255.255", 0)` yields `[0.0.0.1/0]` — a
++    non-truncated net whose network is `0.0.0.0`, i.e. it covers an address
++    *before* `start`.
++  - IPv6 analog: `Ipv6Subnets::new("::", "ffff:...:fffe", 0)` yields `[::/0]`.
++- **Why it's a library bug**: the type's documentation says it "Generates the
++  subnets between the provided `start` and `end` IP addresses inclusive of
++  `end`". Emitting a subnet containing addresses outside `[start, end]`
++  violates that contract.
++- **Code path**: `next_ipv4_subnet` (src/ipnet.rs:1612) computes
++  `let range = end.saturating_sub(start).saturating_add(1);` and special-cases
++  `range == core::u32::MAX && min_prefix_len == 0` to return `start/0`. The
++  saturated `range` cannot distinguish a true range of `2^32` (full space,
++  where `/0` is correct) from `2^32 - 1` (one short, where it is not).
++  `next_ipv6_subnet` (src/ipnet.rs:1626) has the identical flaw with `u128`.
++- **Pinned by**: `hegel_ipv4_subnets_iterator_covers_exact_range`,
++  `hegel_ipv6_subnets_iterator_covers_exact_range`.
++
++### Bug 2: `aggregate` adds an address when an input's broadcast is one below the top of the address space
++
++- **Minimal counterexamples** (shrunk by hegel, confirmed standalone):
++  - `Ipv4Net::aggregate(&vec!["255.255.255.254/32"])` returns
++    `["255.255.255.254/31"]`, which contains `255.255.255.255` — an address in
++    no input network.
++  - `Ipv6Net::aggregate(&vec!["ffff:...:fffe/128"])` returns
++    `["ffff:...:fffe/127"]`.
++- **Why it's a library bug**: aggregation is documented (and demonstrated in
++  `test_aggregate` / `test_aggregate_issue44`) as merging networks; it must not
++  change the covered address set. Returning a strict superset breaks any
++  ACL/routing use of the result.
++- **Code path**: `Ipv4Net::interval()` (src/ipnet.rs:927) represents a net as a
++  half-open interval `(network, broadcast.saturating_add(1))`. For a net ending
++  at `255.255.255.254` the exclusive end is `u32::MAX` — the same value the
++  saturation produces for nets ending at `255.255.255.255`. `aggregate`
++  (src/ipnet.rs:952) then does `if end != core::u32::MAX { end =
++  end.saturating_sub(1) }`, assuming `end == MAX` always means "covers through
++  MAX", and hands the widened range to `Ipv4Subnets`. Same logic for IPv6 at
++  src/ipnet.rs:1303/1328. (Inputs that exactly tile `[0.0.0.1,
++  255.255.255.255]` additionally reach Bug 1 through the same call.)
++- **Pinned by**: `hegel_aggregate_preserves_address_membership`.
++
++## Unsound properties abandoned
++
++None. No property had to be withdrawn as asserting something the crate never
++promised. Two generator constraints were added for test-resource reasons only
++(both commented in the code as such, per the skill's generator discipline):
++the subnet-count cap (prefix delta ≤ 8, range/min-prefix scenarios in the
++`Subnets` tests) and the IPv6 `hosts().count()` check being limited to
++`prefix >= 65` because `count()` is *documented* to overflow/panic on ranges
++that exceed the counter.
++
++## Skill feedback
++
++The skill and Rust reference worked well end to end; the three failures found
++are real, previously-unpinned bugs. Specific notes:
++
++- **The `no_std` gotcha in the Rust reference was load-bearing.** The first
++  compile failed with E0599 (`to_string` on `&'static str` inside
++  `#[hegel::test]`'s expansion) and E0425 (`String` not in scope), exactly as
++  the reference's Setup section predicts; `use alloc::string::{String,
++  ToString};` in each test module fixed it. One small addition would help: the
++  reference mentions the generated code's `.to_string()` call, but a
++  `#[hegel::composite]` returning `String` also needs `String` itself in scope
++  (E0425), which is easy to misread as a different problem.
++- **The boundary-conjunction advice found the bugs.** All three failures need
++  multiple simultaneous boundary draws (e.g. `start == 0`, `end == MAX - 1`,
++  `min_prefix_len == 0`), which never coincided in a default 100-case run. The
++  skill's two recommendations — boost boundaries with `one_of!`/`sampled_from`,
++  and do one exploratory ~10x run — were exactly what surfaced them.
++- **Gap: no guidance for keeping a probabilistic real-bug failure failing.**
++  The skill says to keep the test as written when a real bug is found, but at
++  the default case count these failures reproduce only ~20% of runs (and the
++  `.hegel/` replay database is per-machine and gitignored). I resolved it by
++  boosting the implicated conjunction in the generator and raising
++  `test_cases` on just the pinning tests, with comments. The skill could bless
++  a pattern for this ("make the pinning test fail deterministically:
++  targeted boost + elevated case count, or a fixed seed").
++- **Gap follow-up to gotcha 13 (no global case-count override):** doing the
++  10x pass over 17 tests means editing every attribute; a `sed` round-trip
++  works but also rewrites comments that mention `#[hegel::test]`. A
++  documented env-var or a suggested one-liner would reduce friction.
++- Everything else matched the reference exactly: `cargo add --dev hegeltest`,
++  the `hegel` crate-name split, `one_of!`, `sampled_from`, composites,
++  `.map()` on a composite generator, plain `&TestCase` helper functions, and
++  counterexample output (`draw_N` for helper-internal draws) all behaved as
++  documented.
+diff --git a/src/ipnet.rs b/src/ipnet.rs
+index cecb138..44655a6 100644
+--- a/src/ipnet.rs
++++ b/src/ipnet.rs
+@@ -1998,4 +1998,530 @@ mod tests {
+     fn ipv6net_new_assert_panics() {
+         let _ = Ipv6Net::new_assert(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 129);
+     }
++
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use hegel::generators::{self, Generator};
++    // The crate is `no_std` + alloc; `#[hegel::test]`'s generated code and the
++    // tests themselves need the string types in scope explicitly.
++    use alloc::string::{String, ToString};
++
++    /// Arbitrary IPv4 address bits, with boundary values boosted so that
++    /// conjunctions like "the range covers the whole address space" are
++    /// reachable within a default test run.
++    #[hegel::composite]
++    fn ipv4_addr_bits(tc: hegel::TestCase) -> u32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u32>(),
++            generators::sampled_from(vec![0u32, 1, u32::MAX - 1, u32::MAX]),
++        ))
++    }
++
++    #[hegel::composite]
++    fn ipv6_addr_bits(tc: hegel::TestCase) -> u128 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u128>(),
++            generators::sampled_from(vec![0u128, 1, u128::MAX - 1, u128::MAX]),
++        ))
++    }
++
++    #[hegel::composite]
++    fn ipv4_nets(tc: hegel::TestCase) -> Ipv4Net {
++        let addr = Ipv4Addr::from(tc.draw(ipv4_addr_bits()));
++        // Boost boundary prefix lengths; several code paths special-case
++        // prefix 0 and the maximum prefix.
++        let prefix_len = tc.draw(hegel::one_of!(
++            generators::integers::<u8>().max_value(32),
++            generators::sampled_from(vec![0u8, 1, 31, 32]),
++        ));
++        Ipv4Net::new(addr, prefix_len).unwrap()
++    }
++
++    #[hegel::composite]
++    fn ipv6_nets(tc: hegel::TestCase) -> Ipv6Net {
++        let addr = Ipv6Addr::from(tc.draw(ipv6_addr_bits()));
++        let prefix_len = tc.draw(hegel::one_of!(
++            generators::integers::<u8>().max_value(128),
++            generators::sampled_from(vec![0u8, 1, 127, 128]),
++        ));
++        Ipv6Net::new(addr, prefix_len).unwrap()
++    }
++
++    #[hegel::composite]
++    fn ip_nets(tc: hegel::TestCase) -> IpNet {
++        if tc.draw(generators::booleans()) {
++            IpNet::V4(tc.draw(ipv4_nets()))
++        } else {
++            IpNet::V6(tc.draw(ipv6_nets()))
++        }
++    }
++
++    // Reference implementation of "address is inside the network", used as an
++    // oracle: an address is in a network iff its first prefix_len bits agree
++    // with the network address' first prefix_len bits.
++    fn v4_net_has_addr(net: &Ipv4Net, addr: Ipv4Addr) -> bool {
++        let p = net.prefix_len();
++        p == 0 || (u32::from(addr) ^ u32::from(net.addr())) >> (32 - p as u32) == 0
++    }
++
++    fn v6_net_has_addr(net: &Ipv6Net, addr: Ipv6Addr) -> bool {
++        let p = net.prefix_len();
++        p == 0 || (u128::from(addr) ^ u128::from(net.addr())) >> (128 - p as u32) == 0
++    }
++
++    // Draw an Ipv4Net that is (by construction) a subset of `outer`.
++    fn draw_v4_net_inside(tc: &hegel::TestCase, outer: &Ipv4Net) -> Ipv4Net {
++        let bits = u32::from(outer.network())
++            | (tc.draw(ipv4_addr_bits()) & u32::from(outer.hostmask()));
++        let p = tc.draw(
++            generators::integers::<u8>()
++                .min_value(outer.prefix_len())
++                .max_value(32),
++        );
++        Ipv4Net::new(Ipv4Addr::from(bits), p).unwrap()
++    }
++
++    fn draw_v6_net_inside(tc: &hegel::TestCase, outer: &Ipv6Net) -> Ipv6Net {
++        let bits = u128::from(outer.network())
++            | (tc.draw(ipv6_addr_bits()) & u128::from(outer.hostmask()));
++        let p = tc.draw(
++            generators::integers::<u8>()
++                .min_value(outer.prefix_len())
++                .max_value(128),
++        );
++        Ipv6Net::new(Ipv6Addr::from(bits), p).unwrap()
++    }
++
++    // Strings that range from arbitrary unicode to near-miss CIDR notation to
++    // valid displayed networks.
++    #[hegel::composite]
++    fn cidr_like_strings(tc: hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::text().max_size(48),
++            generators::from_regex(r"[0-9a-fA-F:./]{0,32}").fullmatch(true),
++            ip_nets().map(|n| n.to_string()),
++        ))
++    }
++
++    #[hegel::test]
++    fn hegel_ipv4net_display_parse_roundtrip(tc: hegel::TestCase) {
++        let net = tc.draw(ipv4_nets());
++        let s = net.to_string();
++        assert_eq!(s.parse::<Ipv4Net>(), Ok(net), "roundtrip failed via {:?}", s);
++    }
++
++    #[hegel::test]
++    fn hegel_ipv6net_display_parse_roundtrip(tc: hegel::TestCase) {
++        let net = tc.draw(ipv6_nets());
++        let s = net.to_string();
++        assert_eq!(s.parse::<Ipv6Net>(), Ok(net), "roundtrip failed via {:?}", s);
++    }
++
++    #[hegel::test]
++    fn hegel_ipnet_display_parse_roundtrip(tc: hegel::TestCase) {
++        let net = tc.draw(ip_nets());
++        let s = net.to_string();
++        assert_eq!(s.parse::<IpNet>(), Ok(net), "roundtrip failed via {:?}", s);
++    }
++
++    #[hegel::test]
++    fn hegel_from_str_never_panics(tc: hegel::TestCase) {
++        let s = tc.draw(cidr_like_strings());
++        // Must return Err on garbage, never panic.
++        let _ = s.parse::<IpNet>();
++        let _ = s.parse::<Ipv4Net>();
++        let _ = s.parse::<Ipv6Net>();
++    }
++
++    #[hegel::test]
++    fn hegel_ipnet_parse_agrees_with_concrete_types(tc: hegel::TestCase) {
++        let s = tc.draw(cidr_like_strings());
++        let v4 = s.parse::<Ipv4Net>();
++        let v6 = s.parse::<Ipv6Net>();
++        match s.parse::<IpNet>() {
++            Ok(IpNet::V4(n)) => assert_eq!(Ok(n), v4),
++            Ok(IpNet::V6(n)) => {
++                assert!(v4.is_err(), "IpNet parsed {:?} as V6 but Ipv4Net accepts it", s);
++                assert_eq!(Ok(n), v6);
++            }
++            Err(_) => {
++                assert!(v4.is_err(), "IpNet rejected {:?} but Ipv4Net accepts it", s);
++                assert!(v6.is_err(), "IpNet rejected {:?} but Ipv6Net accepts it", s);
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_netmask_hostmask_are_complementary(tc: hegel::TestCase) {
++        let net = tc.draw(ip_nets());
++        match (net, net.netmask(), net.hostmask()) {
++            (IpNet::V4(n), IpAddr::V4(m), IpAddr::V4(h)) => {
++                let (m, h) = (u32::from(m), u32::from(h));
++                assert_eq!(m ^ h, u32::MAX);
++                assert_eq!(m.leading_ones(), n.prefix_len() as u32);
++                assert_eq!(m.count_ones(), n.prefix_len() as u32);
++            }
++            (IpNet::V6(n), IpAddr::V6(m), IpAddr::V6(h)) => {
++                let (m, h) = (u128::from(m), u128::from(h));
++                assert_eq!(m ^ h, u128::MAX);
++                assert_eq!(m.leading_ones(), n.prefix_len() as u32);
++                assert_eq!(m.count_ones(), n.prefix_len() as u32);
++            }
++            (net, m, h) => panic!("netmask/hostmask changed IP family: {} {} {}", net, m, h),
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_ipv4_hosts_count_and_endpoints_match_docs(tc: hegel::TestCase) {
++        let net = tc.draw(ipv4_nets());
++        let p = net.prefix_len();
++        // Documented: network and broadcast are excluded unless prefix_len >= 31.
++        let expected: u64 = match p {
++            32 => 1,
++            31 => 2,
++            _ => (1u64 << (32 - p)) - 2,
++        };
++        assert_eq!(net.hosts().count() as u64, expected);
++        let first = net.hosts().next();
++        let last = net.hosts().last();
++        if p < 31 {
++            assert_eq!(first, Some(net.network().saturating_add(1)));
++            assert_eq!(last, Some(net.broadcast().saturating_sub(1)));
++        } else {
++            assert_eq!(first, Some(net.network()));
++            assert_eq!(last, Some(net.broadcast()));
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_ipv6_hosts_count_and_endpoints_match_docs(tc: hegel::TestCase) {
++        let net = tc.draw(ipv6_nets());
++        let p = net.prefix_len();
++        // Documented: hosts() spans every address in the network for IPv6.
++        assert_eq!(net.hosts().next(), Some(net.network()));
++        assert_eq!(net.hosts().last(), Some(net.broadcast()));
++        // count() is documented to overflow/panic for ranges larger than what
++        // fits; only assert the count where it fits in usize. This bound
++        // protects the test, not the library's contract.
++        if p >= 65 {
++            let expected: u128 = 1u128 << (128 - p);
++            assert_eq!(net.hosts().count() as u128, expected);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_contains_addr_matches_prefix_bits_oracle(tc: hegel::TestCase) {
++        let net = tc.draw(ip_nets());
++        // Half the time snap the address inside the network (same family) so
++        // both outcomes of contains() are exercised; otherwise draw an
++        // arbitrary address of an arbitrary family.
++        let addr: IpAddr = if tc.draw(generators::booleans()) {
++            match net {
++                IpNet::V4(n) => IpAddr::V4(Ipv4Addr::from(
++                    u32::from(n.network()) | (tc.draw(ipv4_addr_bits()) & u32::from(n.hostmask())),
++                )),
++                IpNet::V6(n) => IpAddr::V6(Ipv6Addr::from(
++                    u128::from(n.network()) | (tc.draw(ipv6_addr_bits()) & u128::from(n.hostmask())),
++                )),
++            }
++        } else if tc.draw(generators::booleans()) {
++            IpAddr::V4(Ipv4Addr::from(tc.draw(ipv4_addr_bits())))
++        } else {
++            IpAddr::V6(Ipv6Addr::from(tc.draw(ipv6_addr_bits())))
++        };
++        let expected = match (net, addr) {
++            (IpNet::V4(n), IpAddr::V4(a)) => v4_net_has_addr(&n, a),
++            (IpNet::V6(n), IpAddr::V6(a)) => v6_net_has_addr(&n, a),
++            _ => false, // documented: cross-family contains is false
++        };
++        assert_eq!(net.contains(&addr), expected, "net {} addr {}", net, addr);
++    }
++
++    #[hegel::test]
++    fn hegel_contains_net_iff_longer_prefix_and_network_inside(tc: hegel::TestCase) {
++        // CIDR fact: b is a subset of a iff b's prefix is at least as long as
++        // a's and b's network address lies inside a.
++        let a4 = tc.draw(ipv4_nets());
++        let b4 = if tc.draw(generators::booleans()) {
++            tc.draw(ipv4_nets())
++        } else {
++            draw_v4_net_inside(&tc, &a4)
++        };
++        let expected = b4.prefix_len() >= a4.prefix_len() && v4_net_has_addr(&a4, b4.network());
++        assert_eq!(a4.contains(&b4), expected, "a {} b {}", a4, b4);
++
++        let a6 = tc.draw(ipv6_nets());
++        let b6 = if tc.draw(generators::booleans()) {
++            tc.draw(ipv6_nets())
++        } else {
++            draw_v6_net_inside(&tc, &a6)
++        };
++        let expected = b6.prefix_len() >= a6.prefix_len() && v6_net_has_addr(&a6, b6.network());
++        assert_eq!(a6.contains(&b6), expected, "a {} b {}", a6, b6);
++    }
++
++    #[hegel::test]
++    fn hegel_supernet_is_unique_immediate_parent(tc: hegel::TestCase) {
++        let net = tc.draw(ip_nets());
++        match net.supernet() {
++            None => assert_eq!(net.prefix_len(), 0, "only /0 has no supernet"),
++            Some(sup) => {
++                // A truncated net with prefix_len - 1 that contains `net` is
++                // unique, so these assertions pin supernet() completely.
++                assert!(net.prefix_len() > 0, "supernet of /0 must be None");
++                assert_eq!(sup.prefix_len(), net.prefix_len() - 1);
++                assert_eq!(sup.addr(), sup.network(), "supernet must be truncated");
++                assert!(sup.contains(&net), "supernet {} must contain {}", sup, net);
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_subnets_partition_their_network(tc: hegel::TestCase) {
++        // v4
++        let net = tc.draw(ipv4_nets());
++        let p = net.prefix_len();
++        // Keep at most 2^8 subnets per case. This bounds the test's memory and
++        // time, it is not a limit of the library.
++        let d = tc.draw(generators::integers::<u8>().max_value(8));
++        let np = min(p + d, 32);
++        let subs: Vec<Ipv4Net> = net.subnets(np).unwrap().collect();
++        assert_eq!(subs.len() as u64, 1u64 << (np - p));
++        let mut cursor = Some(u32::from(net.network()));
++        for s in &subs {
++            assert_eq!(s.prefix_len(), np);
++            assert_eq!(Some(u32::from(s.network())), cursor, "subnets must tile contiguously");
++            cursor = u32::from(s.broadcast()).checked_add(1);
++        }
++        assert_eq!(cursor, u32::from(net.broadcast()).checked_add(1));
++        if p > 0 {
++            assert_eq!(net.subnets(p - 1), Err(PrefixLenError));
++        }
++        assert_eq!(net.subnets(33), Err(PrefixLenError));
++
++        // v6
++        let net = tc.draw(ipv6_nets());
++        let p = net.prefix_len();
++        let d = tc.draw(generators::integers::<u8>().max_value(8));
++        let np = min(p + d, 128);
++        let subs: Vec<Ipv6Net> = net.subnets(np).unwrap().collect();
++        assert_eq!(subs.len() as u64, 1u64 << (np - p));
++        let mut cursor = Some(u128::from(net.network()));
++        for s in &subs {
++            assert_eq!(s.prefix_len(), np);
++            assert_eq!(Some(u128::from(s.network())), cursor, "subnets must tile contiguously");
++            cursor = u128::from(s.broadcast()).checked_add(1);
++        }
++        assert_eq!(cursor, u128::from(net.broadcast()).checked_add(1));
++        if p > 0 {
++            assert_eq!(net.subnets(p - 1), Err(PrefixLenError));
++        }
++        assert_eq!(net.subnets(129), Err(PrefixLenError));
++    }
++
++    // KNOWN BUG (kept failing deliberately, see HEGEL_REPORT.md): for ranges
++    // exactly one address short of the full space (e.g. [0.0.0.0,
++    // 255.255.255.254]) with min_prefix_len 0, next_ipv4_subnet's saturated
++    // `range` computation cannot distinguish 2^32 - 1 from 2^32 and emits
++    // `start/0`, covering addresses outside the requested range. The elevated
++    // case count makes the failure reproduce reliably in a default run.
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_ipv4_subnets_iterator_covers_exact_range(tc: hegel::TestCase) {
++        let start = tc.draw(ipv4_addr_bits());
++        // Two scenarios so the number of generated subnets stays bounded
++        // (protects test time, not a library limit): an arbitrary range with a
++        // small min_prefix_len, or a small range with any min_prefix_len.
++        let (end, min_prefix_len) = if tc.draw(generators::booleans()) {
++            (
++                tc.draw(ipv4_addr_bits()),
++                // Boost min_prefix_len == 0: next_ipv4_subnet special-cases it
++                // together with a saturating range computation.
++                tc.draw(hegel::one_of!(
++                    generators::just(0u8),
++                    generators::integers::<u8>().max_value(6),
++                )),
++            )
++        } else {
++            (
++                start.saturating_add(tc.draw(generators::integers::<u32>().max_value(4096))),
++                tc.draw(generators::integers::<u8>().max_value(32)),
++            )
++        };
++        let subnets: Vec<Ipv4Net> =
++            Ipv4Subnets::new(start.into(), end.into(), min_prefix_len).collect();
++        if start > end {
++            assert!(subnets.is_empty());
++            return;
++        }
++        let mut cursor = Some(start);
++        for s in &subnets {
++            assert!(
++                s.prefix_len() >= min_prefix_len,
++                "documented: prefix length not less than min_prefix_len ({} < {})",
++                s.prefix_len(),
++                min_prefix_len,
++            );
++            assert_eq!(
++                Some(u32::from(s.network())),
++                cursor,
++                "subnets must tile the range [{}, {}] contiguously, got {}",
++                Ipv4Addr::from(start),
++                Ipv4Addr::from(end),
++                s,
++            );
++            cursor = u32::from(s.broadcast()).checked_add(1);
++        }
++        assert_eq!(
++            cursor,
++            end.checked_add(1),
++            "subnets must cover the range [{}, {}] exactly through end",
++            Ipv4Addr::from(start),
++            Ipv4Addr::from(end),
++        );
++    }
++
++    // KNOWN BUG (kept failing deliberately, see HEGEL_REPORT.md): IPv6 analog
++    // of hegel_ipv4_subnets_iterator_covers_exact_range — next_ipv6_subnet has
++    // the same saturated-range special case.
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_ipv6_subnets_iterator_covers_exact_range(tc: hegel::TestCase) {
++        let start = tc.draw(ipv6_addr_bits());
++        let (end, min_prefix_len) = if tc.draw(generators::booleans()) {
++            (
++                tc.draw(ipv6_addr_bits()),
++                tc.draw(hegel::one_of!(
++                    generators::just(0u8),
++                    generators::integers::<u8>().max_value(6),
++                )),
++            )
++        } else {
++            (
++                start.saturating_add(tc.draw(generators::integers::<u128>().max_value(4096))),
++                tc.draw(generators::integers::<u8>().max_value(128)),
++            )
++        };
++        let subnets: Vec<Ipv6Net> =
++            Ipv6Subnets::new(start.into(), end.into(), min_prefix_len).collect();
++        if start > end {
++            assert!(subnets.is_empty());
++            return;
++        }
++        let mut cursor = Some(start);
++        for s in &subnets {
++            assert!(
++                s.prefix_len() >= min_prefix_len,
++                "documented: prefix length not less than min_prefix_len ({} < {})",
++                s.prefix_len(),
++                min_prefix_len,
++            );
++            assert_eq!(
++                Some(u128::from(s.network())),
++                cursor,
++                "subnets must tile the range [{}, {}] contiguously, got {}",
++                Ipv6Addr::from(start),
++                Ipv6Addr::from(end),
++                s,
++            );
++            cursor = u128::from(s.broadcast()).checked_add(1);
++        }
++        assert_eq!(
++            cursor,
++            end.checked_add(1),
++            "subnets must cover the range [{}, {}] exactly through end",
++            Ipv6Addr::from(start),
++            Ipv6Addr::from(end),
++        );
++    }
++
++    // KNOWN BUG (kept failing deliberately, see HEGEL_REPORT.md): aggregate()
++    // grows the address set for inputs whose broadcast is one below the top of
++    // the address space, e.g. aggregate([255.255.255.254/32]) ==
++    // [255.255.255.254/31], which adds 255.255.255.255. The half-open interval
++    // representation saturates at MAX, and `if end != MAX { end -= 1 }` then
++    // treats "ends at MAX - 1" as "ends at MAX". The elevated case count makes
++    // the failure reproduce reliably in a default run.
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_aggregate_preserves_address_membership(tc: hegel::TestCase) {
++        let nets: Vec<IpNet> = tc.draw(generators::vecs(ip_nets()).max_size(8));
++        let aggs = IpNet::aggregate(&nets);
++        for a in &aggs {
++            assert_eq!(a.addr(), a.network(), "aggregate returned non-truncated net {}", a);
++        }
++        // Membership must be preserved exactly. Probe a few arbitrary
++        // addresses plus the boundaries (and one-past-boundaries) of every
++        // input net, where off-by-one bugs live.
++        let mut candidates: Vec<IpAddr> = Vec::new();
++        for _ in 0..4 {
++            candidates.push(if tc.draw(generators::booleans()) {
++                IpAddr::V4(Ipv4Addr::from(tc.draw(ipv4_addr_bits())))
++            } else {
++                IpAddr::V6(Ipv6Addr::from(tc.draw(ipv6_addr_bits())))
++            });
++        }
++        for n in &nets {
++            match n {
++                IpNet::V4(n) => {
++                    let lo = u32::from(n.network());
++                    let hi = u32::from(n.broadcast());
++                    for bits in [lo.wrapping_sub(1), lo, hi, hi.wrapping_add(1)] {
++                        candidates.push(IpAddr::V4(Ipv4Addr::from(bits)));
++                    }
++                }
++                IpNet::V6(n) => {
++                    let lo = u128::from(n.network());
++                    let hi = u128::from(n.broadcast());
++                    for bits in [lo.wrapping_sub(1), lo, hi, hi.wrapping_add(1)] {
++                        candidates.push(IpAddr::V6(Ipv6Addr::from(bits)));
++                    }
++                }
++            }
++        }
++        for addr in candidates {
++            let in_inputs = nets.iter().any(|n| n.contains(&addr));
++            let in_aggs = aggs.iter().any(|n| n.contains(&addr));
++            assert_eq!(
++                in_inputs, in_aggs,
++                "aggregate changed membership of {} (inputs {:?} -> aggregated {:?})",
++                addr, nets, aggs,
++            );
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_ord_consistent_with_contains(tc: hegel::TestCase) {
++        // For truncated networks, a strict superset must sort strictly before
++        // its subsets (Ord is derived on (addr, prefix_len)).
++        let a = tc.draw(ip_nets());
++        let b = if tc.draw(generators::booleans()) {
++            tc.draw(ip_nets())
++        } else {
++            // Boost the contained case, otherwise contains() is nearly always false.
++            match a {
++                IpNet::V4(n) => IpNet::V4(draw_v4_net_inside(&tc, &n)),
++                IpNet::V6(n) => IpNet::V6(draw_v6_net_inside(&tc, &n)),
++            }
++        };
++        let (a, b) = (a.trunc(), b.trunc());
++        if a != b {
++            if a.contains(&b) {
++                assert!(a < b, "{} contains {} but does not sort before it", a, b);
++            }
++            if b.contains(&a) {
++                assert!(b < a, "{} contains {} but does not sort before it", b, a);
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_trunc_preserves_range_and_is_idempotent(tc: hegel::TestCase) {
++        let net = tc.draw(ip_nets());
++        let t = net.trunc();
++        assert_eq!(t.prefix_len(), net.prefix_len());
++        assert_eq!(t.addr(), net.network());
++        assert_eq!(t.network(), net.network());
++        assert_eq!(t.broadcast(), net.broadcast());
++        assert_eq!(t.trunc(), t, "trunc must be idempotent");
++    }
+ }
+diff --git a/src/mask.rs b/src/mask.rs
+index 761c031..3f75003 100644
+--- a/src/mask.rs
++++ b/src/mask.rs
+@@ -128,4 +128,58 @@ mod tests {
+             Ipv6Net::with_netmask(addr, mask).unwrap_err();
+         }
+     }
++
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use hegel::generators;
++    // The crate is `no_std` + alloc; `#[hegel::test]`'s generated code needs
++    // `to_string` in scope explicitly.
++    use alloc::string::ToString;
++
++    #[hegel::test]
++    fn hegel_prefix_netmask_roundtrip(tc: hegel::TestCase) {
++        // v4: build the mask independently of the library, then convert back.
++        let p = tc.draw(generators::integers::<u8>().max_value(32));
++        let mask = if p == 0 { 0u32 } else { u32::MAX << (32 - p as u32) };
++        let mask = Ipv4Addr::from(mask);
++        assert_eq!(ipv4_mask_to_prefix(mask), Ok(p));
++        let addr = Ipv4Addr::from(tc.draw(generators::integers::<u32>()));
++        assert_eq!(Ipv4Net::with_netmask(addr, mask), Ipv4Net::new(addr, p));
++
++        // v6
++        let p = tc.draw(generators::integers::<u8>().max_value(128));
++        let mask = if p == 0 { 0u128 } else { u128::MAX << (128 - p as u32) };
++        let mask = Ipv6Addr::from(mask);
++        assert_eq!(ipv6_mask_to_prefix(mask), Ok(p));
++        let addr = Ipv6Addr::from(tc.draw(generators::integers::<u128>()));
++        assert_eq!(Ipv6Net::with_netmask(addr, mask), Ipv6Net::new(addr, p));
++    }
++
++    #[hegel::test]
++    fn hegel_mask_to_prefix_accepts_exactly_contiguous_masks(tc: hegel::TestCase) {
++        // A valid netmask is exactly a (possibly empty) run of ones followed
++        // by zeros. Independent contiguity check: leading ones plus trailing
++        // zeros span the whole word.
++        let m = tc.draw(generators::integers::<u32>());
++        let contiguous = m.leading_ones() + m.trailing_zeros() == 32;
++        match ip_mask_to_prefix(IpAddr::V4(Ipv4Addr::from(m))) {
++            Ok(p) => {
++                assert!(contiguous, "accepted non-contiguous mask {:#010x}", m);
++                assert_eq!(p as u32, m.leading_ones());
++            }
++            Err(_) => assert!(!contiguous, "rejected valid mask {:#010x}", m),
++        }
++
++        let m = tc.draw(generators::integers::<u128>());
++        let contiguous = m.leading_ones() + m.trailing_zeros() == 128;
++        match ip_mask_to_prefix(IpAddr::V6(Ipv6Addr::from(m))) {
++            Ok(p) => {
++                assert!(contiguous, "accepted non-contiguous mask {:#034x}", m);
++                assert_eq!(p as u32, m.leading_ones());
++            }
++            Err(_) => assert!(!contiguous, "rejected valid mask {:#034x}", m),
++        }
++    }
+ }

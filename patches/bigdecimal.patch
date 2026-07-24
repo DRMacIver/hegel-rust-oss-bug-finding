@@ -1,0 +1,1128 @@
+diff --git a/.gitignore b/.gitignore
+index 9484493..1ad04f1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,3 +22,5 @@ notebooks/
+ proptest-regressions
+ 
+ .mise.toml
++
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 12d168c..8233ec4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,8 @@ serde = { version = "1.0", optional = true, default-features = false }
+ serde_json = { version = "1.0", optional = true, default-features = false, features = ["alloc", "arbitrary_precision"]}
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
++num-rational = "0.4.2"
+ paste = "1"
+ serde_test = "<1.0.176"
+ siphasher = { version = "0.3.10", default-features = false }
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..2e2aaf7
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,255 @@
++# Hegel Property-Based Testing Report — `bigdecimal`
++
++Hegel version: `hegeltest` 0.28.2. All tests run with `cargo test` (default
++features, debug profile). 32 hegel tests were added across five existing test
++modules; two fail, both on suspected genuine library bugs (details below).
++
++## Properties tested
++
++| # | Property | Test (module :: name) | Evidence |
++|---|----------|----------------------|----------|
++| 1 | Parsing never panics on arbitrary input (mixed unicode + "almost numeric" strings) | `impl_trait_from_str::tests::hegel_props::parsing_arbitrary_strings_never_panics` | `FromStr::from_str` returns `Result`; existing unit tests expect `Err` values (`case_bad_string_*`) |
++| 2 | `Display` → `parse` round-trips (full i128 coefficient, full i64 scale) | `impl_fmt::test::hegel_props::display_then_parse_roundtrips` | unit test `test_parse_roundtrip`; gated proptest `roudtrip_to_str_and_back_*` |
++| 3 | `{:e}` (LowerExp) → `parse` round-trips | `impl_fmt::test::hegel_props::lower_exp_then_parse_roundtrips` | LowerExp impl shares the exponential formatter; parser accepts `e` notation |
++| 4 | `to_scientific_notation()` → `parse` round-trips | `impl_fmt::test::hegel_props::scientific_notation_then_parse_roundtrips` | gated proptest `scientific_notation_roundtrip` (broadened from f64-derived values to arbitrary decimals) |
++| 5 | `to_engineering_notation()` → `parse` round-trips | `impl_fmt::test::hegel_props::engineering_notation_then_parse_roundtrips` | gated proptest `engineering_notation_roundtrip` (broadened) |
++| 6 | `to_plain_string()` → `parse` round-trips (scale ±10 000; docs warn plain form of huge exponents OOMs) | `impl_fmt::test::hegel_props::plain_string_then_parse_roundtrips` | `to_plain_string` doc examples + its `# Panics` note |
++| 7 | Formatting a float-derived decimal with requested precision matches `std`'s f64 formatting exactly | `impl_fmt::test::hegel_props::float_formatting_with_precision_matches_f64` | port of gated proptest `float_formatting` (32 000 cases upstream) |
++| 8 | `Ord::cmp` agrees with exact rational arithmetic (`BigRational` oracle) | `impl_cmp::test::hegel_props::cmp_agrees_with_rational_oracle` | `Ord` doc-comment: complete ordering by numeric value |
++| 9 | `PartialEq` (separate implementation from `Ord`) agrees with rational equality; half the pairs made value-equal via scale padding | `impl_cmp::test::hegel_props::eq_agrees_with_rational_oracle` | unit tests `test_eq`, `test_hash_equal` treat different representations as equal |
++| 10 | `cmp` matches f64's ordering for float-derived decimals | `impl_cmp::test::hegel_props::cmp_matches_f64` | port of gated proptest `cmp_matches_f64` |
++| 11 | `normalized()` preserves the value (generator biased toward trailing-zero coefficients and scales near `i64::MIN`) | `bigdecimal_tests::hegel_props::normalized_preserves_value` | `normalized` doc + `normalize` unit tests, all value-preserving. **FAILS — suspected bug 1** |
++| 12 | `normalized()` output is canonical: no trailing zeros, zero is `0e0`, idempotent at representation level | `bigdecimal_tests::hegel_props::normalized_is_canonical` | `normalize` unit tests assert exact `(int_val, scale)` pairs |
++| 13 | Addition commutes | `bigdecimal_tests::hegel_props::addition_commutes` | exact decimal arithmetic (README) |
++| 14 | `(a + b) - b == a` (add/sub exact inverse) | `bigdecimal_tests::hegel_props::add_then_sub_roundtrips` | add/sub align scales and never round (impl_ops_add / impl_ops_sub) |
++| 15 | Multiplication agrees with exact rational oracle | `bigdecimal_tests::hegel_props::multiplication_agrees_with_rational_oracle` | multiplication is exact: scales add, coefficients multiply |
++| 16 | `square() == n * n` (value equality; scale ±i64::MAX/2 so result scale fits) | `bigdecimal_tests::hegel_props::square_equals_self_times_self` | `square` doc: "full result of the squaring operation"; gated proptest `square` (f32-only upstream, broadened) |
++| 17 | `cube() == n * n * n` (scale ±i64::MAX/3) | `bigdecimal_tests::hegel_props::cube_equals_self_times_self_times_self` | `cube` doc + `test_cube` unit tests |
++| 18 | `double()` and `half()` are mutual inverses | `bigdecimal_tests::hegel_props::double_and_half_are_inverses` | doc-comments "Multiply decimal by 2" / "Divide decimal by 2" |
++| 19 | `is_integer()` ⇔ truncation to scale 0 does not change the value | `bigdecimal_tests::hegel_props::is_integer_agrees_with_truncation` | `is_integer` doc + `RoundingMode::Down` documented as truncation |
++| 20 | `sqrt()` of a negative decimal is `None` | `bigdecimal_tests::hegel_props::sqrt_of_negative_is_none` | `sqrt` doc: "If the value is < 0, None is returned" |
++| 21 | `sqrt(x)²` is within `x·1e-95` of `x` (100-digit default precision) | `bigdecimal_tests::hegel_props::sqrt_squared_is_close_to_original` | `sqrt` doc: default precision 100 digits |
++| 22 | Equal values (same value, padded scale) have equal hashes | `bigdecimal_tests::hegel_props::equal_values_have_equal_hashes` | `Hash` impl canonicalizes; unit tests `test_hash_equal`, `test_hash_equal_scale` |
++| 23 | All `+` overloads (val/ref/assign, either side) agree | `bigdecimal_tests::hegel_props::add_overloads_agree` | port of gated proptest `add_ref_*` (i128 subsumes the smaller int types) |
++| 24 | `-` overloads agree, `n - d == -(d - n)` | `bigdecimal_tests::hegel_props::sub_overloads_agree` | port of gated proptest `sub_*` |
++| 25 | All `*` overloads agree; multiplication commutes with negation | `bigdecimal_tests::hegel_props::mul_overloads_agree` | port of gated proptest `mul_*` |
++| 26 | `/` overloads agree; quotient×divisor within 1e-60 of numerator (nonzero divisor: `Div` documents panic by `panic!("Division by zero")`) | `bigdecimal_tests::hegel_props::div_overloads_agree_and_multiply_back` | port of gated proptest `div_*` |
++| 27 | `d /= n` behaves exactly like `d = d / n` for every integer divisor **including zero** (same value or both panic) | `bigdecimal_tests::hegel_props::div_assign_agrees_with_div_for_any_divisor` | Rust operator convention for `DivAssign`; the crate's own gated proptests assert Div/OpAssign agreement for other ops. **FAILS — suspected bug 2** |
++| 28 | Float `/` overloads agree (including non-normal floats, which all overloads short-circuit to zero) | `bigdecimal_tests::hegel_props::float_div_overloads_agree` | port of gated proptest `div_f64` |
++| 29 | `Floor`/`Ceiling` rounding brackets the value; differ by ≤ 1 ulp | `test_with_scale_round::hegel_props::floor_and_ceiling_bracket_the_value` | `RoundingMode` docs: Ceiling "Towards +∞", Floor "Towards -∞" |
++| 30 | Every rounding mode: result has requested scale; error < 1 ulp | `test_with_scale_round::hegel_props::rounding_error_is_less_than_one_ulp` | `with_scale_round` doc + all seven `RoundingMode` variant docs |
++| 31 | Rounding to a *larger* scale is exact for every mode | `test_with_scale_round::hegel_props::rounding_to_larger_scale_is_exact` | `Ordering::Greater` branch only pads zeros; `with_scale` doc |
++| 32 | **Stateful model test**: random op sequences (`+=`, `-=`, `*=`, `square`, `neg`, `abs`, `double`, `half`, `normalized`, scale padding, scientific-notation reparse) against a `num_rational::BigRational` model; invariants: exact value equality and `is_integer()` agreement, checked after every rule | `bigdecimal_tests::hegel_model::bigdecimal_agrees_with_rational_model` | all listed ops are exact per docs/impl; `BigRational` is an independent known-good exact-arithmetic oracle |
++
++Placement follows the skill: tests were added to the existing test
++modules/files (`lib.tests.rs`, `lib.tests.with_scale_round.rs`, and the
++`#[cfg(test)]` modules of `impl_fmt.rs`, `impl_cmp.rs`,
++`impl_trait_from_str.rs`), not to new files. `num-rational` was added as a
++dev-dependency to serve as the independent oracle.
++
++## Test results
++
++`cargo test` final run: **1310 tests, 1308 passed, 2 failed** (the 1278
++pre-existing tests all still pass; of the 32 hegel tests, 30 pass, 2 fail).
++
++Failing (kept in place per instructions — suspected genuine library bugs):
++
++```
++---- bigdecimal_tests::hegel_props::div_assign_agrees_with_div_for_any_divisor stdout ----
++let m = 0;
++let e = 0;
++let n = 0;
++panicked at src/lib.tests.rs: 0 / 0 panicked but the /= overload gave 0
++
++---- bigdecimal_tests::hegel_props::normalized_preserves_value stdout ----
++let coefficient = 1;
++let trailing_zeros = 1;
++let scale = -9223372036854775808;
++panicked at src/lib.rs:932:21: attempt to subtract with overflow
++```
++
++All other 30 hegel tests pass:
++`parsing_arbitrary_strings_never_panics`, `display_then_parse_roundtrips`,
++`lower_exp_then_parse_roundtrips`, `scientific_notation_then_parse_roundtrips`,
++`engineering_notation_then_parse_roundtrips`, `plain_string_then_parse_roundtrips`,
++`float_formatting_with_precision_matches_f64`, `cmp_agrees_with_rational_oracle`,
++`eq_agrees_with_rational_oracle`, `cmp_matches_f64`, `normalized_is_canonical`,
++`addition_commutes`, `add_then_sub_roundtrips`,
++`multiplication_agrees_with_rational_oracle`, `square_equals_self_times_self`,
++`cube_equals_self_times_self_times_self`, `double_and_half_are_inverses`,
++`is_integer_agrees_with_truncation`, `sqrt_of_negative_is_none`,
++`sqrt_squared_is_close_to_original`, `equal_values_have_equal_hashes`,
++`add_overloads_agree`, `sub_overloads_agree`, `mul_overloads_agree`,
++`div_overloads_agree_and_multiply_back`, `float_div_overloads_agree`,
++`floor_and_ceiling_bracket_the_value`, `rounding_error_is_less_than_one_ulp`,
++`rounding_to_larger_scale_is_exact`, `bigdecimal_agrees_with_rational_model`.
++
++## Suspected bugs
++
++### Bug 1: `normalized()` overflows the scale — debug panic, silently *wrong value* in release
++
++- **Minimal counterexample (hegel):** `coefficient = 1`, `trailing_zeros = 1`
++  (i.e. `int_val = 10`), `scale = -9223372036854775808` — that is,
++  `BigDecimal::new(10.into(), i64::MIN).normalized()`.
++- **Code path:** `src/lib.rs:932`, in `BigDecimal::normalized()`:
++  ```rust
++  let scale = self.scale - trailing_count as i64;
++  ```
++  Removing a trailing zero decrements the scale; at `scale == i64::MIN` the
++  subtraction overflows. Debug builds panic (`attempt to subtract with
++  overflow`). In **release** builds it wraps: I verified that
++  `BigDecimal::new(10.into(), i64::MIN).normalized()` returns coefficient 1
++  with scale `9223372036854775807` (`i64::MAX`) — i.e. it turns
++  `10e+9223372036854775808` (= `1e+9223372036854775809`) into
++  `1e-9223372036854775807`, a silently wrong value, and
++  `n.normalized() == n` is false.
++- **Why a library bug, not a test bug:** the constructor accepts any `i64`
++  scale, `normalized()` is documented as value-preserving and has no
++  documented domain restriction, and the same value formats/round-trips fine
++  through every other API I tested. The library elsewhere guards this exact
++  kind of overflow (e.g. `with_precision_round` uses `checked_add` +
++  `expect("precision overflow")`). The wrap-to-wrong-value behavior in
++  release is strictly worse than a panic.
++- Note: the initial 100-case run with a uniform generator did **not** find
++  this (it needs coefficient ≡ 0 mod 10 *and* scale within `trailing_count`
++  of `i64::MIN`); I found it by reading `normalized()` during step 2 of the
++  skill workflow, confirmed it in a scratch program, then biased the
++  generator toward trailing-zero coefficients and near-MIN scales so the
++  suite reproduces and shrinks it. The test is left failing.
++
++### Bug 2: `d /= 0` silently sets `d` to zero, while `d / 0` panics
++
++- **Minimal counterexample (hegel):** `m = 0`, `e = 0`, `n = 0` — i.e.
++  `BigDecimal::zero() / 0i128` panics `"Division by zero"` while
++  `{ let mut a = BigDecimal::zero(); a /= 0i128; }` succeeds and leaves `a == 0`.
++  (Holds for any `d`, not just zero; hegel shrank to the zero decimal.)
++- **Code path:** `src/impl_ops.rs:296-306` (`IMPL:DIV-ASSIGN` arm of
++  `impl_div_for_primitive!`):
++  ```rust
++  fn div_assign(&mut self, rhs: $t) {
++      if rhs.is_zero() {
++          *self = BigDecimal::zero()
++      } ...
++  ```
++  versus `src/impl_ops_div.rs:10` (`Div`): `panic!("Division by zero")`, which
++  is what `Div<$t>` reaches via `self / BigDecimal::from(denom)`.
++- **Why a library bug:** Rust's operator contract is that `a /= b` is the
++  assignment form of `a = a / b`; here one form panics and the other silently
++  produces the mathematically meaningless result `x/0 == 0`. Whichever
++  behavior is intended, the two overloads of the *same operator* disagree.
++  (The float overloads, by contrast, consistently return zero for non-normal
++  divisors in *all* forms, so the float port of the original proptest passes.)
++
++### Additional observation (from code reading, not from a failing test)
++
++`Hash for BigDecimal` (`src/lib.rs:1072`) computes
++`"0".repeat(self.scale.abs() as usize)` for negative scales: hashing a value
++with scale `i64::MIN` would panic (`abs()` overflow), and any large-magnitude
++negative scale (e.g. `-1e12`) attempts to allocate that many bytes. I did not
++encode this as a test because the failure mode is an OOM/abort rather than a
++catchable assertion; the hash-consistency property is therefore tested with
++scales bounded to ±1000 (+ up to 100 padding).
++
++## Unsound properties abandoned
++
++- **Representation-level equality for `square()`/`cube()` vs repeated
++  multiplication.** The docs say "no rounding or truncating of digits; this
++  is the full result", which suggests `square()` and `n * n` should agree in
++  `(int_val, scale)`, but the `is_one_quickcheck() == Some(true)` fast path
++  returns `self.clone()` for values like `1.00` (scale 2), while `n * n`
++  yields scale 4. The existing unit test `test_square` (`"1.00" => "1.00"`)
++  blesses the fast path, so I weakened the assertion to value equality before
++  ever running it. (A buggy `is_one_quickcheck` false-positive is still
++  caught, because then `square()` would return a wrong *value*.)
++- **Float formatting differential at zero.** `format!("{:.2}", -0.0_f64)` is
++  `"-0.00"` but BigDecimal has no signed zero, so the f64-differential
++  formatting property excludes `f == 0.0` (`tc.assume`). This is a domain
++  mismatch, not a bug.
++- **"All division overloads panic on zero divisor."** First formulation of
++  what became Bug 2; abandoned as stated because the code never promises the
++  panic for `DivAssign` — reframed as the sounder consistency property
++  `div_assign_agrees_with_div_for_any_divisor` (which then failed, exposing
++  the inconsistency).
++- **Unbounded scales in several passing tests.** Not abandoned but
++  deliberately constrained, documented in each test: addition/subtraction/
++  rational-oracle/hash/rounding tests bound `|scale|` (300–10 000) because
++  aligning scales or building the `10^scale` oracle denominator materializes
++  `|scale|` digits — with `scale ~ 1e18` the *test* (or the oracle) dies of
++  OOM, not the library. Where a hazard is the library's own documented
++  limitation (`to_plain_string`), the doc warning is cited instead.
++
++## Skill feedback
++
++Overall the skill worked well — the workflow (read source → existing tests →
++port gated proptests → broaden) directly produced the two failures above.
++Specific friction points:
++
++1. **Edition 2015 is not covered.** This crate uses `edition = "2015"`, where
++   `use hegel::...` fails with `unresolved import` unless you add
++   `extern crate hegel;` at the crate root. Neither SKILL.md nor
++   `rust/reference.md` mentions this. Worse, the crate name and lib name
++   differ: the reference says `cargo add --dev hegeltest` but all code uses
++   `hegel::` paths — nothing states "package `hegeltest` exposes lib target
++   `hegel`", which is exactly what you need to know to write the
++   `extern crate` line. I confirmed it via `cargo metadata`. A one-line note
++   in Setup ("the `hegeltest` package's library is named `hegel`; edition-2015
++   crates need `#[cfg(test)] extern crate hegel;`") would have saved a round
++   trip. (Everything else — `#[hegel::test]`, `#[hegel::composite]`,
++   `hegel::one_of!`, `#[hegel::state_machine]` — worked unmodified in
++   edition 2015.)
++2. **Generator gap: arbitrary-precision integers.** The crate under test is
++   built on `num_bigint::BigInt`, but there is no bignum generator and
++   `extras.md` only covers chrono/jiff/serde_json/rand. I composed
++   `BigInt` from `i128` draws (readable counterexamples, but caps
++   coefficients at 128 bits and under-explores >39-digit numbers). Either a
++   bignum generator, or a reference recipe ("build big integers from a drawn
++   `Vec<u32>` of digits / a digit string"), would help every num-bigint-based
++   crate.
++3. **Joint boundary conditions need help.** "Edge Cases Are the Point"
++   promises MIN/MAX/0 coverage, and single draws do hit them — but Bug 1
++   required a *conjunction* (coefficient divisible by 10 AND scale within a
++   few units of `i64::MIN`), which 100 uniform cases never produced; the test
++   passed until I biased the generator (`one_of!` of full-range and a
++   near-MIN band, plus multiplying in 0–3 trailing zeros). Suggested skill
++   addition: when a property guards a boundary computed from *multiple*
++   draws, add a boundary-weighted `one_of!` branch per ingredient (or raise
++   `test_cases`); don't assume the engine will find multi-way conjunctions.
++4. **Memory-exhaustion vs "Start With No Bounds".** SKILL.md's Common
++   Mistake #7 covers test-code *overflow* (wrapping arithmetic) but not
++   test-code/oracle *allocation blowup*. For decimal types, drawing
++   `scale: i64` unbounded is correct for formatting round-trips (they passed
++   at full range) but fatal for anything that aligns scales (`a + b`,
++   rational oracles, `is_integer` with its `ten_to_the(scale)`), where the
++   test process OOMs before any assertion runs. I repeatedly had to decide
++   "is this bound protecting the library's contract or my test's memory?" —
++   a paragraph acknowledging allocation hazards (and recommending
++   documenting each bound with which of the two it is, as I did) would make
++   Generator Discipline easier to follow faithfully.
++5. **`draw` output in counterexamples is excellent** — the failure output
++   (`let m = 0; let e = 0; let n = 0;`) is directly pasteable, and shrinking
++   worked well (both failures shrank to canonical minimal cases). No special
++   `Debug` gymnastics needed.
++6. **Stateful testing reference was accurate.** `#[hegel::state_machine]`,
++   `#[rule]`, `#[invariant]`, `tc.assume()` inside rules (to gate the
++   `mul`/`square` growth guard), and drawing from a `#[hegel::composite]`
++   generator inside a rule all worked first try. One thing the reference
++   doesn't show: rules that *replace* state (`self.subject =
++   self.subject.normalized()`) alongside a reference model — a worked
++   "numeric type vs exact oracle" example (as opposed to container vs
++   container) might be worth adding, since it's a common shape for math
++   crates.
++7. **porting.md fit, with one wrinkle.** The strategy table and checklist
++   mapped 1:1 onto this crate's proptests. But step 1 ("Remove the old
++   dependency") didn't cleanly apply: here proptest is already commented out
++   in `Cargo.toml` and the tests are gated behind a custom
++   `--cfg property_tests` plus helper scripts. I ported the properties into
++   always-compiled hegel tests and left the gated proptest code untouched;
++   guidance for "PBTs gated behind non-default cfg/features" (port them, but
++   should the originals be deleted?) would remove the judgment call.
++8. **Trivial doc nit:** in `rust/reference.md` the Setup code fence is
++   malformed — `cargo add --dev hegeltest``` ` (closing fence glued to the
++   command). Harmless but it renders oddly.
++9. **Compile errors hit:** exactly one, and it was my code, not hegel's:
++   `assert!(!(int_val % 10).is_zero())` → `E0282 type annotations needed`
++   (num-bigint's polymorphic `Rem`); fixed with `BigInt::from(10)`. The
++   hegel macros themselves produced no confusing errors at any point.
+diff --git a/src/impl_cmp.rs b/src/impl_cmp.rs
+index b75697d..8f03037 100644
+--- a/src/impl_cmp.rs
++++ b/src/impl_cmp.rs
+@@ -552,4 +552,79 @@ mod test {
+             }
+         }
+     }
++
++    // Property-based tests (hegel)
++    mod hegel_props {
++        use super::*;
++        use hegel::generators::{self, Generator};
++        use num_rational::BigRational;
++
++        /// Exact value of a BigDecimal as a rational number (independent oracle).
++        fn rational_of(d: &BigDecimal) -> BigRational {
++            let (int_val, scale) = d.as_bigint_and_exponent();
++            if scale >= 0 {
++                BigRational::new(int_val, Pow::pow(BigInt::from(10), scale as u64))
++            } else {
++                let numer = int_val * Pow::pow(BigInt::from(10), scale.unsigned_abs());
++                BigRational::new(numer, BigInt::one())
++            }
++        }
++
++        /// Arbitrary BigDecimal. Scale is bounded to ±5000 so the exact
++        /// rational oracle (denominator 10^scale) stays cheap to build;
++        /// the ordering code itself is exercised with large scale
++        /// differences within that range.
++        #[hegel::composite]
++        fn bigdecimals(tc: hegel::TestCase) -> BigDecimal {
++            let int_val = tc.draw(generators::integers::<i128>());
++            let scale = tc.draw(generators::integers::<i64>().min_value(-5000).max_value(5000));
++            BigDecimal::new(int_val.into(), scale)
++        }
++
++        /// Property: `Ord::cmp` orders decimals the same way exact
++        /// rational arithmetic does.
++        /// Evidence: Ord doc-comment example ("Complete ordering
++        /// implementation for BigDecimal") — comparisons are by numeric
++        /// value, independent of representation.
++        #[hegel::test]
++        fn cmp_agrees_with_rational_oracle(tc: hegel::TestCase) {
++            let a = tc.draw(bigdecimals());
++            let b = tc.draw(bigdecimals());
++            assert_eq!(a.cmp(&b), rational_of(&a).cmp(&rational_of(&b)));
++        }
++
++        /// Property: `PartialEq` (a separate implementation from Ord)
++        /// agrees with exact rational equality.
++        /// Evidence: unit tests `test_eq` / `test_hash_equal` compare
++        /// different representations of the same value as equal.
++        /// Half of the generated pairs are made value-equal (scale
++        /// padding) so equality is exercised, not just inequality.
++        #[hegel::test]
++        fn eq_agrees_with_rational_oracle(tc: hegel::TestCase) {
++            let a = tc.draw(bigdecimals());
++            let b = if tc.draw(generators::booleans()) {
++                let extra = tc.draw(generators::integers::<i64>().min_value(0).max_value(100));
++                a.with_scale(a.fractional_digit_count() + extra)
++            } else {
++                tc.draw(bigdecimals())
++            };
++            assert_eq!(a == b, rational_of(&a) == rational_of(&b));
++        }
++
++        /// Property: comparison of float-derived decimals matches f64's
++        /// own ordering (floats convert exactly via from_f64).
++        /// Ported from the (property_tests-gated) proptest `cmp_matches_f64`.
++        #[hegel::test(test_cases = 500)]
++        fn cmp_matches_f64(tc: hegel::TestCase) {
++            let float_gen = || generators::floats::<f64>().allow_nan(false).allow_infinity(false);
++            let f = tc.draw(float_gen());
++            let g = tc.draw(float_gen());
++
++            let a = BigDecimal::from_f64(f).unwrap();
++            let b = BigDecimal::from_f64(g).unwrap();
++
++            let expected = PartialOrd::partial_cmp(&f, &g).unwrap();
++            assert_eq!(expected, a.cmp(&b));
++        }
++    }
+ }
+diff --git a/src/impl_fmt.rs b/src/impl_fmt.rs
+index 94dd690..a53a2c0 100644
+--- a/src/impl_fmt.rs
++++ b/src/impl_fmt.rs
+@@ -1449,6 +1449,102 @@ mod test {
+         impl_case!(case_413e99999999999997 : "413e99999999999997" => "4.13e99999999999999");
+         // impl_case!(case_413e99999999999997 : "413e99999999999997" => "4.13e99999999999999");
+     }
++
++    // Property-based tests (hegel)
++    mod hegel_props {
++        use super::*;
++        use hegel::generators::{self, Generator};
++
++        /// Arbitrary BigDecimal: full-range i128 coefficient, full-range
++        /// i64 scale. All the string formats under test emit huge exponents
++        /// in scientific/e-notation, so extreme scales are safe to format.
++        #[hegel::composite]
++        fn bigdecimals(tc: hegel::TestCase) -> BigDecimal {
++            let int_val = tc.draw(generators::integers::<i128>());
++            let scale = tc.draw(generators::integers::<i64>());
++            BigDecimal::new(int_val.into(), scale)
++        }
++
++        /// Property: `Display` output re-parses to an equal value.
++        /// Evidence: existing unit test `test_parse_roundtrip` and the
++        /// (property_tests-gated) proptest `roudtrip_to_str_and_back_*`.
++        #[hegel::test]
++        fn display_then_parse_roundtrips(tc: hegel::TestCase) {
++            let n = tc.draw(bigdecimals());
++            let s = n.to_string();
++            let parsed: BigDecimal = s.parse().unwrap_or_else(|e| panic!("could not re-parse {:?}: {:?}", s, e));
++            assert_eq!(parsed, n, "roundtrip through {:?}", s);
++        }
++
++        /// Property: `{:e}` (LowerExp) output re-parses to an equal value.
++        /// Evidence: LowerExp is implemented via the same exponential
++        /// formatter used by Display for extreme values; parser accepts
++        /// `e` exponents (impl_num::from_str_radix).
++        #[hegel::test]
++        fn lower_exp_then_parse_roundtrips(tc: hegel::TestCase) {
++            let n = tc.draw(bigdecimals());
++            let s = format!("{:e}", n);
++            let parsed: BigDecimal = s.parse().unwrap_or_else(|e| panic!("could not re-parse {:?}: {:?}", s, e));
++            assert_eq!(parsed, n, "roundtrip through {:?}", s);
++        }
++
++        /// Property: `to_scientific_notation()` output re-parses to an
++        /// equal value.
++        /// Evidence: existing (property_tests-gated) proptest
++        /// `scientific_notation_roundtrip`, broadened beyond f64 values.
++        #[hegel::test]
++        fn scientific_notation_then_parse_roundtrips(tc: hegel::TestCase) {
++            let n = tc.draw(bigdecimals());
++            let s = n.to_scientific_notation();
++            let parsed: BigDecimal = s.parse().unwrap_or_else(|e| panic!("could not re-parse {:?}: {:?}", s, e));
++            assert_eq!(parsed, n, "roundtrip through {:?}", s);
++        }
++
++        /// Property: `to_engineering_notation()` output re-parses to an
++        /// equal value.
++        /// Evidence: existing (property_tests-gated) proptest
++        /// `engineering_notation_roundtrip`, broadened beyond f64 values.
++        #[hegel::test]
++        fn engineering_notation_then_parse_roundtrips(tc: hegel::TestCase) {
++            let n = tc.draw(bigdecimals());
++            let s = n.to_engineering_notation();
++            let parsed: BigDecimal = s.parse().unwrap_or_else(|e| panic!("could not re-parse {:?}: {:?}", s, e));
++            assert_eq!(parsed, n, "roundtrip through {:?}", s);
++        }
++
++        /// Property: `to_plain_string()` output re-parses to an equal value.
++        /// Evidence: doc examples for `to_plain_string`. The scale is
++        /// bounded because the docs warn the plain representation of very
++        /// large exponents "may cause out-of-memory errors".
++        #[hegel::test]
++        fn plain_string_then_parse_roundtrips(tc: hegel::TestCase) {
++            let int_val = tc.draw(generators::integers::<i128>());
++            let scale = tc.draw(generators::integers::<i64>().min_value(-10_000).max_value(10_000));
++            let n = BigDecimal::new(int_val.into(), scale);
++            let s = n.to_plain_string();
++            let parsed: BigDecimal = s.parse().unwrap_or_else(|e| panic!("could not re-parse {:?}: {:?}", s, e));
++            assert_eq!(parsed, n, "roundtrip through {:?}", s);
++        }
++
++        /// Property: formatting a float-derived BigDecimal with a
++        /// requested precision matches std's float formatting exactly.
++        /// Evidence: existing (property_tests-gated) proptest
++        /// `float_formatting`; BigDecimal::from_f64 is exact, and std
++        /// formats the exact decimal expansion of the double.
++        /// Zero is excluded because f64 has a signed zero ("-0.0")
++        /// which BigDecimal cannot represent.
++        #[hegel::test(test_cases = 500)]
++        fn float_formatting_with_precision_matches_f64(tc: hegel::TestCase) {
++            let f = tc.draw(generators::floats::<f64>().allow_nan(false).allow_infinity(false));
++            tc.assume(f != 0.0);
++            let prec = tc.draw(generators::integers::<usize>().max_value(20));
++
++            let d = BigDecimal::from_f64(f).unwrap();
++            let f_fmt = format!("{f:.prec$}");
++            let d_fmt = format!("{d:.prec$}").replace("+", "");
++            assert_eq!(f_fmt, d_fmt);
++        }
++    }
+ }
+ 
+ 
+diff --git a/src/impl_trait_from_str.rs b/src/impl_trait_from_str.rs
+index c54065f..f340f5b 100644
+--- a/src/impl_trait_from_str.rs
++++ b/src/impl_trait_from_str.rs
+@@ -77,4 +77,34 @@ mod test_invalid {
+     impl_case!(case_bad_string_nan_exponent : "123.123eg" => "InvalidDigit");
+     impl_case!(case_bad_string_multiple_decimal_points : "123.12.45" => "InvalidDigit");
+     impl_case!(case_bad_string_hex : "0xCafeBeef" => "InvalidDigit");
++
++    // Property-based tests (hegel)
++    mod hegel_props {
++        use super::*;
++
++        /// Property: parsing never panics — bad input must produce an
++        /// `Err`, never a crash.
++        /// Evidence: `FromStr::from_str` returns
++        /// `Result<BigDecimal, ParseBigDecimalError>`, and the unit tests
++        /// above expect specific errors for malformed strings.
++        /// Inputs mix arbitrary unicode with "almost numeric" strings that
++        /// reach deeper into the parser (signs, underscores, dots,
++        /// oversized exponents).
++        #[hegel::test]
++        fn parsing_arbitrary_strings_never_panics(tc: hegel::TestCase) {
++            use hegel::generators::{self, Generator};
++
++            let almost_numeric = generators::from_regex(
++                r"[-+]?[0-9_]{0,24}\.?[0-9_]{0,24}([eE][-+]?[0-9]{1,24})?"
++            ).fullmatch(true);
++
++            let s: String = tc.draw(hegel::one_of!(
++                generators::text(),
++                almost_numeric,
++            ));
++
++            // must return Ok or Err, never panic
++            let _ = BigDecimal::from_str(&s);
++        }
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index df3717e..1434037 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -64,6 +64,12 @@ extern crate num_integer;
+ #[cfg(test)]
+ extern crate paste;
+ 
++#[cfg(test)]
++extern crate hegel;
++
++#[cfg(test)]
++extern crate num_rational;
++
+ #[cfg(feature = "serde")]
+ extern crate serde as serde_crate;
+ 
+diff --git a/src/lib.tests.rs b/src/lib.tests.rs
+index 24a633e..7e04055 100644
+--- a/src/lib.tests.rs
++++ b/src/lib.tests.rs
+@@ -137,3 +137,500 @@ mod order_of_magnitude {
+     impl_case!(case_n100d0012e1: "-100.0012e1" => 3);
+     impl_case!(case_16651567373773d553089: "16651567373773.553089" => 13);
+ }
++
++// Property-based tests (hegel)
++mod hegel_props {
++    use super::*;
++    use hegel::generators::{self, Generator};
++    use num_rational::BigRational;
++    use stdlib::DefaultHasher;
++
++    /// Generate an arbitrary BigDecimal with full-range i128 coefficient
++    /// and scale bounded by `max_scale_mag`.
++    ///
++    /// Scale is bounded because several operations (addition, subtraction,
++    /// comparison against an exact rational, `is_integer`) must materialize
++    /// roughly `|scale|` decimal digits to align values; unbounded i64
++    /// scales make the *test* run out of memory, not the library.
++    #[hegel::composite]
++    fn bigdecimals(tc: hegel::TestCase, max_scale_mag: i64) -> BigDecimal {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(
++            generators::integers::<i64>()
++                .min_value(-max_scale_mag)
++                .max_value(max_scale_mag),
++        );
++        BigDecimal::new(int_val.into(), scale)
++    }
++
++    /// Exact value of a BigDecimal as a rational number (independent oracle).
++    fn rational_of(d: &BigDecimal) -> BigRational {
++        let (int_val, scale) = d.as_bigint_and_exponent();
++        if scale >= 0 {
++            BigRational::new(int_val, Pow::pow(BigInt::from(10), scale as u64))
++        } else {
++            let numer = int_val * Pow::pow(BigInt::from(10), scale.unsigned_abs());
++            BigRational::new(numer, BigInt::one())
++        }
++    }
++
++    /// Property: `normalized()` does not change the value of the decimal.
++    /// Evidence: doc-comment on `normalized` ("Return a new BigDecimal after
++    /// removing trailing zeros") and the `normalize` unit tests, all of which
++    /// preserve the numeric value.
++    ///
++    /// The generator deliberately emphasizes the two ingredients of the
++    /// boundary case: coefficients with trailing zeros (multiply by a
++    /// small power of ten) and scales at/near i64::MIN (normalizing
++    /// *subtracts* the trailing-zero count from the scale).
++    #[hegel::test]
++    fn normalized_preserves_value(tc: hegel::TestCase) {
++        let coefficient = tc.draw(generators::integers::<i128>());
++        let trailing_zeros = tc.draw(generators::integers::<u32>().max_value(3));
++        let scale = tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::integers::<i64>().max_value(i64::MIN.wrapping_add(4)),
++        ));
++        let int_val = BigInt::from(coefficient) * Pow::pow(BigInt::from(10), trailing_zeros as u64);
++        let n = BigDecimal::new(int_val, scale);
++        assert_eq!(n.normalized(), n);
++    }
++
++    /// Property: `normalized()` produces the canonical representation:
++    /// no trailing zeros in the coefficient (zero becomes 0e0), so
++    /// normalizing twice gives the identical representation.
++    /// Evidence: `normalize` unit tests assert exact (int_val, scale) pairs
++    /// with trailing zeros stripped, e.g. (10, 2) => (1, 1), (0, -3) => (0, 0).
++    #[hegel::test]
++    fn normalized_is_canonical(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(generators::integers::<i64>());
++        let n = BigDecimal::new(int_val.into(), scale).normalized();
++
++        if n.is_zero() {
++            assert_eq!(n.as_bigint_and_exponent(), (BigInt::zero(), 0));
++        } else {
++            let (int_val, _) = n.as_bigint_and_exponent();
++            assert!(!(int_val % BigInt::from(10)).is_zero(), "trailing zero left by normalized()");
++            assert_eq!(n.normalized().as_bigint_and_exponent(), n.as_bigint_and_exponent());
++        }
++    }
++
++    /// Property: addition is commutative: a + b == b + a.
++    /// Evidence: BigDecimal models exact decimal arithmetic (README:
++    /// "Allows storing any real number to arbitrary precision; avoids
++    /// storing errors of binary floating-point").
++    #[hegel::test]
++    fn addition_commutes(tc: hegel::TestCase) {
++        let a = tc.draw(bigdecimals(1000));
++        let b = tc.draw(bigdecimals(1000));
++        assert_eq!(&a + &b, &b + &a);
++    }
++
++    /// Property: subtraction undoes addition exactly: (a + b) - b == a.
++    /// Evidence: addition/subtraction of decimals is exact (no rounding
++    /// occurs in add/sub; scales are aligned), see impl_ops_add/impl_ops_sub.
++    #[hegel::test]
++    fn add_then_sub_roundtrips(tc: hegel::TestCase) {
++        let a = tc.draw(bigdecimals(1000));
++        let b = tc.draw(bigdecimals(1000));
++        assert_eq!((&a + &b) - &b, a);
++    }
++
++    /// Property: multiplication agrees with exact rational arithmetic.
++    /// Evidence: multiplication is documented/implemented as exact
++    /// (scales add, coefficients multiply — impl_ops_mul.rs).
++    #[hegel::test]
++    fn multiplication_agrees_with_rational_oracle(tc: hegel::TestCase) {
++        let a = tc.draw(bigdecimals(1000));
++        let b = tc.draw(bigdecimals(1000));
++        let product = &a * &b;
++        assert_eq!(rational_of(&product), rational_of(&a) * rational_of(&b));
++    }
++
++    /// Property: `square()` equals multiplying the value by itself.
++    /// Evidence: doc-comment on `square`: "No rounding or truncating of
++    /// digits; this is the full result of the squaring operation", plus the
++    /// existing proptest `square` (which only exercised f32-derived values).
++    /// Scale is limited to i64::MAX/2 because the result's scale (2×scale)
++    /// must itself fit in an i64.
++    #[hegel::test]
++    fn square_equals_self_times_self(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(
++            generators::integers::<i64>()
++                .min_value(i64::MIN / 2)
++                .max_value(i64::MAX / 2),
++        );
++        let n = BigDecimal::new(int_val.into(), scale);
++        assert_eq!(n.square(), &n * &n);
++    }
++
++    /// Property: `cube()` equals multiplying the value by itself twice.
++    /// Evidence: doc-comment on `cube` ("full result of the cubing
++    /// operation") and the `test_cube` unit tests.
++    /// Scale is limited to i64::MAX/3 because the result's scale (3×scale)
++    /// must itself fit in an i64.
++    #[hegel::test]
++    fn cube_equals_self_times_self_times_self(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(
++            generators::integers::<i64>()
++                .min_value(i64::MIN / 3)
++                .max_value(i64::MAX / 3),
++        );
++        let n = BigDecimal::new(int_val.into(), scale);
++        assert_eq!(n.cube(), &n * &n * &n);
++    }
++
++    /// Property: `half()` is the inverse of `double()` (and vice versa).
++    /// Evidence: doc-comments "Multiply decimal by 2 (efficiently)" /
++    /// "Divide decimal by 2 (efficiently)". Scale is kept below i64::MAX
++    /// because halving an odd coefficient increases the scale by one
++    /// (documented in `half`), which must not overflow.
++    #[hegel::test]
++    fn double_and_half_are_inverses(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(generators::integers::<i64>().max_value(i64::MAX - 1));
++        let n = BigDecimal::new(int_val.into(), scale);
++        assert_eq!(n.double().half(), n);
++        assert_eq!(n.half().double(), n);
++    }
++
++    /// Property: `is_integer()` is true exactly when truncating all
++    /// fractional digits does not change the value.
++    /// Evidence: doc-comment "Return true if this number has zero
++    /// fractional part (is equal to an integer)"; RoundingMode::Down
++    /// is documented as truncation ("Always round towards zero").
++    #[hegel::test]
++    fn is_integer_agrees_with_truncation(tc: hegel::TestCase) {
++        let n = tc.draw(bigdecimals(10_000));
++        let truncated = n.with_scale_round(0, RoundingMode::Down);
++        assert_eq!(n.is_integer(), truncated == n);
++    }
++
++    /// Property: sqrt of a negative number is None.
++    /// Evidence: doc-comment on `sqrt`: "If the value is < 0, None is returned".
++    #[hegel::test]
++    fn sqrt_of_negative_is_none(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<i128>().max_value(-1));
++        let scale = tc.draw(generators::integers::<i64>());
++        let n = BigDecimal::new(int_val.into(), scale);
++        assert_eq!(n.sqrt(), None);
++    }
++
++    /// Property: sqrt(x)² is within the documented precision of x.
++    /// Evidence: `sqrt` docs say it computes with default precision
++    /// (100 significant digits). A half-ulp error on the 100-digit root
++    /// yields a relative error in the square well below 1e-95.
++    #[hegel::test]
++    fn sqrt_squared_is_close_to_original(tc: hegel::TestCase) {
++        let int_val = tc.draw(generators::integers::<u128>());
++        let scale = tc.draw(generators::integers::<i64>().min_value(-1000).max_value(1000));
++        let n = BigDecimal::from_biguint(int_val.into(), scale);
++
++        let root = n.sqrt().expect("sqrt of non-negative value");
++        let diff = (root.square() - &n).abs();
++        let tolerance = &n * BigDecimal::new(1.into(), 95); // n * 1e-95
++        assert!(diff <= tolerance, "sqrt({})² = off by {}", n, diff);
++    }
++
++    /// Property: values that are equal must have equal hashes.
++    /// Evidence: the Hash impl (lib.rs) canonicalizes trailing zeros, and
++    /// unit tests test_hash_equal/test_hash_equal_scale check specific
++    /// pairs; padding the scale with `with_scale` preserves the value.
++    #[hegel::test]
++    fn equal_values_have_equal_hashes(tc: hegel::TestCase) {
++        use stdlib::hash::{Hash, Hasher};
++
++        fn hash_of(obj: &BigDecimal) -> u64 {
++            let mut hasher = DefaultHasher::new();
++            obj.hash(&mut hasher);
++            hasher.finish()
++        }
++
++        let n = tc.draw(bigdecimals(1000));
++        let extra_scale = tc.draw(generators::integers::<i64>().min_value(0).max_value(100));
++        let padded = n.with_scale(n.fractional_digit_count() + extra_scale);
++
++        assert_eq!(padded, n);
++        assert_eq!(hash_of(&padded), hash_of(&n), "{} vs {}", n, padded);
++    }
++
++    // The four tests below are hegel ports of the proptest suite in
++    // lib.tests.property-tests.rs (gated behind `--cfg property_tests`).
++    // The original tests are macro-instantiated for every primitive
++    // type; i128 subsumes the smaller signed/unsigned integers, and f64
++    // covers the float variant.
++
++    /// Property: all `+` overloads (val/ref/assign, either side) agree.
++    /// Ported from proptest `add_ref_*`.
++    #[hegel::test]
++    fn add_overloads_agree(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i128>());
++        let m = tc.draw(generators::integers::<i128>());
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++
++        let sum = n + &d;
++        assert_eq!(sum, &d + n);
++        assert_eq!(sum, d.clone() + n);
++
++        let mut s = d;
++        s += n;
++        assert_eq!(sum, s);
++    }
++
++    /// Property: subtraction overloads are consistent and anti-commute:
++    /// n - d == -(d - n). Ported from proptest `sub_*`.
++    #[hegel::test]
++    fn sub_overloads_agree(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i128>());
++        let m = tc.draw(generators::integers::<i128>());
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++
++        let diff_n_d = n - &d;
++        let diff_d_n = d.clone() - n;
++        assert_eq!(&diff_n_d, &diff_d_n.neg());
++
++        let mut a = d.clone();
++        a -= n;
++        assert_eq!(&a, &diff_n_d.neg());
++    }
++
++    /// Property: all `*` overloads agree and multiplication commutes
++    /// with negation. Ported from proptest `mul_*`.
++    #[hegel::test]
++    fn mul_overloads_agree(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i128>());
++        let m = tc.draw(generators::integers::<i128>());
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++
++        let prod_n_d = n * &d;
++        let prod_d_n = d.clone() * n;
++        assert_eq!(&prod_n_d, &prod_d_n);
++
++        let mut r = d.clone();
++        r *= n;
++        assert_eq!(&prod_n_d, &r);
++
++        let r = d.neg() * n;
++        assert_eq!(prod_n_d.neg(), r);
++    }
++
++    /// Property: integer / decimal division overloads agree, and the
++    /// quotient multiplied back differs from the numerator by less than
++    /// 1e-60 (the quotient carries 100 significant digits and
++    /// |n| < 2^127 ≈ 1.7e38, so the error is bounded by ~1.7e-62).
++    /// The decimal divisor is non-zero because `Div` explicitly panics
++    /// with "Division by zero". Ported from proptest `div_*`.
++    #[hegel::test]
++    fn div_overloads_agree_and_multiply_back(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i128>());
++        let m = tc.draw(generators::integers::<i128>());
++        tc.assume(m != 0);
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++
++        let quotient_n_ref_d = n / &d;
++        let quotient_n_d = n / d.clone();
++        assert_eq!(&quotient_n_ref_d, &quotient_n_d);
++
++        let prod = quotient_n_d * &d;
++        let diff = n - &prod;
++        assert!(diff.abs() < BigDecimal::new(1.into(), 60));
++    }
++
++    /// Property: `d /= n` behaves exactly like `d = d / n` for *every*
++    /// integer divisor, including zero — same value, or both panic.
++    /// Evidence: Rust's operator convention (`DivAssign` is "the division
++    /// assignment operator /=") and the crate's own gated proptests, which
++    /// assert Div/DivAssign agreement for the other operators without
++    /// excluding any divisor.
++    #[hegel::test]
++    fn div_assign_agrees_with_div_for_any_divisor(tc: hegel::TestCase) {
++        use std::panic::{catch_unwind, AssertUnwindSafe};
++
++        let m = tc.draw(generators::integers::<i128>());
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++        let n = tc.draw(generators::integers::<i128>());
++
++        let div_result = catch_unwind(AssertUnwindSafe(|| &d / n));
++        let assign_result = catch_unwind(AssertUnwindSafe(|| {
++            let mut a = d.clone();
++            a /= n;
++            a
++        }));
++
++        match (div_result, assign_result) {
++            (Ok(a), Ok(b)) => assert_eq!(a, b),
++            (Err(_), Err(_)) => {} // both panicked: consistent
++            (Ok(q), Err(_)) => panic!("{} / {} = {} but the /= overload panicked", d, n, q),
++            (Err(_), Ok(q)) => panic!("{} / {} panicked but the /= overload gave {}", d, n, q),
++        }
++    }
++
++    /// Property: float / decimal division overloads agree (including
++    /// non-normal floats, which the impl short-circuits to zero for all
++    /// overloads alike). Ported from proptest `div_f64`.
++    #[hegel::test]
++    fn float_div_overloads_agree(tc: hegel::TestCase) {
++        let n = tc.draw(generators::floats::<f64>());
++        let m = tc.draw(generators::integers::<i128>());
++        tc.assume(m != 0);
++        let e = tc.draw(generators::integers::<i8>());
++        let d = BigDecimal::new(m.into(), e as i64);
++
++        let quotient_n_ref_d = n / &d;
++        let quotient_n_d = n / d.clone();
++        assert_eq!(&quotient_n_ref_d, &quotient_n_d);
++
++        let quotient_ref_d_n = &d / n;
++        let quotient_d_n = d.clone() / n;
++        assert_eq!(&quotient_ref_d_n, &quotient_d_n);
++
++        let mut q = d.clone();
++        q /= n;
++        assert_eq!(&q, &quotient_d_n);
++    }
++}
++
++// Stateful model test (hegel): run random sequences of BigDecimal
++// operations, mirroring each exact operation on a BigRational model,
++// and check the two agree after every step.
++mod hegel_model {
++    use super::*;
++    use hegel::TestCase;
++    use hegel::generators::{self, Generator};
++    use num_rational::BigRational;
++
++    fn rational_of(d: &BigDecimal) -> BigRational {
++        let (int_val, scale) = d.as_bigint_and_exponent();
++        if scale >= 0 {
++            BigRational::new(int_val, Pow::pow(BigInt::from(10), scale as u64))
++        } else {
++            let numer = int_val * Pow::pow(BigInt::from(10), scale.unsigned_abs());
++            BigRational::new(numer, BigInt::one())
++        }
++    }
++
++    struct DecimalVsRational {
++        subject: BigDecimal,
++        model: BigRational,
++    }
++
++    impl DecimalVsRational {
++        /// keep coefficient growth bounded so mul/square rules can't
++        /// explode the test's memory; this limits how big the numbers
++        /// get, not which values the library must accept
++        fn digits_are_small(&self) -> bool {
++            self.subject.digits() < 1000
++        }
++    }
++
++    #[hegel::composite]
++    fn small_decimals(tc: hegel::TestCase) -> BigDecimal {
++        let int_val = tc.draw(generators::integers::<i64>());
++        let scale = tc.draw(generators::integers::<i8>());
++        BigDecimal::new(int_val.into(), scale as i64)
++    }
++
++    #[hegel::state_machine]
++    impl DecimalVsRational {
++        #[rule]
++        fn add(&mut self, tc: TestCase) {
++            let d = tc.draw(small_decimals());
++            self.model += rational_of(&d);
++            self.subject += d;
++        }
++
++        #[rule]
++        fn sub(&mut self, tc: TestCase) {
++            let d = tc.draw(small_decimals());
++            self.model -= rational_of(&d);
++            self.subject -= d;
++        }
++
++        #[rule]
++        fn mul(&mut self, tc: TestCase) {
++            tc.assume(self.digits_are_small());
++            let d = tc.draw(small_decimals());
++            self.model *= rational_of(&d);
++            self.subject *= d;
++        }
++
++        #[rule]
++        fn square(&mut self, tc: TestCase) {
++            tc.assume(self.digits_are_small());
++            self.model = &self.model * &self.model;
++            self.subject = self.subject.square();
++        }
++
++        #[rule]
++        fn neg(&mut self, _: TestCase) {
++            self.model = -self.model.clone();
++            self.subject = -self.subject.clone();
++        }
++
++        #[rule]
++        fn abs(&mut self, _: TestCase) {
++            self.model = self.model.abs();
++            self.subject = self.subject.abs();
++        }
++
++        #[rule]
++        fn double(&mut self, _: TestCase) {
++            self.model *= BigRational::from_integer(2.into());
++            self.subject = self.subject.double();
++        }
++
++        #[rule]
++        fn half(&mut self, _: TestCase) {
++            self.model /= BigRational::from_integer(2.into());
++            self.subject = self.subject.half();
++        }
++
++        #[rule]
++        fn normalize(&mut self, _: TestCase) {
++            // value-preserving; model unchanged
++            self.subject = self.subject.normalized();
++        }
++
++        #[rule]
++        fn extend_scale(&mut self, tc: TestCase) {
++            // padding with zeros is value-preserving; model unchanged
++            let extra = tc.draw(generators::integers::<i64>().min_value(0).max_value(50));
++            self.subject = self.subject.with_scale(self.subject.fractional_digit_count() + extra);
++        }
++
++        #[rule]
++        fn roundtrip_through_scientific_notation(&mut self, _: TestCase) {
++            // formatting and re-parsing is value-preserving; model unchanged
++            let repr = self.subject.to_scientific_notation();
++            self.subject = repr.parse().expect("scientific notation must re-parse");
++        }
++
++        #[invariant]
++        fn value_matches_model(&self, _: TestCase) {
++            assert_eq!(rational_of(&self.subject), self.model);
++        }
++
++        #[invariant]
++        fn is_integer_matches_model(&self, _: TestCase) {
++            assert_eq!(self.subject.is_integer(), self.model.is_integer());
++        }
++    }
++
++    #[hegel::test]
++    fn bigdecimal_agrees_with_rational_model(tc: TestCase) {
++        let initial = tc.draw(small_decimals());
++        let machine = DecimalVsRational {
++            model: rational_of(&initial),
++            subject: initial,
++        };
++        hegel::stateful::run(machine, tc);
++    }
++}
+diff --git a/src/lib.tests.with_scale_round.rs b/src/lib.tests.with_scale_round.rs
+index 394378c..53d7482 100644
+--- a/src/lib.tests.with_scale_round.rs
++++ b/src/lib.tests.with_scale_round.rs
+@@ -111,3 +111,87 @@ mod case_682829560896740e30 {
+     impl_test!(-36 : Up => "682829561e36");
+     impl_test!(-100 : Up => "1e100");
+ }
++
++// Property-based tests (hegel)
++mod hegel_props {
++    use super::*;
++    use hegel::generators::{self, Generator};
++
++    /// Arbitrary BigDecimal with scale bounded to ±300 — rounding to a
++    /// new scale materializes ~|scale| digits, and the assertions below
++    /// subtract values at aligned scales, so the bound keeps the *test*
++    /// memory-sane while still covering scales far beyond the digit count.
++    #[hegel::composite]
++    fn bigdecimals(tc: hegel::TestCase) -> BigDecimal {
++        let int_val = tc.draw(generators::integers::<i128>());
++        let scale = tc.draw(generators::integers::<i64>().min_value(-300).max_value(300));
++        BigDecimal::new(int_val.into(), scale)
++    }
++
++    /// Property: Floor and Ceiling rounding bracket the original value,
++    /// and differ by at most one unit in the last place of the new scale.
++    /// Evidence: RoundingMode doc-comments — Ceiling "Towards +∞",
++    /// Floor "Towards -∞".
++    #[hegel::test]
++    fn floor_and_ceiling_bracket_the_value(tc: hegel::TestCase) {
++        let n = tc.draw(bigdecimals());
++        let new_scale = tc.draw(generators::integers::<i64>().min_value(-300).max_value(300));
++
++        let floor = n.with_scale_round(new_scale, RoundingMode::Floor);
++        let ceiling = n.with_scale_round(new_scale, RoundingMode::Ceiling);
++
++        assert!(floor <= n, "floor {} > n {}", floor, n);
++        assert!(n <= ceiling, "n {} > ceiling {}", n, ceiling);
++
++        let ulp = BigDecimal::new(1.into(), new_scale);
++        assert!(ceiling - floor <= ulp);
++    }
++
++    /// Property: for every rounding mode, `with_scale_round` returns a
++    /// value with exactly the requested scale, and the rounding error is
++    /// strictly less than one unit in the last place of that scale.
++    /// Evidence: with_scale_round doc-comment ("Return a new BigDecimal
++    /// after shortening the digits and rounding") and its doc examples;
++    /// all seven RoundingMode variants round to a neighboring multiple
++    /// of 10^-new_scale (rounding.rs doc-comments).
++    #[hegel::test]
++    fn rounding_error_is_less_than_one_ulp(tc: hegel::TestCase) {
++        use crate::rounding::RoundingMode::*;
++
++        let n = tc.draw(bigdecimals());
++        let new_scale = tc.draw(generators::integers::<i64>().min_value(-300).max_value(300));
++        let mode = tc.draw(generators::sampled_from(vec![
++            Up, Down, Ceiling, Floor, HalfUp, HalfDown, HalfEven,
++        ]));
++
++        let rounded = n.with_scale_round(new_scale, mode);
++        assert_eq!(rounded.fractional_digit_count(), new_scale);
++
++        let ulp = BigDecimal::new(1.into(), new_scale);
++        let error = (&n - &rounded).abs();
++        assert!(error < ulp, "rounding {} to scale {} with {:?} gave {} (error {})",
++                n, new_scale, mode, rounded, error);
++    }
++
++    /// Property: rounding to a larger scale (more fractional digits) is
++    /// exact — it never changes the value, whatever the rounding mode.
++    /// Evidence: with_scale doc-comment ("If the new_scale is lower than
++    /// the current value ... digits will be dropped" — implying higher
++    /// scale only pads) and the Ordering::Greater branch of
++    /// with_scale_round, which only multiplies by a power of ten.
++    #[hegel::test]
++    fn rounding_to_larger_scale_is_exact(tc: hegel::TestCase) {
++        use crate::rounding::RoundingMode::*;
++
++        let n = tc.draw(bigdecimals());
++        let extra = tc.draw(generators::integers::<i64>().min_value(0).max_value(300));
++        let mode = tc.draw(generators::sampled_from(vec![
++            Up, Down, Ceiling, Floor, HalfUp, HalfDown, HalfEven,
++        ]));
++
++        let new_scale = n.fractional_digit_count() + extra;
++        let rescaled = n.with_scale_round(new_scale, mode);
++        assert_eq!(rescaled, n);
++        assert_eq!(rescaled.fractional_digit_count(), new_scale);
++    }
++}

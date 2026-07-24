@@ -1,0 +1,798 @@
+diff --git a/.gitignore b/.gitignore
+index f0eb175..e70d6a1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,3 +8,4 @@ dist/
+ src/epoch.rs
+ .vscode/settings.json
+ .DS_Store
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index f28efad..a6985dd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -58,6 +58,7 @@ serde_json = "1.0.91"
+ criterion = "0.7.0"
+ iai = "0.1"
+ sofars = "0.6.1"
++hegeltest = "0.28.2"
+ 
+ [target.wasm32-unknown-unknown.dependencies]
+ js-sys = { version = "0.3" }
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..21ee7a3
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,179 @@
++# Hegel Property-Based Testing Report — hifitime 4.3.0
++
++Property-based tests were added with [hegel](https://hegel.dev) (`hegeltest` dev-dependency)
++to the existing integration test files `tests/duration.rs` and `tests/epoch.rs`
++(modules `hegel_props`). 17 hegel tests cover 13 distinct properties. Four tests
++are **deliberately failing**: they pin real bugs with deterministic counterexamples
++(see *Suspected bugs*). Each pinned bug has a green "sibling" property that excludes
++only the known-buggy region so the surrounding behavior stays under test.
++
++## Properties tested
++
++The crate ships extensive kani proof harnesses (`src/**/kani_verif.rs`), but those
++are almost entirely no-panic checks with structural postconditions (results are
++normalized, saturate at MIN/MAX, time scale matches). The properties below target
++what kani does not: value-level semantics, round-trips, and oracle agreement.
++
++### Duration (`tests/duration.rs::hegel_props`)
++
++1. **`prop_duration_total_nanoseconds_roundtrip`** — `Duration::from_total_nanoseconds`
++   is the inverse of `total_nanoseconds` for in-range i128 values and clamps to
++   MIN/MAX outside. Evidence: rustdoc of both functions; kani proves normalization
++   but not value fidelity. Full-range i128 generation plus boundary boosts.
++2. **`prop_duration_add_matches_i128_oracle`** — `a + b` equals saturating i128
++   addition of total nanoseconds, clamped to the representable range. Evidence:
++   `Add` docs, `test_bounds`/`test_ops_near_bounds` saturation examples.
++3. **`prop_duration_sub_matches_i128_oracle`** — same for subtraction.
++   **FAILING — pins bug #1** (wrong saturation direction).
++   Sibling **`prop_duration_sub_matches_i128_oracle_no_century_overflow`** (green)
++   constructs pairs whose century difference fits in i16.
++4. **`prop_duration_neg_matches_i128_oracle`** — `-d` equals i128 negation (the
++   range is symmetric, `-MIN == MAX` per the `Neg` impl), hence an involution.
++5. **`prop_duration_ordering_matches_total_nanoseconds`** — the derived
++   lexicographic `Ord` on `(centuries, nanoseconds)` orders durations by value.
++   Evidence: the representation convention documented on the `Duration` struct.
++6. **`prop_duration_display_fromstr_roundtrip`** — `Display` → `FromStr` is
++   lossless. Evidence: the serde `Serialize`/`Deserialize` impls literally use
++   `to_string`/`from_str`, so serde round-trip integrity requires this.
++   **FAILING — pins bug #2** (f64 error in `decompose()` corrupts `Display`).
++   Sibling **`prop_duration_display_fromstr_roundtrip_subday`** (green) restricts
++   to sub-day durations where the f64 component math is exact.
++7. **`prop_duration_from_str_never_panics`** — parse robustness on arbitrary
++   Unicode text and duration-shaped strings. Green (the duration parser slices
++   only at char boundaries / on raw bytes).
++
++### Epoch (`tests/epoch.rs::hegel_props`)
++
++8. **`prop_epoch_timescale_roundtrip_non_utc`** — for all 78 ordered pairs of the
++   12 non-UTC time scales, `e.to_time_scale(to).to_time_scale(from) == e` over
++   ±292 years (i64 nanoseconds), **exactly** for fixed-offset scales
++   (TAI/TT/GPST/GST/BDT/QZSST), within 2 ns for rate-scaled scales (TCG/TL/TCL)
++   and 100 ns for iterated dynamical scales (ET/TDB/TCB). Evidence:
++   `test_timescale_recip`, `formal_epoch_reciprocity_tdb`, `sofa_val_tcg` (≤1 ns),
++   `tcl_tl_round_trip` (≤1 ns). Green at 10× case count.
++9. **`prop_epoch_utc_roundtrip`** — round-trip through UTC from fixed-offset
++   scales, generation boosted to within ±2 min of all 28 IERS leap-second
++   boundaries. **FAILING — pins bug #3** (1 s error in a ΔAT-wide window around
++   every leap boundary). Sibling
++   **`prop_epoch_utc_roundtrip_away_from_leap_boundaries`** (green) tests both
++   directions (X→UTC→X and UTC→X→UTC) for epochs >60 s from every boundary,
++   asserting **exact** round-trips.
++10. **`prop_epoch_gregorian_roundtrip`** — `to_gregorian(ts)` followed by
++    `maybe_from_gregorian(..., ts)` returns the exact same epoch, for all 13 time
++    scales over the (almost) full ±32,767-century Duration range. Both directions
++    are pure integer calendar math. Evidence: `extreme_gregorian_print_roundtrip`
++    does this for hand-picked dates from year −200,000 to +200,000. Green,
++    including at 10×.
++11. **`prop_epoch_from_str_never_panics`** — parse robustness for
++    `Epoch::from_str`. **FAILING — pins bug #4** (byte-index slicing panic on
++    multi-byte UTF-8). Sibling **`prop_epoch_from_str_never_panics_ascii`**
++    (green) fuzzes the parser with ASCII-only garbage and format-shaped strings.
++12. **`prop_epoch_display_fromstr_roundtrip`** — `Display` → `from_str` is exact
++    for all time scales and all valid Gregorian dates in years 1–9999 with
++    nanosecond precision. Evidence: serde impls for Epoch, `tcl_tl_round_trip`,
++    `test_timescale_recip` RFC3339 leg. Green at 10×.
++13. **`prop_epoch_time_of_week_roundtrip`** — `from_time_of_week ∘ to_time_of_week`
++    is the identity for non-negative epoch durations in every time scale (the
++    week counter is unsigned). Evidence: `test_time_of_week`; kani harnesses only
++    prove no-panic. Green at 10×.
++
++## Test results
++
++- `cargo test` (full suite): **all pre-existing tests pass** (including the 42
++  doc tests). Hegel tests: **13 of 17 pass**, 4 fail deliberately (bug pins).
++- Liveness check performed: temporarily inverting the ordering assertion in
++  property 5 produced a shrunk minimal counterexample
++  (`(0,0)` vs `(0,1)` — 0 ns vs 1 ns), then was reverted.
++- Exploratory 10× run (`test_cases = 1000`) performed on every property: no
++  additional failures beyond the four pinned bugs; reverted to defaults.
++- The four pinned tests fail deterministically: each embeds its counterexample
++  in a boosted `one_of!`/`just` branch and was verified to fail on 3 consecutive
++  fresh runs (with the `.hegel` failure database deleted between runs).
++
++## Suspected bugs
++
++All four were found by the properties above, minimized by hegel's shrinker, and
++confirmed with standalone reproductions. None were fixed (per instructions).
++
++1. **`Duration::Sub` saturates to the wrong end on positive century overflow**
++   (`src/duration/ops.rs`, `Sub::sub`): when `a.centuries - b.centuries`
++   overflows i16 *positively* (large positive minus large negative), the
++   `checked_sub` `None` arm unconditionally returns `Duration::MIN`.
++   Counterexample: `Duration::ZERO - Duration::MIN` returns `Duration::MIN`
++   (−1,196,851,200 days) instead of `Duration::MAX`. The result has the wrong
++   sign by ~2.3 million years. Pinned in `prop_duration_sub_matches_i128_oracle`.
++
++2. **`Duration::decompose()` f64 rounding corrupts `Display` (and therefore
++   serde serialization)** (`src/duration/mod.rs`): components are computed with
++   `to_unit(...).floor()` in f64. From ~105 days upward, a duration just below a
++   day boundary rounds *up*, producing an inconsistent decomposition.
++   Counterexample: one century − 1 ns displays as
++   `"36525 days 59 min 59 s 999 ms 999 μs 999 ns"` (note: 36525 days is the full
++   century and the 23 h component is missing entirely); `decompose()` returns
++   `(0, 36525, 0, 59, 59, 999, 999, 999)`. Parsing the display back yields a
++   value ~1 h too large, so a serde round-trip silently corrupts the value.
++   Also reproduces at e.g. 250 days − 1 ns. Pinned in
++   `prop_duration_display_fromstr_roundtrip`.
++
++3. **TAI↔UTC conversions are inconsistent in a ΔAT-wide window at every leap
++   second boundary** (`src/epoch/mod.rs`, `to_time_scale`): the leap-second
++   table timestamps (`src/epoch/leap_seconds.rs`) are UTC calendar counts
++   ("assume this is TAI" convention — 2_272_060_800 s is 26,297 days, the UTC
++   count of 1972-01-01), and the UTC→TAI direction keys its lookup in that same
++   convention, but the TAI→UTC direction keys the lookup with the *true* TAI
++   value. Result: `TAI→UTC→TAI` is off by 1 s for every TAI epoch in
++   `[L, L + ΔAT_new)` — a 10–37 s window, e.g. 22 s wide at the 1983-07-01
++   boundary — and `UTC→TAI→UTC` is off by 1 s in `[L − ΔAT_old, L)`. Only a 1 s
++   window (the actual 23:59:60 leap second) is genuinely ambiguous; the rest of
++   the window is a keying inconsistency. Worst case pinned:
++   TAI 1972-01-01T00:00:00 → UTC 1971-12-31T23:59:50 → TAI 1971-12-31T23:59:50
++   (10 s error, the full first IERS ΔAT). Pinned in `prop_epoch_utc_roundtrip`.
++
++4. **`Epoch::from_str` panics on multi-byte UTF-8 input**
++   (`src/epoch/mod.rs:1131`): format sniffing does `&s[..2] == "JD"` /
++   `&s[..3] == "MJD"` after only checking `s.len() >= 7` in *bytes*. Any input
++   ≥7 bytes whose byte 2 (or 3) falls inside a multi-byte character panics with
++   "byte index 2 is not a char boundary". Minimal shrunk counterexample:
++   `"\u{0800}\u{10000}"` (2 chars, 7 bytes). Since `FromStr` returns a `Result`
++   and is fed by serde deserialization, this is a DoS-able panic on untrusted
++   input. Pinned in `prop_epoch_from_str_never_panics`.
++
++## Unsound properties abandoned
++
++- **Exact round-trips for dynamical time scales (ET/TDB/TCB)** — deliberately
++  not asserted. The docs describe the TDB/ET conversion as an iterated
++  approximation (convergence threshold 1e-9 s), so the property uses a 100 ns
++  tolerance instead (the crate's own `formal_epoch_reciprocity_tdb` tolerates
++  up to 0.5 ms at extreme epochs; 100 ns held over ±292 years at 10× cases).
++- **Epoch ordering consistency across time scales** — considered and dropped as
++  non-falsifiable: `Ord for Epoch` is *defined* as comparison of the TAI
++  conversion, so the test would restate the implementation.
++- **`Duration::Display` exact round-trip over the full range** — the property
++  itself is sound (serde relies on it) and is kept as a failing bug pin; the
++  originally hoped-for "holds everywhere" version is unattainable while
++  `decompose()` is f64-based, so the green sibling documents the sub-day domain
++  where exactness genuinely holds.
++- No other property had to be weakened: all remaining assertions are exact
++  (Duration oracle arithmetic, Gregorian and time-of-week round-trips,
++  fixed-offset time scale conversions).
++
++## Skill feedback
++
++- The boundary-boost advice paid off immediately: every one of the four bugs was
++  found by a boosted branch (`sampled_from` extremes, leap-second boundary
++  offsets) within the default 100 cases, and shrinking produced clean minimal
++  counterexamples (`ZERO - MIN`, a 7-byte 2-char string).
++- The "pin known failures deterministically via a `just` branch + KNOWN FAILURE
++  comment, then exclude the region from siblings" workflow from SKILL.md mapped
++  perfectly onto this crate; verified pins reproduce on fresh runs without the
++  failure database.
++- Friction: there is no global case-count override, so the exploratory 10× run
++  required sed-editing every attribute and reverting (as the reference warns).
++  A `HEGEL_TEST_CASES` env var would remove the most error-prone step.
++- Friction (minor): a failing hegel test in one integration test binary makes
++  bare `cargo test` stop before later binaries; `--no-fail-fast` is needed to
++  see the full picture once known-failure pins exist. Worth a note in the
++  reference next to the pinning section.
++- The Rust reference was accurate throughout — every generator/macro signature
++  compiled first try (`one_of!`, `#[hegel::composite]`, `sampled_from` with
++  owned enums, `just`, `from_regex().fullmatch(true)`).
+diff --git a/tests/duration.rs b/tests/duration.rs
+index 70c773a..1d705e8 100644
+--- a/tests/duration.rs
++++ b/tests/duration.rs
+@@ -733,3 +733,234 @@ fn regression_test_gh_475() {
+         .try_truncated_nanoseconds()
+         .is_ok());
+ }
++
++/// Hegel property-based tests for `Duration`.
++///
++/// The existing kani harnesses (src/duration/kani_verif.rs) prove structural
++/// postconditions (results are normalized, saturate at MIN/MAX) but not
++/// value-level semantics. The properties below check the value semantics
++/// against an independent i128 total-nanoseconds oracle, plus the
++/// Display <-> FromStr round-trip which the serde impls rely on.
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use hifitime::{Duration, NANOSECONDS_PER_CENTURY};
++    use std::str::FromStr;
++
++    /// Total-nanosecond bounds of the representable range: Duration is
++    /// (centuries: i16, nanoseconds in century: u64), and per the Duration
++    /// docs MIN is (i16::MIN, 0) and MAX is (i16::MAX, NANOSECONDS_PER_CENTURY).
++    const MIN_TOTAL_NS: i128 = (i16::MIN as i128) * (NANOSECONDS_PER_CENTURY as i128);
++    const MAX_TOTAL_NS: i128 = -MIN_TOTAL_NS;
++
++    /// Draws an arbitrary in-range Duration, boosting boundary values.
++    #[hegel::composite]
++    fn arb_duration(tc: hegel::TestCase) -> Duration {
++        let total = tc.draw(hegel::one_of!(
++            generators::integers::<i128>()
++                .min_value(MIN_TOTAL_NS)
++                .max_value(MAX_TOTAL_NS),
++            generators::sampled_from(vec![
++                MIN_TOTAL_NS,
++                MAX_TOTAL_NS,
++                0,
++                1,
++                -1,
++                i64::MIN as i128,
++                i64::MAX as i128,
++                NANOSECONDS_PER_CENTURY as i128,
++                -(NANOSECONDS_PER_CENTURY as i128),
++                NANOSECONDS_PER_CENTURY as i128 - 1,
++            ]),
++        ));
++        Duration::from_total_nanoseconds(total)
++    }
++
++    /// from_total_nanoseconds is the inverse of total_nanoseconds for in-range
++    /// values and saturates to MIN/MAX outside the range (per its rustdoc).
++    #[hegel::test]
++    fn prop_duration_total_nanoseconds_roundtrip(tc: hegel::TestCase) {
++        let nanos = tc.draw(hegel::one_of!(
++            generators::integers::<i128>(),
++            generators::integers::<i128>()
++                .min_value(MIN_TOTAL_NS)
++                .max_value(MAX_TOTAL_NS),
++            generators::sampled_from(vec![
++                MIN_TOTAL_NS,
++                MAX_TOTAL_NS,
++                MIN_TOTAL_NS - 1,
++                MAX_TOTAL_NS + 1,
++                0,
++            ]),
++        ));
++        let dur = Duration::from_total_nanoseconds(nanos);
++        let expected = nanos.clamp(MIN_TOTAL_NS, MAX_TOTAL_NS);
++        assert_eq!(
++            dur.total_nanoseconds(),
++            expected,
++            "roundtrip failed for {nanos} ns"
++        );
++    }
++
++    /// Duration addition agrees with saturating i128 addition of the total
++    /// nanoseconds (evidence: Add docs + "Duration::MIN - 1 ns == MIN" bound tests).
++    #[hegel::test]
++    fn prop_duration_add_matches_i128_oracle(tc: hegel::TestCase) {
++        let a = tc.draw(arb_duration());
++        let b = tc.draw(arb_duration());
++        let expected = (a.total_nanoseconds() + b.total_nanoseconds())
++            .clamp(MIN_TOTAL_NS, MAX_TOTAL_NS);
++        let sum = a + b;
++        assert_eq!(
++            sum.total_nanoseconds(),
++            expected,
++            "{a} + {b} gave {sum}"
++        );
++    }
++
++    /// Duration subtraction agrees with saturating i128 subtraction.
++    ///
++    /// KNOWN FAILURE: when `a.centuries - b.centuries` overflows an i16 on the
++    /// *positive* side (a large positive minus a large negative duration),
++    /// `Sub for Duration` (src/duration/ops.rs) treats the `checked_sub`
++    /// overflow as an underflow and saturates to `Duration::MIN` instead of
++    /// `Duration::MAX`. Minimal counterexample (pinned by the `just` branch
++    /// below so the failure reproduces on every run):
++    /// `Duration::ZERO - Duration::MIN == Duration::MIN` but must be
++    /// `Duration::MAX`.
++    #[hegel::test(test_cases = 200)]
++    fn prop_duration_sub_matches_i128_oracle(tc: hegel::TestCase) {
++        let a = tc.draw(arb_duration());
++        let b = tc.draw(hegel::one_of!(
++            arb_duration(),
++            // Deterministic pin of the known counterexample region.
++            generators::just(Duration::MIN),
++        ));
++        let expected = (a.total_nanoseconds() - b.total_nanoseconds())
++            .clamp(MIN_TOTAL_NS, MAX_TOTAL_NS);
++        let diff = a - b;
++        assert_eq!(
++            diff.total_nanoseconds(),
++            expected,
++            "{a} - {b} gave {diff}"
++        );
++    }
++
++    /// Sibling of prop_duration_sub_matches_i128_oracle (KNOWN FAILURE): the
++    /// same oracle restricted to pairs whose century difference fits in an
++    /// i16, i.e. excluding the known wrong-saturation bug, so the rest of the
++    /// subtraction logic keeps being exercised.
++    #[hegel::test]
++    fn prop_duration_sub_matches_i128_oracle_no_century_overflow(tc: hegel::TestCase) {
++        let a = tc.draw(arb_duration());
++        let mut b = tc.draw(arb_duration());
++        // Construct a non-overflowing pair instead of rejecting: if the century
++        // difference overflows i16, flipping b's sign brings it back in range.
++        let centuries_diff =
++            i32::from(a.to_parts().0) - i32::from(b.to_parts().0);
++        if centuries_diff > i32::from(i16::MAX) || centuries_diff < i32::from(i16::MIN) {
++            b = -b;
++        }
++        let expected = (a.total_nanoseconds() - b.total_nanoseconds())
++            .clamp(MIN_TOTAL_NS, MAX_TOTAL_NS);
++        let diff = a - b;
++        assert_eq!(
++            diff.total_nanoseconds(),
++            expected,
++            "{a} - {b} gave {diff}"
++        );
++    }
++
++    /// Negation matches i128 negation (the range is symmetric: -MIN == MAX),
++    /// and is therefore an involution.
++    #[hegel::test]
++    fn prop_duration_neg_matches_i128_oracle(tc: hegel::TestCase) {
++        let d = tc.draw(arb_duration());
++        let neg = -d;
++        assert_eq!(
++            neg.total_nanoseconds(),
++            -d.total_nanoseconds(),
++            "-({d}) gave {neg}"
++        );
++        assert_eq!(-neg, d, "double negation of {d} gave {}", -neg);
++    }
++
++    /// The derived lexicographic Ord on (centuries, nanoseconds) must order
++    /// durations by their actual value (evidence: representation convention
++    /// documented on the Duration struct).
++    #[hegel::test]
++    fn prop_duration_ordering_matches_total_nanoseconds(tc: hegel::TestCase) {
++        let a = tc.draw(arb_duration());
++        let b = tc.draw(arb_duration());
++        assert_eq!(
++            a.cmp(&b),
++            a.total_nanoseconds().cmp(&b.total_nanoseconds()),
++            "ordering of {a} vs {b} disagrees with total nanoseconds"
++        );
++    }
++
++    /// Display -> FromStr round-trips exactly. Evidence: the serde
++    /// Serialize/Deserialize impls for Duration serialize via to_string and
++    /// deserialize via from_str, so this round-trip must be lossless.
++    ///
++    /// KNOWN FAILURE: `Duration::decompose()` computes each component with f64
++    /// unit conversions (`to_unit(...).floor()`). For large durations the f64
++    /// rounds up across a component boundary, so `Display` prints a value that
++    /// differs from the stored duration and the serde round-trip corrupts the
++    /// value. Minimal counterexample (pinned by the `just` branch below so the
++    /// failure reproduces on every run):
++    /// `Duration::from_total_nanoseconds(NANOSECONDS_PER_CENTURY as i128 - 1)`
++    /// (one nanosecond less than a century) displays as
++    /// "36525 days 59 min 59 s 999 ms 999 μs 999 ns" — 36525 days is already
++    /// the *full* century, its `decompose()` is (0, 36525, 0, 59, 59, 999,
++    /// 999, 999) (note the missing 23 h), and parsing the display back yields
++    /// a value ~1 h larger than the original. The failure region starts as low
++    /// as ~105 days: e.g. 250 days - 1 ns displays as
++    /// "250 days 59 min 59 s 999 ms 999 μs 999 ns" and round-trips off by 1 h.
++    #[hegel::test(test_cases = 200)]
++    fn prop_duration_display_fromstr_roundtrip(tc: hegel::TestCase) {
++        let d = tc.draw(hegel::one_of!(
++            arb_duration(),
++            // Deterministic pin of the known counterexample region.
++            generators::just(Duration::from_total_nanoseconds(
++                NANOSECONDS_PER_CENTURY as i128 - 1
++            )),
++        ));
++        let repr = format!("{d}");
++        match Duration::from_str(&repr) {
++            Ok(parsed) => assert_eq!(parsed, d, "{repr} parsed back as {parsed}"),
++            Err(err) => panic!("failed to parse the display of {d} ({repr}): {err:?}"),
++        }
++    }
++
++    /// Sibling of prop_duration_display_fromstr_roundtrip (KNOWN FAILURE):
++    /// restricted to sub-day durations, where the largest component value is
++    /// 23 hours and the f64 conversions in decompose() are exact (the 1 ns
++    /// resolution is orders of magnitude above the f64 ulp of every
++    /// component), so the round-trip must hold.
++    #[hegel::test]
++    fn prop_duration_display_fromstr_roundtrip_subday(tc: hegel::TestCase) {
++        const DAY_NS: i128 = 86_400 * 1_000_000_000;
++        let nanos = tc.draw(
++            generators::integers::<i128>()
++                .min_value(-(DAY_NS - 1))
++                .max_value(DAY_NS - 1),
++        );
++        let d = Duration::from_total_nanoseconds(nanos);
++        let repr = format!("{d}");
++        match Duration::from_str(&repr) {
++            Ok(parsed) => assert_eq!(parsed, d, "{repr} parsed back as {parsed}"),
++            Err(err) => panic!("failed to parse the display of {d} ({repr}): {err:?}"),
++        }
++    }
++
++    /// Duration::from_str must never panic, whatever the input.
++    #[hegel::test]
++    fn prop_duration_from_str_never_panics(tc: hegel::TestCase) {
++        let s = tc.draw(hegel::one_of!(
++            generators::text(),
++            generators::from_regex(r"[+-]?[0-9]{0,10}\.?[0-9]{0,6} ?(d|days|h|min|s|ms|us|ns|nanoseconds)?")
++                .fullmatch(true),
++        ));
++        drop(Duration::from_str(&s));
++    }
++}
+diff --git a/tests/epoch.rs b/tests/epoch.rs
+index 21b181d..608b6d1 100644
+--- a/tests/epoch.rs
++++ b/tests/epoch.rs
+@@ -2651,3 +2651,348 @@ fn tcl_tl_round_trip() {
+         }
+     }
+ }
++
++/// Hegel property-based tests for `Epoch`.
++///
++/// The existing kani harnesses (src/epoch/kani_verif.rs) are no-panic checks
++/// with structural postconditions (e.g. the resulting time scale matches);
++/// the properties below target the value-level semantics: time scale
++/// conversion round-trips (evidence: test_timescale_recip,
++/// formal_epoch_reciprocity_tdb, sofa_val_tcg, tcl_tl_round_trip), Gregorian
++/// round-trips (evidence: extreme_gregorian_print_roundtrip), string parsing
++/// robustness and Display round-trips (evidence: the serde impls and
++/// test_from_str).
++mod hegel_props {
++    use core::str::FromStr;
++    use hegel::generators::{self, Generator};
++    use hifitime::{Duration, Epoch, TimeScale, Unit, NANOSECONDS_PER_CENTURY};
++
++    fn all_scales() -> Vec<TimeScale> {
++        vec![
++            TimeScale::TAI,
++            TimeScale::TT,
++            TimeScale::ET,
++            TimeScale::TDB,
++            TimeScale::UTC,
++            TimeScale::GPST,
++            TimeScale::GST,
++            TimeScale::BDT,
++            TimeScale::QZSST,
++            TimeScale::TCG,
++            TimeScale::TCB,
++            TimeScale::TL,
++            TimeScale::TCL,
++        ]
++    }
++
++    /// IERS leap second boundaries in TAI seconds past the 1900 reference
++    /// epoch, copied from src/epoch/leap_seconds.rs (announced_by_iers only,
++    /// which is what to_time_scale uses).
++    const IERS_LEAP_TAI_S: [i64; 28] = [
++        2_272_060_800,
++        2_287_785_600,
++        2_303_683_200,
++        2_335_219_200,
++        2_366_755_200,
++        2_398_291_200,
++        2_429_913_600,
++        2_461_449_600,
++        2_492_985_600,
++        2_524_521_600,
++        2_571_782_400,
++        2_603_318_400,
++        2_634_854_400,
++        2_698_012_800,
++        2_776_982_400,
++        2_840_140_800,
++        2_871_676_800,
++        2_918_937_600,
++        2_950_473_600,
++        2_982_009_600,
++        3_029_443_200,
++        3_076_704_000,
++        3_124_137_600,
++        3_345_062_400,
++        3_439_756_800,
++        3_550_089_600,
++        3_644_697_600,
++        3_692_217_600,
++    ];
++
++    /// Draws a nanosecond count (i64 spans ±292 years around the reference
++    /// epoch, which avoids Duration saturation at the representable bounds —
++    /// conversions saturate there by design so round-trips cannot hold), with
++    /// a branch boosted to within ±2 minutes of an IERS leap second boundary.
++    #[hegel::composite]
++    fn ns_with_leap_boost(tc: hegel::TestCase) -> i64 {
++        if tc.draw(generators::booleans()) {
++            let boundary_s = tc.draw(generators::sampled_from(IERS_LEAP_TAI_S.to_vec()));
++            let delta_ns = tc.draw(
++                generators::integers::<i64>()
++                    .min_value(-120_000_000_000)
++                    .max_value(120_000_000_000),
++            );
++            boundary_s * 1_000_000_000 + delta_ns
++        } else {
++            tc.draw(generators::integers::<i64>())
++        }
++    }
++
++    /// Converting an epoch to another time scale and back returns the
++    /// original epoch: exactly for the fixed-offset scales (TAI, TT, GNSS),
++    /// within the documented tolerances for the scales that apply a
++    /// relativistic rate (TCG/TL/TCL, ~1 ns per sofa_val_tcg and
++    /// tcl_tl_round_trip) or an iterated correction (ET/TDB/TCB).
++    /// UTC is excluded here: it is covered by the two UTC-specific properties
++    /// below because of the leap-second boundary behavior.
++    #[hegel::test]
++    fn prop_epoch_timescale_roundtrip_non_utc(tc: hegel::TestCase) {
++        let scales: Vec<TimeScale> = all_scales()
++            .into_iter()
++            .filter(|ts| *ts != TimeScale::UTC)
++            .collect();
++        let from = tc.draw(generators::sampled_from(scales.clone()));
++        let to = tc.draw(generators::sampled_from(scales));
++        let ns = tc.draw(generators::integers::<i64>());
++        let e = Epoch::from_duration(Duration::from_total_nanoseconds(i128::from(ns)), from);
++        let rt = e.to_time_scale(to).to_time_scale(from);
++        let err = (rt.duration - e.duration).abs();
++        let tol_of = |ts: TimeScale| -> Duration {
++            match ts {
++                TimeScale::ET | TimeScale::TDB | TimeScale::TCB => 100 * Unit::Nanosecond,
++                TimeScale::TCG | TimeScale::TL | TimeScale::TCL => 2 * Unit::Nanosecond,
++                _ => Duration::ZERO,
++            }
++        };
++        let tol = tol_of(from).max(tol_of(to));
++        assert!(
++            err <= tol,
++            "{from:?}->{to:?}->{from:?} error {err} (tol {tol}) for epoch {e:?} ({ns} ns)"
++        );
++    }
++
++    /// Round-trip through UTC from a fixed-offset scale, boosted near leap
++    /// second boundaries.
++    ///
++    /// KNOWN FAILURE (suspected bug): TAI->UTC->TAI is off by 1 s for every
++    /// TAI epoch within [L, L + delta_at_new) of each IERS leap boundary L —
++    /// a window 10..37 s wide, much wider than the genuinely ambiguous
++    /// 23:59:60 leap second itself. Cause: the leap second table timestamps
++    /// (src/epoch/leap_seconds.rs) are "UTC seconds counted as TAI"
++    /// (2_272_060_800 is 26_297 days, i.e. the UTC calendar count of
++    /// 1972-01-01), and `to_time_scale` keys the UTC->TAI lookup with that
++    /// same convention ("Assume this is TAI"), but keys the TAI->UTC lookup
++    /// with the *true* TAI value — the two directions disagree wherever the
++    /// lookups straddle a boundary. Pinned counterexample (`just` branch
++    /// below): TAI 2_272_060_800 s (1972-01-01T00:00:00 TAI) -> UTC
++    /// 1971-12-31T23:59:50 -> TAI 1971-12-31T23:59:50 (10 s error, the full
++    /// first IERS delta_at).
++    #[hegel::test(test_cases = 200)]
++    fn prop_epoch_utc_roundtrip(tc: hegel::TestCase) {
++        let other = tc.draw(generators::sampled_from(vec![
++            TimeScale::TAI,
++            TimeScale::TT,
++            TimeScale::GPST,
++            TimeScale::GST,
++            TimeScale::BDT,
++            TimeScale::QZSST,
++        ]));
++        let ns = tc.draw(hegel::one_of!(
++            ns_with_leap_boost(),
++            // Deterministic pin of the known counterexample.
++            generators::just(2_272_060_800_000_000_000_i64),
++        ));
++        // Start from a TAI epoch so the leap boost lands near the boundaries
++        // regardless of the scale's own reference epoch; the conversion to
++        // `other` is an exact fixed offset.
++        let e = Epoch::from_duration(Duration::from_total_nanoseconds(i128::from(ns)), TimeScale::TAI)
++            .to_time_scale(other);
++        let rt = e.to_time_scale(TimeScale::UTC).to_time_scale(other);
++        let err = (rt.duration - e.duration).abs();
++        assert!(
++            err <= Duration::ZERO,
++            "{other:?}->UTC->{other:?} error {err} for epoch {e:?} ({ns} ns TAI)"
++        );
++    }
++
++    /// Sibling of prop_epoch_utc_roundtrip (KNOWN FAILURE): UTC round-trips,
++    /// in both directions, restricted to epochs more than 60 s away from
++    /// every IERS leap second boundary, i.e. excluding the known buggy
++    /// windows, so the conversion logic everywhere else keeps being tested
++    /// exactly.
++    #[hegel::test]
++    fn prop_epoch_utc_roundtrip_away_from_leap_boundaries(tc: hegel::TestCase) {
++        let other = tc.draw(generators::sampled_from(vec![
++            TimeScale::TAI,
++            TimeScale::TT,
++            TimeScale::GPST,
++            TimeScale::GST,
++            TimeScale::BDT,
++            TimeScale::QZSST,
++        ]));
++        let start_in_utc = tc.draw(generators::booleans());
++        let ns = tc.draw(ns_with_leap_boost());
++        // Exclusion of the known-buggy windows (see prop_epoch_utc_roundtrip):
++        // keep only epochs > 60 s away from every leap boundary.
++        tc.assume(
++            IERS_LEAP_TAI_S
++                .iter()
++                .all(|l| (ns - l * 1_000_000_000).abs() > 60_000_000_000),
++        );
++        let tai = Epoch::from_duration(
++            Duration::from_total_nanoseconds(i128::from(ns)),
++            TimeScale::TAI,
++        );
++        let (e, via) = if start_in_utc {
++            (tai.to_time_scale(TimeScale::UTC), other)
++        } else {
++            (tai.to_time_scale(other), TimeScale::UTC)
++        };
++        let rt = e.to_time_scale(via).to_time_scale(e.time_scale);
++        let err = (rt.duration - e.duration).abs();
++        assert!(
++            err <= Duration::ZERO,
++            "{:?}->{via:?}->{:?} error {err} for epoch {e:?} ({ns} ns TAI)",
++            e.time_scale,
++            e.time_scale
++        );
++    }
++
++    /// Gregorian round-trip: to_gregorian in the epoch's own time scale
++    /// followed by maybe_from_gregorian must return the exact same epoch
++    /// (both directions are pure integer calendar math).
++    /// Evidence: extreme_gregorian_print_roundtrip does this for hand-picked
++    /// extreme dates in TAI and UTC.
++    #[hegel::test]
++    fn prop_epoch_gregorian_roundtrip(tc: hegel::TestCase) {
++        let ts = tc.draw(generators::sampled_from(all_scales()));
++        // Stay one century inside the Duration bounds so that adding the time
++        // scale's Gregorian reference offset cannot saturate (that would break
++        // the round-trip by construction, not by a calendar bug).
++        const BOUND: i128 = 32_767 * (NANOSECONDS_PER_CENTURY as i128);
++        let total_ns = tc.draw(hegel::one_of!(
++            generators::integers::<i128>().min_value(-BOUND).max_value(BOUND),
++            generators::integers::<i64>().map(i128::from),
++        ));
++        let e = Epoch::from_duration(Duration::from_total_nanoseconds(total_ns), ts);
++        let (y, m, d, hh, mm, ss, nanos) = e.to_gregorian(ts);
++        let rebuilt = Epoch::maybe_from_gregorian(y, m, d, hh, mm, ss, nanos, ts)
++            .unwrap_or_else(|err| {
++                panic!(
++                    "to_gregorian({ts:?}) of {total_ns} ns produced invalid date \
++                     {y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{nanos:09}: {err:?}"
++                )
++            });
++        assert_eq!(
++            rebuilt.duration.to_parts(),
++            e.duration.to_parts(),
++            "gregorian roundtrip in {ts:?} failed for {total_ns} ns \
++             ({y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{nanos:09})"
++        );
++    }
++
++    /// Epoch::from_str / from_gregorian_str must never panic, whatever the
++    /// input (they return Result).
++    ///
++    /// KNOWN FAILURE (real panic bug): `Epoch::from_str` sniffs the format
++    /// with byte-index slicing (`&s[..2] == "JD"`, `&s[..3] == "MJD"`, ... in
++    /// src/epoch/mod.rs). The length guard only checks `s.len() < 7` in
++    /// *bytes*, so any string of >= 7 bytes whose byte 2 or 3 falls inside a
++    /// multi-byte character makes the slice panic ("byte index 2 is not a
++    /// char boundary"). Pinned counterexample (`just` branch below):
++    /// `"ࠀ𐀀"` (U+0800 U+10000, 7 bytes).
++    #[hegel::test(test_cases = 200)]
++    fn prop_epoch_from_str_never_panics(tc: hegel::TestCase) {
++        if tc.draw(generators::booleans()) {
++            // Deterministic pin of the known counterexample.
++            drop(Epoch::from_str("\u{0800}\u{10000}"));
++            return;
++        }
++        let s = if tc.draw(generators::booleans()) {
++            // Targeted: short strings mixing ASCII and multi-byte characters
++            // (the format sniffing slices the string by byte index).
++            let mut s = String::new();
++            for _ in 0..8 {
++                let cp = tc.draw(hegel::one_of!(
++                    generators::integers::<u32>().max_value(0x7F),
++                    generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++                ));
++                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
++            }
++            s
++        } else {
++            tc.draw(hegel::one_of!(
++                generators::text(),
++                generators::from_regex(
++                    r"(JD|MJD|SEC)? ?-?[0-9]{0,12}\.?[0-9]{0,6} ?(TAI|UTC|TT|TDB|ET|GPST|GST|BDT|QZSST|TCG|TCB|TL|TCL)?"
++                )
++                .fullmatch(true),
++                generators::from_regex(
++                    r"[0-9]{1,5}-[0-9]{1,2}-[0-9]{1,2}[T ][0-9:.]{0,15}Z?"
++                )
++                .fullmatch(true),
++            ))
++        };
++        drop(Epoch::from_str(&s));
++    }
++
++    /// Sibling of prop_epoch_from_str_never_panics (KNOWN FAILURE):
++    /// robustness restricted to ASCII-only inputs, where the byte-slicing
++    /// panic cannot trigger, so the rest of the parser keeps being fuzzed.
++    #[hegel::test]
++    fn prop_epoch_from_str_never_panics_ascii(tc: hegel::TestCase) {
++        let s = tc.draw(hegel::one_of!(
++            generators::from_regex(r"[ -~]{0,40}").fullmatch(true),
++            generators::from_regex(
++                r"(JD|MJD|SEC)? ?-?[0-9]{0,12}\.?[0-9]{0,6} ?(TAI|UTC|TT|TDB|ET|GPST|GST|BDT|QZSST|TCG|TCB|TL|TCL)?"
++            )
++            .fullmatch(true),
++            generators::from_regex(r"[0-9]{1,5}-[0-9]{1,2}-[0-9]{1,2}[T ][0-9:.+\-Z]{0,15}")
++                .fullmatch(true),
++        ));
++        drop(Epoch::from_str(&s));
++    }
++
++    /// Display -> from_str round-trips exactly for representable dates in the
++    /// ISO year range. Evidence: the serde impls for Epoch serialize via
++    /// to_string and deserialize via from_str; tcl_tl_round_trip and
++    /// test_timescale_recip assert the same for specific epochs.
++    #[hegel::test]
++    fn prop_epoch_display_fromstr_roundtrip(tc: hegel::TestCase) {
++        let ts = tc.draw(generators::sampled_from(all_scales()));
++        let year = tc.draw(generators::integers::<i32>().min_value(1).max_value(9999));
++        let month = tc.draw(generators::integers::<u8>().min_value(1).max_value(12));
++        let day = tc.draw(generators::integers::<u8>().min_value(1).max_value(31));
++        let hour = tc.draw(generators::integers::<u8>().max_value(23));
++        let minute = tc.draw(generators::integers::<u8>().max_value(59));
++        let second = tc.draw(generators::integers::<u8>().max_value(59));
++        let nanos = tc.draw(generators::integers::<u32>().max_value(999_999_999));
++        let e = match Epoch::maybe_from_gregorian(year, month, day, hour, minute, second, nanos, ts)
++        {
++            Ok(e) => e,
++            // Only invalid day-of-month combinations are rejected here.
++            Err(_) => tc.reject(),
++        };
++        let repr = format!("{e}");
++        match Epoch::from_str(&repr) {
++            Ok(parsed) => assert_eq!(parsed, e, "{repr} parsed back as {parsed}"),
++            Err(err) => panic!("failed to parse the display of {e} ({repr}): {err:?}"),
++        }
++    }
++
++    /// to_time_of_week / from_time_of_week round-trip for non-negative epoch
++    /// durations (the week counter is unsigned).
++    #[hegel::test]
++    fn prop_epoch_time_of_week_roundtrip(tc: hegel::TestCase) {
++        let ts = tc.draw(generators::sampled_from(all_scales()));
++        let ns = tc.draw(generators::integers::<i64>().min_value(0));
++        let e = Epoch::from_duration(Duration::from_total_nanoseconds(i128::from(ns)), ts);
++        let (week, tow_ns) = e.to_time_of_week();
++        let rebuilt = Epoch::from_time_of_week(week, tow_ns, ts);
++        assert_eq!(
++            rebuilt.duration.to_parts(),
++            e.duration.to_parts(),
++            "time-of-week roundtrip failed in {ts:?} for {ns} ns (week {week}, tow {tow_ns})"
++        );
++    }
++}

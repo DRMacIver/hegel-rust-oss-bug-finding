@@ -1,0 +1,631 @@
+diff --git a/.gitignore b/.gitignore
+index e9e2199..b123105 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ /target/
+ /Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index b3fd4a8..94093a6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,6 +51,7 @@ quickcheck = "0.9"
+ 
+ # Scientific benchmarking
+ criterion = { version = "0.4.0", features = ["html_reports"] }
++hegeltest = "0.28.2"
+ 
+ [build-dependencies]
+ cc = { version = "1.0", optional = true }
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..53796cb
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,142 @@
++# Hegel Property-Based Testing Report: reed-solomon-erasure
++
++Crate: `reed-solomon-erasure` 6.0.0 (Reed-Solomon erasure coding over GF(2^8) and GF(2^16)).
++Tests added with `hegeltest` 0.28.2 (`#[hegel::test]`), supplementing the existing quickcheck
++suite and fuzz targets. No AI-contribution-gating file was found in the repository
++(no `HUMAN_VS_MACHINE.md` / `.ai-ack` / `CONTRIBUTING.md`; README/LICENSE checked).
++All work is local; nothing was pushed or upstreamed.
++
++## Properties tested
++
++All hegel tests live in the existing test files (`src/tests/mod.rs`,
++`src/tests/galois_16.rs`, and the `tests` module of `src/galois_8.rs`),
++prefixed `hegel_`. Erasure subsets are drawn via a Fisher-Yates shuffle so every
++choice is shrinkable — the existing quickcheck tests pick corruption positions with
++`rand::random`, which hegel/quickcheck cannot shrink, and they never exercise more
++than `parity` erasures.
++
++1. **`hegel_encode_erase_reconstruct_roundtrip`** (crown, `src/tests/mod.rs`) —
++   draw `k, m ∈ 1..=10`, shard length `1..=64`, full `0..=255` shard bytes; encode;
++   erase a drawn subset of size `0..=m` (any mix of data and parity positions);
++   `reconstruct` must recover every shard exactly and `verify` must pass.
++   Evidence: the crate's core contract, its README, the quickcheck
++   `qc_encode_verify_reconstruct_verify`, and `fuzz/fuzz_targets/fuzz_encode_reconstruct.rs`.
++   Exploratory-run counters confirmed the erasure branch is not vacuous: 820 of 1000
++   cases had at least one erasure.
++2. **`hegel_reconstruct_too_many_erasures_fails_cleanly`** — erase a drawn subset of
++   size `m+1..=n`; `reconstruct` must return `Err(Error::TooFewShardsPresent)` and
++   (per its doc: "if the method returns an `Error`, then nothing is touched") leave
++   every shard bit-identical, erased slots still `None`. Not covered by the existing
++   suite (quickcheck caps corruption at `parity`; only one fixed-shape unit test).
++3. **`hegel_reconstruct_data_recovers_only_data_shards`** — after erasing `≤ m`
++   shards, `reconstruct_data` restores all data shards exactly, leaves erased parity
++   shards `None`, and leaves present parity shards untouched. Evidence: doc comment on
++   `reconstruct_data` ("Reconstructs only the data shards") and the `data_only` branch
++   of `reconstruct_internal`.
++4. **`hegel_verify_detects_single_byte_corruption`** — `verify` is true for a freshly
++   encoded set; after XOR-ing one drawn byte of one drawn shard (data *or* parity) with
++   a drawn non-zero delta, `verify` is false. Evidence: MDS property of the systematic
++   Vandermonde construction (every parity coefficient non-zero, so any single-symbol
++   change perturbs every parity row). Stronger than `qc_verify`, which corrupts whole
++   shards with unconstrained random bytes.
++5. **`hegel_encode_deterministic_regardless_of_parity_prefill`** — two independently
++   constructed codecs with the same `(k, m)` produce identical parity for the same data,
++   one starting from zeroed parity buffers and one from drawn garbage (doc: "You do not
++   need to clear the parity shards beforehand"); re-encoding is idempotent.
++6. **`hegel_encode_is_columnwise`** (shard-size independence) — parity byte at column
++   `j` of an encoding of length-`L` shards equals the parity of encoding just column `j`
++   as 1-byte shards. Evidence: `mul_slice`/`mul_slice_add` operate element-wise, so the
++   code is a per-byte-position linear map; a SIMD/unrolling bug would break this.
++7. **`hegel_single_data_shard_parity_equals_data`** (k = 1 edge, `m ∈ 1..=255`) —
++   with one data shard, every parity shard is an exact copy of it. Evidence:
++   `Matrix::vandermonde` entry `[r][0] = nth(r)^0 = 1` and the 1×1 top submatrix `[1]`,
++   so the whole encode matrix is ones.
++8. **`hegel_single_parity_recovers_any_single_erasure`** (m = 1 edge, `k ∈ 1..=255`) —
++   a single parity shard recovers any one erased shard (data or parity) at any drawn
++   position, up to the GF(2^8) shard-count limit.
++9. **`hegel_mul_slice_matches_scalar_mul`** and **`hegel_mul_slice_xor_matches_scalar_mul`**
++   (`src/galois_8.rs`) — backend differential: the slice routines (pure-Rust 4-way
++   unrolled by default, SIMD C under `simd-accel`) must agree with the scalar table
++   lookup `mul` for every coefficient and length `1..=300` (covers the unroll main
++   loop, the scalar tail, and with `simd-accel` the SIMD-block + remainder split).
++   This is the "feature paths agree" property, run under both builds. **Found a real
++   bug at length 0 — see Suspected bugs.**
++10. **`hegel_mul_div_roundtrip`** (`src/galois_8.rs`) — `div(mul(a, b), b) == a` for
++    `b ≠ 0`, tying `div` to `mul` directly (existing tests only check `mul(a, div(1,a)) == 1`).
++11. **`hegel_encode_erase_reconstruct_roundtrip_gf16`** (`src/tests/galois_16.rs`) —
++    the crown property over GF(2^16) (`[u8; 2]` elements), whose arithmetic is a
++    completely different code path (polynomial reduction, no lookup tables).
++
++Plus **`mul_slice_empty_input_does_not_panic`** (`src/galois_8.rs`) — deterministic
++pin for the empty-slice SIMD bug below (plain `#[test]`; no randomness needed).
++
++## Test results
++
++- Default build: **all 112 lib tests + 7 doctests pass**, including all 12 hegel tests
++  and the entire pre-existing quickcheck/unit suite (`cargo test`).
++- Liveness check: temporarily inverting the crown assertion produced a fully shrunk
++  counterexample (`k=1, m=1, shard_len=1, data=[0], erase_count=0`); reverted.
++- Exploratory 10x run (`test_cases = 1000` on all 12 tests, with case counters):
++  all green; crown test confirmed 1000 cases executed, 820 with ≥ 1 erasure.
++  Counters and elevated counts reverted; committed tests use the default 100 cases.
++- `cargo test --features simd-accel`: all hegel property tests pass (the SIMD backend
++  agrees with the scalar oracle on all non-empty inputs); exactly one test fails,
++  deterministically — the known-failure pin `mul_slice_empty_input_does_not_panic`.
++
++## Suspected bugs
++
++**`galois_8::mul_slice` / `galois_8::mul_slice_xor` panic on empty slices under
++`--features simd-accel` (backend divergence).**
++
++- Repro: `cargo test --features simd-accel mul_slice_empty_input_does_not_panic`
++  (or call `reed_solomon_erasure::galois_8::mul_slice(5, &[], &mut [])` in any
++  program built with `simd-accel` on x86_64/aarch64).
++- Panic: `index out of bounds: the len is 0 but the index is 0`, `src/galois_8.rs:297`
++  (and `:319` for the xor variant).
++- Code path: the pure-Rust implementations guard with `return_if_empty!(len)`
++  (`src/galois_8.rs:137-144, 179-186`), but the `simd-accel` wrappers take raw
++  pointers via `&input[0]` / `&mut out[0]` **before** any length check
++  (`pub fn mul_slice` at `src/galois_8.rs:291-305`, `pub fn mul_slice_xor` at
++  `:313-327`), so they panic where the default build returns silently. These are
++  `pub` functions in a `pub` module, so the divergence is user-visible. The
++  higher-level `ReedSolomon` API is unaffected (it rejects empty shards with
++  `Error::EmptyShard` before reaching these routines).
++- Status: NOT fixed (per instructions). Pinned deterministically by
++  `mul_slice_empty_input_does_not_panic`, which passes on the default build and fails
++  under `simd-accel`. The two sibling differential properties exclude length 0 with a
++  comment referencing the pin, so they stay green and keep testing everything else.
++- Found by: the hegel differential tests, which drew `len = 0` and shrank to the
++  minimal case on the first `simd-accel` run.
++
++No other property failed in any run (default and `simd-accel`, default and 10x counts).
++
++## Unsound properties abandoned
++
++None abandoned outright. One property was consciously *not* attempted: asserting a
++specific parity formula for `m = 1` (e.g. "single parity = XOR of data shards") — the
++systematic Vandermonde construction does not promise all-ones parity rows for `k > 1`,
++so only the reconstruction contract was asserted. The k = 1 parity-copy property was
++asserted only after deriving it from `Matrix::vandermonde` (`nth(r)^0 = 1`).
++
++## Skill feedback
++
++- The porting guidance ("existing PBTs use narrow ranges because shrinking was
++  slow — broaden") mapped well here: the quickcheck suite's corruption positions come
++  from `rand::random` inside the property (unshrinkable) and never exceed `parity`;
++  drawing the erasure subset through hegel and adding the `> m` failure-path property
++  were exactly the gaps.
++- The Fisher-Yates draw-a-subset idiom (suggested by the "avoid rejection sampling /
++  construct valid inputs directly" section) worked perfectly for "erase WHICH shards";
++  a `vecs(...).unique(true).min_size(e)` approach would have risked heavy rejection
++  when `e ≈ n`. A short cookbook entry for "draw a k-subset / permutation" would save
++  others deriving it.
++- The "feature flag testing" row in the catalogue paid off immediately: the only real
++  bug found lives exclusively behind `simd-accel`. Worth strengthening that advice to
++  "run the finished suite once per compile-time backend feature" — the bug is invisible
++  in the default build no matter how many cases run.
++- The Run-and-Reflect requirement to verify case counts with a counter (not wall-clock)
++  was useful: the 10x run also revealed that `k ∈ 1..=255` codec construction dominates
++  runtime (Vandermonde build + O(k³) inversion per case), which informed keeping the
++  m = 1 test at the default case count rather than shrinking its input range.
++- Gotcha #11 (delete `.hegel/` after deliberate liveness failures) avoided a confusing
++  replay after the inverted-assertion check.
+diff --git a/src/galois_8.rs b/src/galois_8.rs
+index 01adc09..e7c2fcf 100644
+--- a/src/galois_8.rs
++++ b/src/galois_8.rs
+@@ -618,4 +618,82 @@ mod tests {
+             }
+         }
+     }
++
++    // ===============================================================
++    // Hegel property-based tests
++    //
++    // The slice routines (`mul_slice` / `mul_slice_xor`) have several
++    // implementations selected at compile time (pure-Rust unrolled
++    // loop by default, SIMD C when `simd-accel` is enabled). Whichever
++    // backend is compiled in must agree with the scalar table lookup
++    // `mul` for every coefficient and every slice length — lengths are
++    // drawn up to a few hundred so the 4-way-unrolled main loop, the
++    // scalar tail, the empty slice, and (with simd-accel) the SIMD
++    // block + remainder split are all exercised.
++    // ===============================================================
++
++    use hegel::generators;
++
++    /// KNOWN FAILURE under `--features simd-accel` on x86_64/aarch64:
++    /// the SIMD wrappers for `mul_slice` / `mul_slice_xor` take
++    /// `&input[0]` without the `return_if_empty!` guard that the
++    /// pure-Rust implementations have, so they panic (index out of
++    /// bounds) on empty slices. The two backends therefore disagree
++    /// on the empty-slice case. Found by the hegel differential tests
++    /// below; this test pins the bug deterministically. It passes on
++    /// the default (pure-Rust) build.
++    #[test]
++    fn mul_slice_empty_input_does_not_panic() {
++        let mut out: [u8; 0] = [];
++        mul_slice(5, &[], &mut out);
++        let mut out: [u8; 0] = [];
++        mul_slice_xor(5, &[], &mut out);
++    }
++
++    /// `mul_slice(c, input, out)` must equal element-wise scalar `mul`.
++    #[hegel::test]
++    fn hegel_mul_slice_matches_scalar_mul(tc: hegel::TestCase) {
++        let c = tc.draw(generators::integers::<u8>());
++        // min_value(1): the empty-slice case panics under simd-accel;
++        // it is pinned by `mul_slice_empty_input_does_not_panic` above.
++        let len = tc.draw(generators::integers::<usize>().min_value(1).max_value(300));
++        let input: Vec<u8> = tc.draw(generators::binary().min_size(len).max_size(len));
++
++        let mut out = vec![0u8; len];
++        mul_slice(c, &input, &mut out);
++
++        let expect: Vec<u8> = input.iter().map(|&x| mul(c, x)).collect();
++        assert_eq!(expect, out);
++    }
++
++    /// `mul_slice_xor(c, input, out)` must equal out[i] ^ mul(c, input[i]).
++    #[hegel::test]
++    fn hegel_mul_slice_xor_matches_scalar_mul(tc: hegel::TestCase) {
++        let c = tc.draw(generators::integers::<u8>());
++        // min_value(1): empty-slice case pinned by
++        // `mul_slice_empty_input_does_not_panic` (see comment there).
++        let len = tc.draw(generators::integers::<usize>().min_value(1).max_value(300));
++        let input: Vec<u8> = tc.draw(generators::binary().min_size(len).max_size(len));
++        let initial: Vec<u8> = tc.draw(generators::binary().min_size(len).max_size(len));
++
++        let mut out = initial.clone();
++        mul_slice_xor(c, &input, &mut out);
++
++        let expect: Vec<u8> = input
++            .iter()
++            .zip(initial.iter())
++            .map(|(&x, &o)| o ^ mul(c, x))
++            .collect();
++        assert_eq!(expect, out);
++    }
++
++    /// Multiplication and division are inverse for non-zero divisors:
++    /// div(mul(a, b), b) == a. Complements the existing exhaustive
++    /// identity/associativity tests by tying `div` to `mul` directly.
++    #[hegel::test]
++    fn hegel_mul_div_roundtrip(tc: hegel::TestCase) {
++        let a = tc.draw(generators::integers::<u8>());
++        let b = tc.draw(generators::integers::<u8>().min_value(1));
++        assert_eq!(a, div(mul(a, b), b));
++    }
+ }
+diff --git a/src/tests/galois_16.rs b/src/tests/galois_16.rs
+index 872472e..1260d75 100644
+--- a/src/tests/galois_16.rs
++++ b/src/tests/galois_16.rs
+@@ -487,3 +487,63 @@ quickcheck! {
+         expect == shards
+     }
+ }
++
++// ===================================================================
++// Hegel property-based tests
++//
++// Same crown property as the GF(2^8) suite in `tests/mod.rs`, but
++// over the GF(2^16) extension field (elements are [u8; 2]), whose
++// arithmetic is a completely different code path (polynomial
++// reduction rather than lookup tables).
++// ===================================================================
++
++/// Encode k data shards into k+m total over GF(2^16), erase any
++/// subset of up to m shards, then `reconstruct` must recover every
++/// shard exactly and the result must verify.
++#[hegel::test]
++fn hegel_encode_erase_reconstruct_roundtrip_gf16(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let n = k + m;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(16));
++
++    // Draw k data shards of `shard_len` GF(2^16) elements (full byte
++    // range in both bytes), plus m zeroed parity shards.
++    let flat: Vec<u8> = tc.draw(
++        generators::binary()
++            .min_size(k * shard_len * 2)
++            .max_size(k * shard_len * 2),
++    );
++    let mut shards: Vec<Vec<[u8; 2]>> = flat
++        .chunks(shard_len * 2)
++        .map(|c| c.chunks(2).map(|p| [p[0], p[1]]).collect())
++        .collect();
++    for _ in 0..m {
++        shards.push(vec![[0u8; 2]; shard_len]);
++    }
++
++    let r = ReedSolomon::new(k, m).unwrap();
++    r.encode(&mut shards).unwrap();
++    let expect = shards.clone();
++
++    // Erase a drawn subset of size <= m (Fisher-Yates, all shrinkable).
++    let erase_count = tc.draw(generators::integers::<usize>().max_value(m));
++    let mut idx: Vec<usize> = (0..n).collect();
++    for i in (1..n).rev() {
++        let j = tc.draw(generators::integers::<usize>().max_value(i));
++        idx.swap(i, j);
++    }
++
++    let mut option_shards = shards_into_option_shards(shards);
++    for &i in idx[..erase_count].iter() {
++        option_shards[i] = None;
++    }
++
++    r.reconstruct(&mut option_shards).unwrap();
++
++    let recovered = option_shards_into_shards(option_shards);
++    assert_eq!(expect, recovered);
++    assert!(r.verify(&recovered).unwrap());
++}
+diff --git a/src/tests/mod.rs b/src/tests/mod.rs
+index 488443b..db0aa7b 100644
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -2617,3 +2617,303 @@ fn test_encode_single_error_handling() {
+         );
+     }
+ }
++
++// ===================================================================
++// Hegel property-based tests
++//
++// These supplement the quickcheck properties above. Differences from
++// the quickcheck suite:
++//   - the erased-shard subset is drawn through hegel (the quickcheck
++//     tests pick corruption positions with `rand::random`, which is
++//     not shrinkable),
++//   - erasure counts beyond the parity count are exercised (the
++//     quickcheck tests cap `corrupt` at `parity`),
++//   - `reconstruct_data`, single-byte corruption detection, and the
++//     k = 1 / m = 1 edge cases are covered.
++// ===================================================================
++
++/// Draws a `count`-element subset of `0..n` as erasure positions,
++/// via a Fisher-Yates shuffle so every decision is shrinkable and no
++/// rejection sampling is needed.
++fn draw_erased_indices(tc: &hegel::TestCase, n: usize, count: usize) -> Vec<usize> {
++    use hegel::generators;
++
++    let mut idx: Vec<usize> = (0..n).collect();
++    for i in (1..n).rev() {
++        let j = tc.draw(generators::integers::<usize>().max_value(i));
++        idx.swap(i, j);
++    }
++    idx.truncate(count);
++    idx
++}
++
++/// Draws `k` data shards of `shard_len` bytes each (full 0..=255 byte
++/// range) followed by `m` zeroed parity shards, ready for `encode`.
++fn draw_shards(tc: &hegel::TestCase, k: usize, m: usize, shard_len: usize) -> Vec<Vec<u8>> {
++    use hegel::generators;
++
++    let flat: Vec<u8> = tc.draw(
++        generators::binary()
++            .min_size(k * shard_len)
++            .max_size(k * shard_len),
++    );
++    let mut shards: Vec<Vec<u8>> = flat.chunks(shard_len).map(|c| c.to_vec()).collect();
++    for _ in 0..m {
++        shards.push(vec![0u8; shard_len]);
++    }
++    shards
++}
++
++/// Crown property: encode k data shards into k+m total, erase any
++/// subset of up to m shards (data and/or parity), then `reconstruct`
++/// must recover every shard exactly and the result must verify.
++#[hegel::test]
++fn hegel_encode_erase_reconstruct_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let n = k + m;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    let mut shards = draw_shards(&tc, k, m, shard_len);
++    let r = ReedSolomon::new(k, m).unwrap();
++    r.encode(&mut shards).unwrap();
++    let expect = shards.clone();
++
++    // Erase any subset of size <= m.
++    let erase_count = tc.draw(generators::integers::<usize>().max_value(m));
++    let erased = draw_erased_indices(&tc, n, erase_count);
++
++    let mut option_shards = shards_into_option_shards(shards);
++    for &i in erased.iter() {
++        option_shards[i] = None;
++    }
++
++    r.reconstruct(&mut option_shards).unwrap();
++
++    let recovered = option_shards_into_shards(option_shards);
++    assert_eq!(expect, recovered);
++    assert!(r.verify(&recovered).unwrap());
++}
++
++/// When more than m shards are erased, `reconstruct` must fail with
++/// `Error::TooFewShardsPresent` — and per its docs ("if the method
++/// returns an `Error`, then nothing is touched") it must leave every
++/// shard exactly as it found it.
++#[hegel::test]
++fn hegel_reconstruct_too_many_erasures_fails_cleanly(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let n = k + m;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    let mut shards = draw_shards(&tc, k, m, shard_len);
++    let r = ReedSolomon::new(k, m).unwrap();
++    r.encode(&mut shards).unwrap();
++
++    // Erase strictly more than m shards.
++    let erase_count = tc.draw(
++        generators::integers::<usize>()
++            .min_value(m + 1)
++            .max_value(n),
++    );
++    let erased = draw_erased_indices(&tc, n, erase_count);
++
++    let mut option_shards = shards_into_option_shards(shards);
++    for &i in erased.iter() {
++        option_shards[i] = None;
++    }
++    let before = option_shards.clone();
++
++    let result = r.reconstruct(&mut option_shards);
++    assert_eq!(Err(Error::TooFewShardsPresent), result);
++    // Nothing is touched: present shards unchanged, erased still None.
++    assert_eq!(before, option_shards);
++}
++
++/// `reconstruct_data` must recover the data shards exactly while
++/// leaving erased parity shards missing (it only reconstructs data).
++#[hegel::test]
++fn hegel_reconstruct_data_recovers_only_data_shards(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let n = k + m;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    let mut shards = draw_shards(&tc, k, m, shard_len);
++    let r = ReedSolomon::new(k, m).unwrap();
++    r.encode(&mut shards).unwrap();
++    let expect = shards.clone();
++
++    let erase_count = tc.draw(generators::integers::<usize>().max_value(m));
++    let erased = draw_erased_indices(&tc, n, erase_count);
++
++    let mut option_shards = shards_into_option_shards(shards);
++    for &i in erased.iter() {
++        option_shards[i] = None;
++    }
++
++    r.reconstruct_data(&mut option_shards).unwrap();
++
++    for i in 0..n {
++        if i < k {
++            // Every data shard must be recovered exactly.
++            assert_eq!(Some(&expect[i]), option_shards[i].as_ref());
++        } else if erased.contains(&i) {
++            // Erased parity shards must stay missing.
++            assert_eq!(None, option_shards[i]);
++        } else {
++            // Present parity shards must be untouched.
++            assert_eq!(Some(&expect[i]), option_shards[i].as_ref());
++        }
++    }
++}
++
++/// `verify` returns true for a correctly encoded set, and false after
++/// any single byte of any shard (data or parity) is changed. The
++/// encode matrix is MDS (every parity coefficient is non-zero), so a
++/// single-byte change must always be detected.
++#[hegel::test]
++fn hegel_verify_detects_single_byte_corruption(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let n = k + m;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    let mut shards = draw_shards(&tc, k, m, shard_len);
++    let r = ReedSolomon::new(k, m).unwrap();
++    r.encode(&mut shards).unwrap();
++
++    assert!(r.verify(&shards).unwrap());
++
++    // Corrupt one drawn byte of one drawn shard by a non-zero delta,
++    // guaranteeing the shard set is genuinely different.
++    let shard_idx = tc.draw(generators::integers::<usize>().max_value(n - 1));
++    let byte_idx = tc.draw(generators::integers::<usize>().max_value(shard_len - 1));
++    let delta = tc.draw(generators::integers::<u8>().min_value(1));
++    shards[shard_idx][byte_idx] ^= delta;
++
++    assert!(!r.verify(&shards).unwrap());
++}
++
++/// Encoding is a pure function of (k, m, data): two independently
++/// constructed codecs must produce identical parity, regardless of
++/// what the parity buffers contained beforehand (the docs promise the
++/// parity slots are completely overwritten).
++#[hegel::test]
++fn hegel_encode_deterministic_regardless_of_parity_prefill(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    // First copy: zeroed parity buffers.
++    let mut shards_a = draw_shards(&tc, k, m, shard_len);
++    // Second copy: same data, garbage in the parity buffers.
++    let mut shards_b = shards_a.clone();
++    let garbage: Vec<u8> = tc.draw(
++        generators::binary()
++            .min_size(m * shard_len)
++            .max_size(m * shard_len),
++    );
++    for (i, chunk) in garbage.chunks(shard_len).enumerate() {
++        shards_b[k + i].copy_from_slice(chunk);
++    }
++
++    let r_a = ReedSolomon::new(k, m).unwrap();
++    let r_b = ReedSolomon::new(k, m).unwrap();
++    r_a.encode(&mut shards_a).unwrap();
++    r_b.encode(&mut shards_b).unwrap();
++
++    assert_eq!(shards_a, shards_b);
++
++    // Re-encoding with the same codec is idempotent.
++    let mut shards_c = shards_a.clone();
++    r_a.encode(&mut shards_c).unwrap();
++    assert_eq!(shards_a, shards_c);
++}
++
++/// Shard-size independence: encoding operates on each byte position
++/// independently, so parity byte j of the full-length encoding must
++/// equal the parity produced by encoding just column j as 1-byte
++/// shards.
++#[hegel::test]
++fn hegel_encode_is_columnwise(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(10));
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(64));
++
++    let mut shards = draw_shards(&tc, k, m, shard_len);
++    let r = ReedSolomon::new(k, m).unwrap();
++    let data_only = shards[..k].to_vec();
++    r.encode(&mut shards).unwrap();
++
++    let col = tc.draw(generators::integers::<usize>().max_value(shard_len - 1));
++
++    // Encode just that column as 1-byte shards.
++    let mut column_shards: Vec<Vec<u8>> = data_only.iter().map(|s| vec![s[col]]).collect();
++    for _ in 0..m {
++        column_shards.push(vec![0u8]);
++    }
++    r.encode(&mut column_shards).unwrap();
++
++    for i in 0..m {
++        assert_eq!(shards[k + i][col], column_shards[k + i][0]);
++    }
++}
++
++/// k = 1 edge case: with a single data shard the systematic
++/// Vandermonde construction makes every encode-matrix row equal to
++/// [1] (`vandermonde` entry [r][0] = nth(r)^0 = 1, and the top 1x1
++/// submatrix is [1]), so every parity shard is an exact copy of the
++/// data shard.
++#[hegel::test]
++fn hegel_single_data_shard_parity_equals_data(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(255));
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(32));
++
++    let mut shards = draw_shards(&tc, 1, m, shard_len);
++    let r = ReedSolomon::new(1, m).unwrap();
++    r.encode(&mut shards).unwrap();
++
++    for i in 0..m {
++        assert_eq!(shards[0], shards[1 + i]);
++    }
++}
++
++/// m = 1 edge case: a single parity shard must be able to recover any
++/// one erased shard, for any data shard count up to the field limit.
++#[hegel::test]
++fn hegel_single_parity_recovers_any_single_erasure(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(255));
++    let n = k + 1;
++    let shard_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(16));
++
++    let mut shards = draw_shards(&tc, k, 1, shard_len);
++    let r = ReedSolomon::new(k, 1).unwrap();
++    r.encode(&mut shards).unwrap();
++    let expect = shards.clone();
++
++    let erased = tc.draw(generators::integers::<usize>().max_value(n - 1));
++
++    let mut option_shards = shards_into_option_shards(shards);
++    option_shards[erased] = None;
++
++    r.reconstruct(&mut option_shards).unwrap();
++
++    assert_eq!(expect, option_shards_into_shards(option_shards));
++}

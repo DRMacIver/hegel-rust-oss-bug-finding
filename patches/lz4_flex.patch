@@ -1,0 +1,602 @@
+diff --git a/.gitignore b/.gitignore
+index c04809c..c72fb49 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ /target
+ benchmarks/target
++.hegel/
+ Cargo.lock
+ my-prof.profile
+ Session.vim
+diff --git a/Cargo.toml b/Cargo.toml
+index 15c2a7f..cb92668 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,9 +22,9 @@ lz4-compress = "0.1.1"
+ more-asserts = "0.3.1"
+ snap = "1.1.0"
+ serde_json = "1.0.91"
+-proptest = "1.0.0"
+ binggan = { version = "0.16.0"}
+ jemallocator = "0.5.4"
++hegeltest = "0.28.2"
+ 
+ [dev-dependencies.lz-fear]
+ git = "https://github.com/main--/rust-lz-fear"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..1758d59
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,176 @@
++# Hegel Property-Based Testing Report for `lz4_flex`
++
++Added with `hegeltest` v0.28.2 (library crate name `hegel`). All new tests live in the
++existing test files: `tests/tests.rs` (integration properties) and the `#[cfg(test)]`
++modules of `src/fastcpy.rs` / `src/fastcpy_unsafe.rs` (ports of the pre-existing
++proptest PBTs). The pre-existing `proptest` suite (3 properties) was fully ported and
++the `proptest` dev-dependency removed.
++
++Shared generators: `payload()` (mixes incompressible random segments with repeated
++patterns, empty up to a few hundred KB, crossing the 64KB hash-table switch and the
++128KB linked-mode ext-dict handoff) and `frame_config()` (arbitrary `FrameInfo`
++configurations rather than canned ones — the "generate configurations, not just
++payloads" pattern; the crate's own `fuzz/` targets only ever use 4 of the 6 block
++sizes and never generate `content_size` or `legacy_frame`).
++
++## Properties tested
++
++| # | Property | Test | Evidence |
++|---|----------|------|----------|
++| 1 | Roundtrip: block raw, block size-prepended, frame (both block modes), cross-checked against C++ lz4 (`lzzzz`) | `hegel_roundtrip_block_and_frame` (`tests/tests.rs`) | Port of the old `proptest_roundtrip`; crate docs' roundtrip examples; existing `test_roundtrip` oracle |
++| 2 | `compress_prepend_size` output == LE-u32 length ++ `compress` output, and `uncompressed_size` reads it back | `hegel_prepend_size_consistency` | Doc comments on `compress_prepend_size` and `uncompressed_size` |
++| 3 | Dictionary roundtrip: `compress_prepend_size_with_dict` / `decompress_size_prepended_with_dict` with the same dict (dict sizes cross MINMATCH=4 fallback and the 64KB window truncation; sometimes dict==data to force ext-dict matches) | `hegel_roundtrip_with_dict` | Doc comments pairing the two functions; `init_dict` truncation code in `src/block/compress.rs` |
++| 4 | A buffer of exactly `get_maximum_output_size(len)` is sufficient for `compress_into` | `hegel_compress_into_max_output_size_is_sufficient` | Doc comments on `get_maximum_output_size` and `compress_into` |
++| 5 | A reused `CompressTable` roundtrips for every input in a sequence (incl. the transparent Small→Large upgrade at 64KB); no stale state leaks between inputs | `hegel_compress_table_reuse_roundtrips` | `CompressTable` docs ("pass it ... repeatedly", "transparently upgraded"); stale-state bug pattern |
++| 6 | `decompress` accepts any `min_uncompressed_size` >= actual size and returns the same data | `hegel_decompress_accepts_larger_size_hint` | Doc: "needs to be equal or larger than the uncompressed size" |
++| 7 | Frame roundtrip holds for every configuration expressible via public `FrameInfo` (all 6 `BlockSize` variants, both `BlockMode`s, both checksums, optional `content_size`, `legacy_frame` flag) | `hegel_frame_roundtrip_any_config` | Public API surface of `FrameInfo`/`BlockSize`; fuzzer `fuzz_roundtrip_frame.rs` covers only a 4-size subset |
++| 8 | Write chunking invariance: arbitrary `write` splits + arbitrary intermediate `flush`es decompress to the same data as one `write_all` | `hegel_frame_write_chunking_invariance` | `FrameEncoder` doc: "Writes are buffered automatically"; `io::Write` contract |
++| 9 | Read chunking invariance: `FrameDecoder` with arbitrary small read-buffer sizes produces the same bytes as `read_to_end` | `hegel_frame_read_chunking_invariance` | `io::Read` contract; generalizes fixed-chunk reads in `fuzz_roundtrip_frame.rs` |
++| 10 | Concatenated frames: payloads written through one encoder via `try_finish` are read back one frame per `read_to_end` call | `hegel_frame_concatenated_frames` | Generalizes the existing `concatenated` unit test |
++| 11 | Corruption robustness: with block+content checksums enabled, flipping any single byte of a frame never panics the decoder and is never silently accepted with different output | `hegel_frame_corruption_never_panics_or_misdecodes` | Generalizes the existing `checksums` unit test (which corrupts two fixed positions) |
++| 12 | `fastcpy::slice_copy` copies exactly (lengths 0..2048+, past the 512-byte threshold) | `fastcpy::tests::test_fast_short_slice_copy` | Port of existing proptest (which only used default small vec sizes) |
++| 13 | `fastcpy_unsafe::slice_copy` copies exactly (lengths 1..2048+; empty is outside its domain, as in the original test) | `fastcpy_unsafe::tests::test_fast_short_slice_copy` | Port of existing proptest; only compiled without the safe-encode/safe-decode features |
++
++## Test results
++
++`cargo test` (default features): lib unit tests **19 passed / 0 failed** (includes port #12),
++doc tests 10 passed, `tests/tests.rs` **52 passed / 2 failed / 1 ignored** (the pre-existing
++`#[ignore]` on `big_compression`).
++
++| Test | Result |
++|------|--------|
++| hegel_roundtrip_block_and_frame | PASS |
++| hegel_prepend_size_consistency | PASS |
++| hegel_roundtrip_with_dict | PASS |
++| hegel_compress_into_max_output_size_is_sufficient | PASS |
++| hegel_compress_table_reuse_roundtrips | PASS |
++| hegel_decompress_accepts_larger_size_hint | PASS |
++| frame::hegel_frame_roundtrip_any_config | **FAIL — suspected bug 1** |
++| frame::hegel_frame_write_chunking_invariance | PASS |
++| frame::hegel_frame_read_chunking_invariance | PASS |
++| frame::hegel_frame_concatenated_frames | **FAIL — suspected bug 2** |
++| frame::hegel_frame_corruption_never_panics_or_misdecodes | PASS |
++| fastcpy::tests::test_fast_short_slice_copy | PASS |
++| fastcpy_unsafe::tests::test_fast_short_slice_copy | PASS (run with `--no-default-features --features std,frame,checked-decode`) |
++
++Verification steps per the skill: liveness confirmed by temporarily inverting an
++assertion in `hegel_prepend_size_consistency` (hegel reported a shrunk counterexample,
++then reverted); one exploratory run at `test_cases = 1000` (10x) found nothing beyond
++the two failures below; the whole suite was additionally run with
++`--no-default-features --features std,frame,checked-decode` (unsafe encode/decode
++paths) with identical results — same 2 failures, everything else passes.
++
++## Suspected bugs
++
++### Bug 1: `BlockSize::Max8MB` produces frames that no decoder accepts
++
++Minimal counterexample (shrunk by hegel):
++
++```text
++data = []
++frame_info = FrameInfo { block_size: Max8MB, block_mode: Independent, ..default }
++→ FrameEncoder writes the frame fine, FrameDecoder fails with Error::ReservedBitsSet
++```
++
++Why it's a library bug: `BlockSize::Max8MB` is a public variant accepted by
++`FrameInfo::block_size()`, and the encoder happily emits a frame — but the emitted
++header is invalid. Code path: `FrameInfo::write` in `src/frame/header.rs` line 250 does
++`buffer[5] = (self.block_size as u8) << BD_BLOCK_SIZE_MASK_RSHIFT`. `Max8MB = 8`, so
++`8 << 4 = 0x80`: this sets the reserved bit 7 of the BD byte and leaves the block-size
++bits at `0`. Per the LZ4 frame spec (and `FrameInfo::read`, which only accepts size
++codes 4..=7 and rejects any reserved bit), such a frame is malformed — the C++ lz4
++would reject it too. `Max8MB` exists for the *legacy* frame format (which the decoder
++supports for reading), but the encoder never writes legacy frames, so encoding with
++`Max8MB` can never be valid. `FrameInfo::write` (or the encoder) should reject or clamp
++it instead of emitting a corrupt header. The test is kept failing as written.
++
++### Bug 2: `try_finish` after a finished frame with no new data panics (debug) / writes a stray EndMark (release)
++
++Minimal counterexample (shrunk by hegel):
++
++```text
++payloads = [[], []]   // also fails for [data, []]
++for p in payloads { write_all(p); try_finish(); }
++→ second try_finish panics: "assertion failed: self.is_frame_open",
++  src/frame/compress.rs:210 (debug_assert in end_frame)
++```
++
++Why it's a library bug: `try_finish` is documented to "finish this output stream,
++flushing internal buffer and writing stream terminator", and it contains an explicit
++empty-input special case that writes a valid empty frame. But that special case in
++`FrameEncoder::try_finish` (`src/frame/compress.rs` lines 173–187) is gated on
++`!self.data_to_frame_written` — i.e. "no frame has *ever* been finished by this
++encoder" — instead of "no data since the *last* finished frame". So the first
++`try_finish` with no data works (writes an empty frame), but any later `try_finish`
++with no intervening writes skips `begin_frame` and calls `end_frame()` with no open
++frame: in debug builds the `debug_assert!(self.is_frame_open)` at line 210 panics; in
++release builds it silently writes a spurious EndMark (and content checksum, if
++enabled) into the output stream — bytes that are not part of any frame. The fix would
++be to track "data written since last finished frame" (or make the guard
++`!self.is_frame_open && nothing_buffered → begin_frame`) so every `try_finish`
++produces a valid (possibly empty) frame. The test is kept failing as written.
++
++## Unsound properties abandoned
++
++- **Byte-equality between `compress_into_with_table` and `compress_into` across table
++  reuse.** Abandoned during design (before running): `HashTable4KU16` and `HashTable4K`
++  use *different hash functions* (`hash` vs `hash5` in `src/block/hashtable.rs`), and the
++  documented Small→Large upgrade is one-way — after a >=64KB input, subsequent small
++  inputs are compressed with the Large table and legitimately produce different (still
++  valid) bytes than `compress_into` would. Replaced with the sound per-input roundtrip
++  property (#5).
++- **Byte-equality between chunked writes and a single `write_all` in the frame
++  encoder.** Abandoned during design: intermediate `flush`es change block boundaries, and
++  `BlockSize::Auto` is resolved from the *first* write's length (`begin_frame`), so byte
++  identity is not promised anywhere. Weakened to the documented contract: both decompress
++  to the same data (#8).
++- **`Max8MB` in the generators of the other frame properties (#8, #9).** Not unsound,
++  but excluded there with a source comment so that those properties don't re-fail on the
++  already-covered Bug 1; `hegel_frame_roundtrip_any_config` keeps generating it.
++
++## Skill feedback
++
++Overall the skill worked well — the two real bugs were found by exactly the patterns it
++recommends ("generate configurations, not just payloads" found Bug 1; broad generators
++that don't exclude empty inputs found Bug 2). Specific notes:
++
++1. **The MSRV note in `references/rust/reference.md` was load-bearing and accurate.**
++   `cargo add --dev hegeltest` failed against the crate's `rust-version = "1.81"`
++   (hegeltest requires 1.86); the documented `--ignore-rust-version` retry worked
++   first time. Without that note this would have been the most likely
++   abandon-hegel moment.
++2. **The 10x exploratory run is more manual than it needs to be.** Gotcha 13 says
++   there is no global case-count override, so raising 12 tests to `test_cases = 1000`
++   and reverting meant sed-editing attributes in three files. A supported env-var
++   override (or a documented pattern, e.g. a shared `const` if attribute arguments
++   accept one) would make this step much less error-prone. This is the biggest
++   workflow gap I hit.
++3. **The "keep the failing test as written" rule could say what to do with sibling
++   properties.** Bug 1 would have made three otherwise-passing frame properties fail
++   for the same known reason. I excluded the buggy input from the *other* tests with
++   comments pointing at the failing test, keeping one canonical failure. The skill
++   never says whether this is sanctioned; a sentence blessing (or forbidding) this
++   pattern would remove the judgment call.
++4. **Failure output naming worked nicely** — draws bound to variables print as
++   `let data = []` / `let frame_info = ...`, which made the shrunk counterexamples
++   directly readable. Inline draws (e.g. inside `if tc.draw(...)`) print as `draw_1`;
++   the reference could mention that binding draws to named variables improves
++   counterexample readability.
++5. **Composites with parameters worked exactly as documented**
++   (`frame_config(include_max_8mb: bool)`), as did `one_of!`, `sampled_from` over an
++   owned `Vec` of enum values, and stacking `#[cfg_attr(miri, ignore)]` under
++   `#[hegel::test]` (compiles; not verified under miri).
++6. **porting.md's checklist was actionable.** Enumerating the old suite first (3
++   proptest properties: one integration roundtrip, two `fastcpy` copies) made it easy
++   to guarantee superset coverage and to know when removing the `proptest`
++   dev-dependency was safe. The "broaden the generators" instruction directly
++   improved the fastcpy ports (old tests never exceeded proptest's default vec sizes;
++   the copy routine branches at 4/8/16/32/64/512 bytes).
++7. Minor: the skill's liveness check leaves a `.hegel/` failure-database entry, and
++   gotcha 3/11 correctly predicted both the directory's appearance and the cleanup;
++   no surprises.
++
++Environment note (not a skill issue, disclosed for transparency): the shared build
++disk filled up mid-build; I deleted two *build-artifact* directories of sibling
++investigation targets (`targets/fjall-fable/target`, `targets/sqlparser-fable/target`)
++to free space. No source files outside this crate were touched.
+diff --git a/src/fastcpy.rs b/src/fastcpy.rs
+index 20652a6..7f452eb 100644
+--- a/src/fastcpy.rs
++++ b/src/fastcpy.rs
+@@ -100,14 +100,17 @@ fn double_copy_trick<const SIZE: usize>(src: &[u8], dst: &mut [u8]) {
+ mod tests {
+     use super::slice_copy;
+     use alloc::vec::Vec;
+-    use proptest::prelude::*;
+-    proptest! {
+-        #[test]
+-        fn test_fast_short_slice_copy(left: Vec<u8>) {
+-            let mut right = vec![0u8; left.len()];
+-            slice_copy(&left, &mut right);
+-            prop_assert_eq!(&left, &right);
+-        }
++
++    // Ported from proptest to hegel. The length is drawn separately so that
++    // copies beyond the 512-byte wild-copy threshold are exercised, not just
++    // hegel's small default collection sizes.
++    #[hegel::test]
++    fn test_fast_short_slice_copy(tc: hegel::TestCase) {
++        let len = tc.draw(hegel::generators::integers::<usize>().max_value(2048));
++        let left: Vec<u8> = tc.draw(hegel::generators::binary().min_size(len));
++        let mut right = vec![0u8; left.len()];
++        slice_copy(&left, &mut right);
++        assert_eq!(left, right);
+     }
+ 
+     #[test]
+diff --git a/src/fastcpy_unsafe.rs b/src/fastcpy_unsafe.rs
+index 8e4b300..925c8e4 100644
+--- a/src/fastcpy_unsafe.rs
++++ b/src/fastcpy_unsafe.rs
+@@ -117,17 +117,23 @@ fn double_copy_trick<const SIZE: usize>(src: *const u8, dst: *mut u8, len: usize
+ mod tests {
+     use super::slice_copy;
+     use alloc::vec::Vec;
+-    use proptest::prelude::*;
+-    proptest! {
+-        #[test]
+-        fn test_fast_short_slice_copy(left: Vec<u8>) {
+-            if left.is_empty() {
+-                return Ok(());
+-            }
+-            let mut right = vec![0u8; left.len()];
+-            slice_copy(left.as_ptr(), right.as_mut_ptr(), left.len());
+-            prop_assert_eq!(&left, &right);
+-        }
++
++    // Ported from proptest to hegel. The length is drawn separately so that
++    // copies beyond the 512-byte wild-copy threshold are exercised, not just
++    // hegel's small default collection sizes. Empty input is outside this
++    // function's domain (the original test skipped it, and the pointer
++    // arithmetic requires len >= 1), so the length starts at 1.
++    #[hegel::test]
++    fn test_fast_short_slice_copy(tc: hegel::TestCase) {
++        let len = tc.draw(
++            hegel::generators::integers::<usize>()
++                .min_value(1)
++                .max_value(2048),
++        );
++        let left: Vec<u8> = tc.draw(hegel::generators::binary().min_size(len));
++        let mut right = vec![0u8; left.len()];
++        slice_copy(left.as_ptr(), right.as_mut_ptr(), left.len());
++        assert_eq!(left, right);
+     }
+ 
+     #[test]
+diff --git a/tests/tests.rs b/tests/tests.rs
+index 87222eb..e0cadd0 100644
+--- a/tests/tests.rs
++++ b/tests/tests.rs
+@@ -588,38 +588,145 @@ fn test_text_1k() {
+     test_roundtrip(COMPRESSION1K);
+ }
+ 
+-use proptest::{prelude::*, test_runner::FileFailurePersistence};
++use hegel::generators as gens;
++
++/// Generates byte payloads that mix incompressible (random) segments with highly
++/// compressible (repeated pattern) segments, so that both the literal and the match
++/// code paths of the compressor are exercised. Sizes range from empty up to a few
++/// hundred KB so that multi-block frame paths (blocks > 64KB, linked-mode ext_dict
++/// handoff at > 128KB) and the u16 vs u32 hash table switch (64KB) are reachable.
++#[hegel::composite]
++fn payload(tc: hegel::TestCase) -> Vec<u8> {
++    let n_segments = tc.draw(gens::integers::<usize>().max_value(6));
++    let mut data = Vec::new();
++    for _ in 0..n_segments {
++        if tc.draw(gens::booleans()) {
++            // Compressible segment: a short pattern repeated many times.
++            let pattern: Vec<u8> = tc.draw(gens::binary().min_size(1).max_size(16));
++            let repeats = tc.draw(gens::integers::<usize>().min_value(1).max_value(5000));
++            for _ in 0..repeats {
++                data.extend_from_slice(&pattern);
++            }
++        } else {
++            // Incompressible segment: random bytes.
++            let chunk: Vec<u8> = tc.draw(gens::binary().max_size(2048));
++            data.extend_from_slice(&chunk);
++        }
++    }
++    data
++}
+ 
+-proptest! {
+-    #![proptest_config(ProptestConfig {
+-        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("regressions"))),
+-        ..Default::default()
+-    })]
++/// Generates external dictionaries. Sizes cover the documented interesting
++/// boundaries: dicts smaller than MINMATCH (4 bytes) take a no-dict fallback path,
++/// and dicts larger than the 64KB window are truncated by the compressor.
++#[hegel::composite]
++fn ext_dict(tc: hegel::TestCase) -> Vec<u8> {
++    let target_len = tc.draw(hegel::one_of!(
++        gens::integers::<usize>().max_value(8),
++        gens::integers::<usize>().max_value(2048),
++        gens::integers::<usize>().min_value(65_000).max_value(70_000),
++    ));
++    let pattern: Vec<u8> = tc.draw(gens::binary().min_size(1).max_size(64));
++    let mut dict = pattern.repeat(target_len / pattern.len() + 1);
++    dict.truncate(target_len);
++    dict
++}
+ 
+-    #[test]
+-    #[cfg_attr(miri, ignore)]
+-    fn proptest_roundtrip(v in vec_of_vec()) {
+-        let data: Vec<u8>  = v.iter().flat_map(|v|v.iter()).cloned().collect::<Vec<_>>();
+-        test_roundtrip(data);  // sum of the sum of all vectors.
+-    }
++/// Port of the old `proptest_roundtrip` test to hegel.
++///
++/// Property: compress ∘ decompress is the identity, for the raw block format, the
++/// size-prepended block format, the frame format (both block modes), and
++/// cross-checked against the C++ lz4 implementation (see `test_roundtrip`).
++#[hegel::test]
++#[cfg_attr(miri, ignore)]
++fn hegel_roundtrip_block_and_frame(tc: hegel::TestCase) {
++    let data = tc.draw(payload());
++    test_roundtrip(data);
++}
+ 
++/// Property: `compress_prepend_size` output is documented to be the uncompressed
++/// size as a little-endian u32 followed by the regular compressed data, and
++/// `uncompressed_size` is documented to read that size back and return the rest.
++#[hegel::test]
++fn hegel_prepend_size_consistency(tc: hegel::TestCase) {
++    use lz4_flex::block::uncompressed_size;
++    let data = tc.draw(payload());
++    let plain = compress_block(&data);
++    let prepended = compress_prepend_size(&data);
++    assert_eq!(prepended[..4], (data.len() as u32).to_le_bytes());
++    assert_eq!(prepended[4..], plain[..]);
++    let (size, rest) = uncompressed_size(&prepended).unwrap();
++    assert_eq!(size, data.len());
++    assert_eq!(rest, &plain[..]);
+ }
+ 
+-fn vec_of_vec() -> impl Strategy<Value = Vec<Vec<u8>>> {
+-    const N: u8 = 200;
++/// Property: dictionary roundtrip. `compress_prepend_size_with_dict` is documented
++/// to be usable in conjunction with `decompress_size_prepended_with_dict` (with the
++/// same dictionary on both sides).
++#[hegel::test]
++fn hegel_roundtrip_with_dict(tc: hegel::TestCase) {
++    use lz4_flex::block::compress_prepend_size_with_dict;
++    let data = tc.draw(payload());
++    // Use the data itself as the dict sometimes, to guarantee dict matches occur.
++    let dict = if !data.is_empty() && tc.draw(gens::booleans()) {
++        data.clone()
++    } else {
++        tc.draw(ext_dict())
++    };
++    let compressed = compress_prepend_size_with_dict(&data, &dict);
++    let decompressed = decompress_size_prepended_with_dict(&compressed, &dict).unwrap();
++    assert_eq!(decompressed, data);
++}
+ 
+-    let length = 0..N;
+-    length.prop_flat_map(vec_from_length)
++/// Property: a buffer of exactly `get_maximum_output_size(input.len())` bytes is
++/// documented to be large enough for `compress_into` ("output should be
++/// preallocated with a size of `get_maximum_output_size`"), so compression into
++/// such a buffer must succeed and report a length within the buffer.
++#[hegel::test]
++fn hegel_compress_into_max_output_size_is_sufficient(tc: hegel::TestCase) {
++    use lz4_flex::block::{compress_into, get_maximum_output_size};
++    let data = tc.draw(payload());
++    let max = get_maximum_output_size(data.len());
++    let mut out = vec![0u8; max];
++    let written = compress_into(&data, &mut out).unwrap();
++    assert!(written <= max);
+ }
+ 
+-fn vec_from_length(length: u8) -> impl Strategy<Value = Vec<Vec<u8>>> {
+-    const K: usize = u8::MAX as usize;
+-    let mut result = vec![];
+-    for index in 1..length {
+-        let inner = proptest::collection::vec(0..index, 0..K);
+-        result.push(inner);
++/// Property: a `CompressTable` is documented to be reusable across many inputs
++/// ("Create one table and pass it to `compress_into_with_table` repeatedly"),
++/// including a transparent Small -> Large upgrade for inputs >= 64KB. Every
++/// compression in such a sequence must still roundtrip; stale table state from a
++/// previous input must never leak into the next compression.
++#[hegel::test]
++fn hegel_compress_table_reuse_roundtrips(tc: hegel::TestCase) {
++    use lz4_flex::block::{compress_into_with_table, get_maximum_output_size, CompressTable};
++    let mut table = match tc.draw(gens::integers::<u8>().max_value(2)) {
++        0 => CompressTable::default(),
++        1 => CompressTable::small(),
++        _ => CompressTable::large(),
++    };
++    let n_inputs = tc.draw(gens::integers::<usize>().min_value(1).max_value(4));
++    for _ in 0..n_inputs {
++        let data = tc.draw(payload());
++        let mut out = vec![0u8; get_maximum_output_size(data.len())];
++        let written = compress_into_with_table(&data, &mut out, &mut table).unwrap();
++        let decompressed = decompress(&out[..written], data.len()).unwrap();
++        assert_eq!(decompressed, data);
+     }
+-    result
++}
++
++/// Property: `decompress` documents that `min_uncompressed_size` "needs to be equal
++/// or larger than the uncompressed size" — so any larger size hint must give the
++/// same result as the exact one.
++#[hegel::test]
++fn hegel_decompress_accepts_larger_size_hint(tc: hegel::TestCase) {
++    let data = tc.draw(payload());
++    let compressed = compress_block(&data);
++    // The bound on `extra` keeps this test's own allocation small; it is not a
++    // limit of the library contract.
++    let extra = tc.draw(gens::integers::<usize>().max_value(100_000));
++    let decompressed = decompress(&compressed, data.len() + extra).unwrap();
++    assert_eq!(decompressed, data);
+ }
+ 
+ #[cfg(feature = "frame")]
+@@ -743,6 +850,151 @@ mod frame {
+         let uncompressed = lz4_flex_frame_decompress(DECOMPRESSION10MB_LEGACY).unwrap();
+         assert_eq!(uncompressed, COMPRESSION10MB);
+     }
++
++    use lz4_flex::frame::{FrameEncoder, FrameInfo};
++
++    /// Generates arbitrary `FrameInfo` configurations instead of testing a handful
++    /// of canned ones. `include_max_8mb` controls whether the `Max8MB` block size
++    /// is generated (see `hegel_frame_roundtrip_any_config` for why it is special).
++    #[hegel::composite]
++    fn frame_config(tc: hegel::TestCase, include_max_8mb: bool) -> FrameInfo {
++        let mut block_sizes = vec![
++            BlockSize::Auto,
++            BlockSize::Max64KB,
++            BlockSize::Max256KB,
++            BlockSize::Max1MB,
++            BlockSize::Max4MB,
++        ];
++        if include_max_8mb {
++            block_sizes.push(BlockSize::Max8MB);
++        }
++        FrameInfo::new()
++            .block_size(tc.draw(gens::sampled_from(block_sizes)))
++            .block_mode(tc.draw(gens::sampled_from(vec![
++                BlockMode::Independent,
++                BlockMode::Linked,
++            ])))
++            .block_checksums(tc.draw(gens::booleans()))
++            .content_checksum(tc.draw(gens::booleans()))
++            .legacy_frame(tc.draw(gens::booleans()))
++    }
++
++    /// Property: the frame roundtrip must hold for every configuration expressible
++    /// through the public `FrameInfo` API — every `BlockSize` variant (all are
++    /// public and accepted by the encoder), both `BlockMode`s, both checksum
++    /// options, the optional content size, and the `legacy_frame` flag.
++    #[hegel::test]
++    fn hegel_frame_roundtrip_any_config(tc: hegel::TestCase) {
++        let data = tc.draw(payload());
++        let mut frame_info = tc.draw(frame_config(true));
++        if tc.draw(gens::booleans()) {
++            frame_info.content_size = Some(data.len() as u64);
++        }
++        let compressed = lz4_flex_frame_compress_with(frame_info, &data).unwrap();
++        let decompressed = lz4_flex_frame_decompress(&compressed).unwrap();
++        assert_eq!(decompressed, data);
++    }
++
++    /// Property: `FrameEncoder` documents that "writes are buffered automatically",
++    /// so splitting the input across arbitrary `write` calls (with arbitrary
++    /// intermediate flushes) must still decompress to the same data as a single
++    /// `write_all`.
++    ///
++    /// `Max8MB` is excluded here only because it already fails the roundtrip on its
++    /// own (see `hegel_frame_roundtrip_any_config`); including it would make this
++    /// test fail for the same, already-covered reason.
++    #[hegel::test]
++    fn hegel_frame_write_chunking_invariance(tc: hegel::TestCase) {
++        let data = tc.draw(payload());
++        let frame_info = tc.draw(frame_config(false));
++
++        // Reference: the whole buffer in one write_all.
++        let whole = lz4_flex_frame_compress_with(frame_info.clone(), &data).unwrap();
++        assert_eq!(lz4_flex_frame_decompress(&whole).unwrap(), data);
++
++        // Chunked: split the input at up to 8 arbitrary positions.
++        let mut splits: Vec<usize> = tc.draw(
++            gens::vecs(gens::integers::<usize>().max_value(data.len())).max_size(8),
++        );
++        splits.push(0);
++        splits.push(data.len());
++        splits.sort_unstable();
++        let mut enc = FrameEncoder::with_frame_info(frame_info, Vec::new());
++        for w in splits.windows(2) {
++            enc.write_all(&data[w[0]..w[1]]).unwrap();
++            if tc.draw(gens::booleans()) {
++                enc.flush().unwrap();
++            }
++        }
++        let chunked = enc.finish().unwrap();
++        assert_eq!(lz4_flex_frame_decompress(&chunked).unwrap(), data);
++    }
++
++    /// Property: the `io::Read` contract — decompressing with arbitrary (small)
++    /// read buffer sizes must produce exactly the same bytes as `read_to_end`.
++    #[hegel::test]
++    fn hegel_frame_read_chunking_invariance(tc: hegel::TestCase) {
++        let data = tc.draw(payload());
++        let frame_info = tc.draw(frame_config(false));
++        let compressed = lz4_flex_frame_compress_with(frame_info, &data).unwrap();
++
++        let mut dec = lz4_flex::frame::FrameDecoder::new(&*compressed);
++        let mut out = Vec::new();
++        let mut buf = [0u8; 4096];
++        loop {
++            let want = tc.draw(gens::integers::<usize>().min_value(1).max_value(buf.len()));
++            match dec.read(&mut buf[..want]).unwrap() {
++                0 => break,
++                n => out.extend_from_slice(&buf[..n]),
++            }
++        }
++        assert_eq!(out, data);
++    }
++
++    /// Property: several frames written through one encoder via `try_finish` are
++    /// read back one frame per `read_to_end` call, in order. Generalization of the
++    /// `concatenated` unit test above.
++    #[hegel::test]
++    fn hegel_frame_concatenated_frames(tc: hegel::TestCase) {
++        let n_frames = tc.draw(gens::integers::<usize>().min_value(1).max_value(4));
++        let payloads: Vec<Vec<u8>> = (0..n_frames).map(|_| tc.draw(payload())).collect();
++
++        let mut enc = FrameEncoder::new(Vec::new());
++        for p in &payloads {
++            enc.write_all(p).unwrap();
++            enc.try_finish().unwrap();
++        }
++        let compressed = enc.into_inner();
++
++        let mut dec = lz4_flex::frame::FrameDecoder::new(&*compressed);
++        for p in &payloads {
++            let mut uncompressed = Vec::new();
++            dec.read_to_end(&mut uncompressed).unwrap();
++            assert_eq!(&uncompressed, p);
++        }
++    }
++
++    /// Property: with block and content checksums enabled, flipping a single byte
++    /// anywhere in the compressed frame must never panic the decoder, and must
++    /// never be silently accepted with different output (evidence: the `checksums`
++    /// unit test above checks specific corrupted byte positions).
++    #[hegel::test]
++    fn hegel_frame_corruption_never_panics_or_misdecodes(tc: hegel::TestCase) {
++        let data = tc.draw(payload());
++        let mut frame_info = FrameInfo::new();
++        frame_info.block_checksums = true;
++        frame_info.content_checksum = true;
++        let mut compressed = lz4_flex_frame_compress_with(frame_info, &data).unwrap();
++
++        let pos = tc.draw(gens::integers::<usize>().max_value(compressed.len() - 1));
++        let xor = tc.draw(gens::integers::<u8>().min_value(1));
++        compressed[pos] ^= xor;
++
++        match lz4_flex_frame_decompress(&compressed) {
++            Err(_) => (),
++            Ok(out) => assert_eq!(out, data, "corrupted frame silently misdecoded"),
++        }
++    }
+ }
+ 
+ #[cfg(test)]

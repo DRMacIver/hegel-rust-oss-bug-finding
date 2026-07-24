@@ -1,0 +1,1051 @@
+diff --git a/.gitignore b/.gitignore
+index 52302ad..d859d74 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,3 +4,4 @@
+ Cargo.lock
+ /.vscode
+ /.idea
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..57ea7fc
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,165 @@
++# Hegel Property-Based Testing Report: etherparse
++
++## 1. Summary
++
++Added 14 hegel property-based tests (10 distinct properties) to the `etherparse`
++crate, covering build→parse roundtrips, untrusted-input decoder robustness,
++truncation handling, and spec-transcribed (RFC 1071/768/9293) checksum oracles.
++All tests pass, including a 10x exploratory high-count run. **No bugs were
++found** — consistent with etherparse being a mature, heavily proptest-tested
++parser. There are no pinned/failing tests.
++
++Setup note: `hegeltest` 0.28.2 requires rustc 1.86 while the crate pins
++`rust-version = "1.83.0"`, so the dev-dependency was added with
++`cargo add --dev hegeltest -p etherparse --ignore-rust-version`. This only
++affects the dev-dependency tree; whether that MSRV bump is acceptable is a
++maintainer decision if these tests are ever upstreamed.
++
++Maintainer AI-consent check: no `HUMAN_VS_MACHINE.md`, `.ai-ack`, or anti-AI
++clause in `CONTRIBUTING`/`README`/`LICENSE` was found in this repository.
++
++## 2. Existing Coverage Reviewed and Gaps Targeted
++
++This checkout has no `fuzz/` (cargo-fuzz) directory; the fuzz-equivalent is the
++extensive existing **proptest** suite: per-header `proptest!` modules
++throughout `src/`, the shared strategies in `src/test_gens/mod.rs`, and the
++packet-level `src/compositions_tests.rs` (valid-packet compositions checked
++against `SlicedPacket`/`PacketHeaders`). Those were read and used as evidence
++for which objects the maintainers consider worth generating.
++
++Gaps the new hegel tests target (the existing suite is almost entirely
++*valid-input* focused, and validates checksums against the crate's own
++checksum helpers rather than an independent oracle):
++
++- **Arbitrary/garbage bytes** into every packet-level entry point, including
++  the lax decoders (`LaxSlicedPacket`, `LaxPacketHeaders`) and the
++  `from_ether_type` dispatch (ARP/MACsec/VLAN paths).
++- **Corrupted valid packets** — random byte overwrites biased into the header
++  area where the attacker-controlled length fields (IHL, total length, IPv6
++  extension header length, TCP data offset) live.
++- **Strict every-prefix truncation** (existing tests only check a handful of
++  interesting truncation lengths via `invalid_ser_lengths`).
++- **Spec-transcribed checksum oracles** — RFC 1071 one's-complement sum
++  written independently in the tests, rather than trusting
++  `checksum::Sum16BitWords` to validate itself.
++- **Builder→parser roundtrip** — the existing composition tests serialize
++  header structs directly; the new roundtrip goes through the public
++  `PacketBuilder` API (which computes lengths, ether types, next-header
++  chains, and checksums) and asserts the parsers recover everything exactly.
++
++## 3. Properties Added
++
++Packet level — `etherparse/src/compositions_tests.rs` (`mod hegel_props`):
++
++1. `hegel_builder_parse_roundtrip` (crown roundtrip, 200 cases): builds
++   Ethernet II + {none, single, double} VLAN + {IPv4 with drawn options, IPv6
++   with drawn hop-by-hop/destination-options extension headers} +
++   {UDP, TCP with drawn flags/options, ICMPv4 echo, ICMPv6 echo} + payload via
++   `PacketBuilder`, parses with `PacketHeaders::from_ethernet_slice` and
++   `SlicedPacket::from_ethernet`, and asserts every drawn field recovers
++   exactly. Also asserts oracle-independent consistency of the
++   builder-computed fields: IPv4 `total_len`/IPv6 `payload_length` equal the
++   actual serialized sizes, the written IPv4 checksum equals
++   `calc_header_checksum()`, the written TCP checksum equals
++   `calc_checksum_ipv4_raw`/`calc_checksum_ipv6_raw`, and the IPv6 extension
++   chain (after `set_next_headers`) roundtrips exactly.
++2. `hegel_arbitrary_bytes_never_panic` (key untrusted-decoder target, 500
++   cases): up to 2 KiB of arbitrary bytes (with the IP version nibble
++   occasionally forced to 4/6 to reach the deeper paths) fed to
++   `SlicedPacket::{from_ethernet, from_ip, from_ether_type}`,
++   `PacketHeaders::{from_ethernet_slice, from_ip_slice, from_ether_type}`,
++   `LaxSlicedPacket::{from_ethernet, from_ip}` and
++   `LaxPacketHeaders::{from_ethernet, from_ip}` — must never panic, over-read,
++   or hang.
++3. `hegel_corrupted_packet_never_panics` (500 cases): builds a valid
++   eth+IPv4/IPv6(+ext)+UDP/TCP packet, overwrites 1–8 drawn bytes (biased into
++   the first 60 bytes where IHL/total_len/data-offset/ext-length fields live),
++   and feeds the result to all eight decoders — no panics allowed.
++4. `hegel_truncated_packet_returns_error`: for a valid eth+IPv4(options)+UDP
++   packet, *every* strict prefix must be rejected with a clean `Err` by both
++   `SlicedPacket::from_ethernet` and `PacketHeaders::from_ethernet_slice`
++   (never a panic), while the full packet parses `Ok`.
++
++IPv4 header — `etherparse/src/net/ipv4_header.rs` (`mod hegel_props`):
++
++5. `hegel_write_from_slice_roundtrip`: arbitrary valid header (all fields,
++   options in 4-byte steps 0–40) → `write_raw` → `from_slice` restores the
++   header exactly, consumes exactly `header_len()` bytes, and returns trailing
++   bytes untouched.
++6. `hegel_header_checksum_matches_rfc1071`: `calc_header_checksum` makes the
++   serialized header sum to 0xFFFF under an independently transcribed
++   RFC 1071 one's-complement sum.
++7. `hegel_header_checksum_detects_bit_flip`: flipping any single bit of a
++   validly-checksummed header invalidates the checksum (a ±2^k word change is
++   never ≡ 0 mod 0xFFFF).
++8. `hegel_from_slice_on_prefix_returns_len_error`: every strict prefix of a
++   serialized header yields `HeaderSliceError::Len` — never a panic, never a
++   content error, never `Ok`.
++
++TCP header — `etherparse/src/transport/tcp_header.rs` (`mod hegel_props`):
++
++9. `hegel_to_bytes_from_slice_roundtrip`: arbitrary header (all flags, raw
++   options in 4-byte steps) roundtrips exactly through
++   `to_bytes`/`from_slice` with exact byte-consumption accounting.
++10. `hegel_ipv4_checksum_matches_rfc1071`: `calc_checksum_ipv4_raw` validates
++    against a spec-transcribed IPv4 pseudo-header + segment RFC 1071 sum.
++11. `hegel_from_slice_on_prefix_returns_len_error`: as (8) for TCP, exercising
++    the data-offset-announced length.
++
++UDP header — `etherparse/src/transport/udp_header.rs` (`mod hegel_props`):
++
++12. `hegel_to_bytes_from_slice_roundtrip`: `to_bytes`/`from_bytes` are exact
++    inverses; `from_slice` restores exactly and returns the rest untouched.
++13. `hegel_ipv4_checksum_matches_rfc768`: `with_ipv4_checksum` produces a
++    datagram valid under the transcribed RFC 768 pseudo-header sum, and never
++    transmits the reserved 0 ("no checksum") value.
++14. `hegel_from_slice_on_prefix_returns_len_error`: every strict prefix of the
++    8-byte header errors.
++
++Generator discipline: all bounded draws encode documented contracts (IHL
++options must be multiples of 4 and ≤ 40 bytes; TCP raw options in 4-byte steps
++because `TcpOptions` zero-pads other lengths, which would make exact-equality
++comparison unsound; IPv6 raw extension payloads must be 6+8k bytes; VLAN
++id/pcp, DSCP/ECN/fragment-offset/flow-label field widths). Everything else
++(ports, addresses, ids, flags, TTLs, payload bytes) is drawn full-range.
++
++## 4. Run and Reflect (Verification)
++
++- **Full suite green**: `cargo test -p etherparse` — 1177 lib tests (incl.
++  the 14 hegel tests) + 11 integration + 112 doc tests, 0 failures.
++- **Liveness check**: three representative mutations were applied and all were
++  caught with cleanly shrunk counterexamples, then reverted:
++  - IPv4 roundtrip `assert_eq` → `assert_ne`: failed with the all-zero minimal
++    header.
++  - TCP checksum oracle `0xFFFF` → `0xFFFE`: failed with the minimal all-zero
++    segment (left: 65535, right: 65534).
++  - Arbitrary-bytes test asserting `from_ethernet(...).is_err()`: failed with
++    the shrunk 14-zero-byte frame — which also confirms the property is not
++    vacuous: the decoders' `Ok` path is genuinely reached by the generator.
++- **Exploratory 10x run**: all case counts temporarily raised 10x
++  (100→1000, 200→2000, 500→5000) with per-test atomic case counters printing
++  progress; the log confirmed the expected totals actually executed
++  (1000/2000/5000+ cases per test). Everything still passed; instrumentation
++  then removed. The committed tests keep CI-friendly counts (default/200/500).
++- `.hegel/` failure database removed after the deliberate liveness failures
++  and added to `.gitignore`.
++
++## 5. Findings and Bugs
++
++**No bugs found.** Specifically:
++
++- No panics, over-reads, or hangs from arbitrary bytes, corrupted length
++  fields (IHL/total_len/extension-length/data-offset), or truncation, in any
++  of the ten decoder entry points exercised — the classic packet-parser bug
++  class this crate defends against with explicit length checks throughout.
++- All roundtrips are exact, including IPv4 options, TCP flag/option
++  combinations, VLAN double-tagging, and IPv6 extension-header chains built
++  through the `PacketBuilder`.
++- All three checksum implementations (IPv4 header, TCP, UDP) agree with
++  independently transcribed RFC 1071/768 oracles, including the UDP zero-
++  checksum special case.
++- No pinned failing tests and no `#[ignore]`d reproducers were needed.
++
++One pre-existing observation (not introduced by this work): building the test
++profile emits five `unused import` warnings in untouched IGMP test modules
++(`src/transport/igmp/*.rs`, `src/transport/igmp_header.rs`).
+diff --git a/etherparse/Cargo.toml b/etherparse/Cargo.toml
+index 27e7d03..c29376d 100644
+--- a/etherparse/Cargo.toml
++++ b/etherparse/Cargo.toml
+@@ -28,6 +28,7 @@ std = ["alloc", "arrayvec/std"]
+ arrayvec = { version = "0.7.2", default-features = false }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ proptest = "1.4.0"
+ 
+ [package.metadata.docs.rs]
+diff --git a/etherparse/src/compositions_tests.rs b/etherparse/src/compositions_tests.rs
+index f0eacbd..a29cf1e 100644
+--- a/etherparse/src/compositions_tests.rs
++++ b/etherparse/src/compositions_tests.rs
+@@ -804,3 +804,467 @@ fn test_packet_slicing_panics() {
+     }
+     .assert_sliced_packet(s);
+ }
++
++/// Hegel property based tests operating on complete packets.
++mod hegel_props {
++    use super::*;
++    use hegel::generators as gens;
++    use std::{format, string::ToString, vec, vec::Vec};
++
++    fn draw_mac(tc: &hegel::TestCase) -> [u8; 6] {
++        tc.draw(gens::arrays(gens::integers::<u8>()))
++    }
++
++    fn draw_addr4(tc: &hegel::TestCase) -> [u8; 4] {
++        tc.draw(gens::arrays(gens::integers::<u8>()))
++    }
++
++    fn draw_addr16(tc: &hegel::TestCase) -> [u8; 16] {
++        tc.draw(gens::arrays(gens::integers::<u8>()))
++    }
++
++    fn draw_single_vlan(tc: &hegel::TestCase) -> SingleVlanHeader {
++        SingleVlanHeader {
++            pcp: VlanPcp::try_new(tc.draw(gens::integers::<u8>().max_value(0b111))).unwrap(),
++            drop_eligible_indicator: tc.draw(gens::booleans()),
++            vlan_id: VlanId::try_new(tc.draw(gens::integers::<u16>().max_value(0xfff))).unwrap(),
++            // the ether type is determined by the builder based on the
++            // headers that follow
++            ether_type: EtherType(0),
++        }
++    }
++
++    /// IPv4 header for the packet builder (total_len, protocol &
++    /// checksum are computed by the builder on write).
++    fn draw_ipv4_header(tc: &hegel::TestCase) -> Ipv4Header {
++        let options_len = usize::from(tc.draw(gens::integers::<u8>().max_value(10))) * 4;
++        let options: Vec<u8> = tc.draw(
++            gens::vecs(gens::integers::<u8>())
++                .min_size(options_len)
++                .max_size(options_len),
++        );
++        let mut header = Ipv4Header::new(
++            0,
++            tc.draw(gens::integers::<u8>()),
++            IpNumber::UDP, // replaced by the builder
++            draw_addr4(tc),
++            draw_addr4(tc),
++        )
++        .unwrap();
++        header.identification = tc.draw(gens::integers::<u16>());
++        header.dscp = IpDscp::try_new(tc.draw(gens::integers::<u8>().max_value(0b11_1111))).unwrap();
++        header.ecn = IpEcn::try_new(tc.draw(gens::integers::<u8>().max_value(0b11))).unwrap();
++        header.dont_fragment = tc.draw(gens::booleans());
++        header.options = (&options[..]).try_into().unwrap();
++        header
++    }
++
++    /// Raw IPv6 extension header (payload len must be 6 + 8k).
++    fn draw_raw_ext(tc: &hegel::TestCase) -> Ipv6RawExtHeader {
++        let payload_len = 6 + 8 * usize::from(tc.draw(gens::integers::<u8>().max_value(3)));
++        let payload: Vec<u8> = tc.draw(
++            gens::vecs(gens::integers::<u8>())
++                .min_size(payload_len)
++                .max_size(payload_len),
++        );
++        // next_header is fixed up by the builder
++        Ipv6RawExtHeader::new_raw(IpNumber(0), &payload).unwrap()
++    }
++
++    fn draw_tcp_header(tc: &hegel::TestCase) -> TcpHeader {
++        let mut header = TcpHeader::new(
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u32>()),
++            tc.draw(gens::integers::<u16>()),
++        );
++        header.acknowledgment_number = tc.draw(gens::integers::<u32>());
++        header.urgent_pointer = tc.draw(gens::integers::<u16>());
++        header.ns = tc.draw(gens::booleans());
++        header.fin = tc.draw(gens::booleans());
++        header.syn = tc.draw(gens::booleans());
++        header.rst = tc.draw(gens::booleans());
++        header.psh = tc.draw(gens::booleans());
++        header.ack = tc.draw(gens::booleans());
++        header.ece = tc.draw(gens::booleans());
++        header.urg = tc.draw(gens::booleans());
++        header.cwr = tc.draw(gens::booleans());
++        let options_len = usize::from(tc.draw(gens::integers::<u8>().max_value(10))) * 4;
++        let options: Vec<u8> = tc.draw(
++            gens::vecs(gens::integers::<u8>())
++                .min_size(options_len)
++                .max_size(options_len),
++        );
++        header.set_options_raw(&options).unwrap();
++        header
++    }
++
++    /// The crown roundtrip: build a packet (Ethernet II, optional
++    /// single/double VLAN, IPv4 with options or IPv6 with extension
++    /// headers, UDP/TCP/ICMPv4/ICMPv6, payload) with the
++    /// `PacketBuilder` and verify `PacketHeaders::from_ethernet_slice`
++    /// & `SlicedPacket::from_ethernet` recover the headers & payload
++    /// exactly.
++    #[hegel::test(test_cases = 200)]
++    fn hegel_builder_parse_roundtrip(tc: hegel::TestCase) {
++        let eth_source = draw_mac(&tc);
++        let eth_destination = draw_mac(&tc);
++
++        // vlan: 0 = none, 1 = single, 2 = double
++        let vlan = match tc.draw(gens::integers::<u8>().max_value(2)) {
++            0 => None,
++            1 => Some(VlanHeader::Single(draw_single_vlan(&tc))),
++            _ => Some(VlanHeader::Double(DoubleVlanHeader {
++                outer: draw_single_vlan(&tc),
++                inner: draw_single_vlan(&tc),
++            })),
++        };
++        let vlan_len = match &vlan {
++            None => 0,
++            Some(VlanHeader::Single(_)) => SingleVlanHeader::LEN,
++            Some(VlanHeader::Double(_)) => SingleVlanHeader::LEN * 2,
++        };
++
++        // net: IPv4 (with options) or IPv6 (with extension headers)
++        let use_ipv4 = tc.draw(gens::booleans());
++        let ip = if use_ipv4 {
++            IpHeaders::Ipv4(draw_ipv4_header(&tc), Default::default())
++        } else {
++            let mut exts = Ipv6Extensions::default();
++            if tc.draw(gens::booleans()) {
++                exts.hop_by_hop_options = Some(draw_raw_ext(&tc));
++            }
++            if tc.draw(gens::booleans()) {
++                exts.destination_options = Some(draw_raw_ext(&tc));
++            }
++            IpHeaders::Ipv6(
++                Ipv6Header {
++                    traffic_class: tc.draw(gens::integers::<u8>()),
++                    flow_label: Ipv6FlowLabel::try_new(
++                        tc.draw(gens::integers::<u32>().max_value(0xf_ffff)),
++                    )
++                    .unwrap(),
++                    payload_length: 0,        // computed by the builder
++                    next_header: IpNumber(0), // computed by the builder
++                    hop_limit: tc.draw(gens::integers::<u8>()),
++                    source: draw_addr16(&tc),
++                    destination: draw_addr16(&tc),
++                },
++                exts,
++            )
++        };
++
++        // transport: 0 = udp, 1 = tcp, 2 = icmpv4 echo request,
++        // 3 = icmpv6 echo request (IPv6 only, as the builder rejects
++        // ICMPv6 in IPv4 due to the pseudo header checksum)
++        let transport_choice = tc.draw(
++            gens::integers::<u8>().max_value(if use_ipv4 { 2 } else { 3 }),
++        );
++        let udp_ports = (
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u16>()),
++        );
++        let tcp_header = draw_tcp_header(&tc);
++        let echo = (
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u16>()),
++        );
++        let payload: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(1024));
++
++        // build the packet
++        let base = PacketBuilder::ethernet2(eth_source, eth_destination);
++        let ip_step = match &vlan {
++            None => base.ip(ip.clone()),
++            Some(v) => base.vlan(v.clone()).ip(ip.clone()),
++        };
++        let mut packet = Vec::new();
++        match transport_choice {
++            0 => ip_step
++                .udp(udp_ports.0, udp_ports.1)
++                .write(&mut packet, &payload)
++                .unwrap(),
++            1 => ip_step
++                .tcp_header(tcp_header.clone())
++                .write(&mut packet, &payload)
++                .unwrap(),
++            2 => ip_step
++                .icmpv4_echo_request(echo.0, echo.1)
++                .write(&mut packet, &payload)
++                .unwrap(),
++            _ => ip_step
++                .icmpv6_echo_request(echo.0, echo.1)
++                .write(&mut packet, &payload)
++                .unwrap(),
++        }
++
++        let transport_ip_number = match transport_choice {
++            0 => IpNumber::UDP,
++            1 => IpNumber::TCP,
++            2 => IpNumber::ICMP,
++            _ => IpNumber::IPV6_ICMP,
++        };
++
++        // parse
++        let headers = PacketHeaders::from_ethernet_slice(&packet).unwrap();
++
++        // link
++        match &headers.link {
++            Some(LinkHeader::Ethernet2(actual)) => {
++                assert_eq!(actual.source, eth_source);
++                assert_eq!(actual.destination, eth_destination);
++            }
++            other => panic!("expected an Ethernet2 header, got {other:?}"),
++        }
++
++        // vlan
++        match (&vlan, &headers.vlan()) {
++            (None, None) => {}
++            (Some(VlanHeader::Single(expected)), Some(VlanHeader::Single(actual))) => {
++                assert_eq!(actual.pcp, expected.pcp);
++                assert_eq!(
++                    actual.drop_eligible_indicator,
++                    expected.drop_eligible_indicator
++                );
++                assert_eq!(actual.vlan_id, expected.vlan_id);
++            }
++            (Some(VlanHeader::Double(expected)), Some(VlanHeader::Double(actual))) => {
++                for (a, e) in [
++                    (&actual.outer, &expected.outer),
++                    (&actual.inner, &expected.inner),
++                ] {
++                    assert_eq!(a.pcp, e.pcp);
++                    assert_eq!(a.drop_eligible_indicator, e.drop_eligible_indicator);
++                    assert_eq!(a.vlan_id, e.vlan_id);
++                }
++            }
++            (expected, actual) => panic!("vlan mismatch: {expected:?} vs {actual:?}"),
++        }
++
++        // net
++        match (&ip, &headers.net) {
++            (IpHeaders::Ipv4(expected, _), Some(NetHeaders::Ipv4(actual, actual_exts))) => {
++                assert_eq!(actual.source, expected.source);
++                assert_eq!(actual.destination, expected.destination);
++                assert_eq!(actual.time_to_live, expected.time_to_live);
++                assert_eq!(actual.identification, expected.identification);
++                assert_eq!(actual.dscp, expected.dscp);
++                assert_eq!(actual.ecn, expected.ecn);
++                assert_eq!(actual.dont_fragment, expected.dont_fragment);
++                assert_eq!(actual.options, expected.options);
++                assert_eq!(actual.protocol, transport_ip_number);
++                // the builder must have written a consistent total
++                // length & a checksum matching calc_header_checksum
++                assert_eq!(
++                    usize::from(actual.total_len),
++                    packet.len() - Ethernet2Header::LEN - vlan_len
++                );
++                assert_eq!(actual.header_checksum, actual.calc_header_checksum());
++                assert_eq!(actual_exts, &Ipv4Extensions::default());
++            }
++            (IpHeaders::Ipv6(expected, expected_exts), Some(NetHeaders::Ipv6(actual, actual_exts))) => {
++                assert_eq!(actual.source, expected.source);
++                assert_eq!(actual.destination, expected.destination);
++                assert_eq!(actual.traffic_class, expected.traffic_class);
++                assert_eq!(actual.flow_label, expected.flow_label);
++                assert_eq!(actual.hop_limit, expected.hop_limit);
++                assert_eq!(
++                    usize::from(actual.payload_length),
++                    packet.len() - Ethernet2Header::LEN - vlan_len - Ipv6Header::LEN
++                );
++                // the extension chain must round trip with the next
++                // header fields fixed up like the builder does
++                let mut expected_exts = expected_exts.clone();
++                let first = expected_exts.set_next_headers(transport_ip_number);
++                assert_eq!(actual.next_header, first);
++                assert_eq!(actual_exts, &expected_exts);
++            }
++            (expected, actual) => panic!("net mismatch: {expected:?} vs {actual:?}"),
++        }
++
++        // transport
++        match (transport_choice, &headers.transport) {
++            (0, Some(TransportHeader::Udp(actual))) => {
++                assert_eq!(actual.source_port, udp_ports.0);
++                assert_eq!(actual.destination_port, udp_ports.1);
++                assert_eq!(
++                    usize::from(actual.length),
++                    UdpHeader::LEN + payload.len()
++                );
++            }
++            (1, Some(TransportHeader::Tcp(actual))) => {
++                // the builder computes the checksum; mirror it in the
++                // expected header (its correctness is separately checked
++                // against a spec transcribed oracle in tcp_header.rs)
++                let mut expected = tcp_header.clone();
++                expected.checksum = match &ip {
++                    IpHeaders::Ipv4(v4, _) => expected
++                        .calc_checksum_ipv4_raw(v4.source, v4.destination, &payload)
++                        .unwrap(),
++                    IpHeaders::Ipv6(v6, _) => expected
++                        .calc_checksum_ipv6_raw(v6.source, v6.destination, &payload)
++                        .unwrap(),
++                };
++                assert_eq!(actual, &expected);
++            }
++            (2, Some(TransportHeader::Icmpv4(actual))) => match actual.icmp_type {
++                Icmpv4Type::EchoRequest(echo_header) => {
++                    assert_eq!(echo_header.id, echo.0);
++                    assert_eq!(echo_header.seq, echo.1);
++                }
++                ref other => panic!("expected an ICMPv4 echo request, got {other:?}"),
++            },
++            (3, Some(TransportHeader::Icmpv6(actual))) => match actual.icmp_type {
++                Icmpv6Type::EchoRequest(echo_header) => {
++                    assert_eq!(echo_header.id, echo.0);
++                    assert_eq!(echo_header.seq, echo.1);
++                }
++                ref other => panic!("expected an ICMPv6 echo request, got {other:?}"),
++            },
++            (choice, actual) => panic!("transport mismatch: {choice} vs {actual:?}"),
++        }
++
++        // payload
++        assert_eq!(headers.payload.slice(), &payload[..]);
++
++        // the sliced variant must also parse & expose the same payload
++        let sliced = SlicedPacket::from_ethernet(&packet).unwrap();
++        match &sliced.transport {
++            Some(TransportSlice::Udp(slice)) => assert_eq!(slice.payload(), &payload[..]),
++            Some(TransportSlice::Tcp(slice)) => assert_eq!(slice.payload(), &payload[..]),
++            Some(TransportSlice::Icmpv4(slice)) => assert_eq!(slice.payload(), &payload[..]),
++            Some(TransportSlice::Icmpv6(slice)) => assert_eq!(slice.payload(), &payload[..]),
++            other => panic!("expected a transport slice, got {other:?}"),
++        }
++    }
++
++    /// Feeding completely arbitrary bytes into any of the packet level
++    /// decoders must never panic, read out of bounds or hang — the
++    /// input is attacker controlled on this API boundary (`Ok` and
++    /// `Err` are both acceptable results).
++    #[hegel::test(test_cases = 500)]
++    fn hegel_arbitrary_bytes_never_panic(tc: hegel::TestCase) {
++        let mut data: Vec<u8> = tc.draw(gens::binary().max_size(2048));
++
++        // occasionally force a plausible IP version nibble into the
++        // first byte so the deeper v4/v6 parsing paths are reached
++        if !data.is_empty() && tc.draw(gens::booleans()) {
++            let version: u8 = if tc.draw(gens::booleans()) { 4 } else { 6 };
++            data[0] = (version << 4) | (data[0] & 0x0f);
++        }
++
++        drop(SlicedPacket::from_ethernet(&data));
++        drop(SlicedPacket::from_ip(&data));
++        drop(PacketHeaders::from_ethernet_slice(&data));
++        drop(PacketHeaders::from_ip_slice(&data));
++        drop(LaxSlicedPacket::from_ethernet(&data));
++        drop(LaxSlicedPacket::from_ip(&data));
++        drop(LaxPacketHeaders::from_ethernet(&data));
++        drop(LaxPacketHeaders::from_ip(&data));
++
++        // also exercise the ether type dispatch (ARP, MACsec, VLAN, ...)
++        let ether_type = EtherType(tc.draw(gens::integers::<u16>()));
++        drop(SlicedPacket::from_ether_type(ether_type, &data));
++        drop(PacketHeaders::from_ether_type(ether_type, &data));
++    }
++
++    /// Corrupting arbitrary bytes of a valid packet — including the
++    /// attacker controlled length fields (IHL, total length, IPv6
++    /// extension header lengths, TCP data offset) — must never cause a
++    /// panic or out of bounds read in any decoder.
++    #[hegel::test(test_cases = 500)]
++    fn hegel_corrupted_packet_never_panics(tc: hegel::TestCase) {
++        // build a valid packet
++        let payload: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(128));
++        let use_ipv4 = tc.draw(gens::booleans());
++        let use_tcp = tc.draw(gens::booleans());
++        let ip = if use_ipv4 {
++            IpHeaders::Ipv4(draw_ipv4_header(&tc), Default::default())
++        } else {
++            let mut exts = Ipv6Extensions::default();
++            if tc.draw(gens::booleans()) {
++                exts.hop_by_hop_options = Some(draw_raw_ext(&tc));
++            }
++            IpHeaders::Ipv6(
++                Ipv6Header {
++                    traffic_class: 0,
++                    flow_label: Ipv6FlowLabel::ZERO,
++                    payload_length: 0,
++                    next_header: IpNumber(0),
++                    hop_limit: 64,
++                    source: draw_addr16(&tc),
++                    destination: draw_addr16(&tc),
++                },
++                exts,
++            )
++        };
++        let ip_step = PacketBuilder::ethernet2(draw_mac(&tc), draw_mac(&tc)).ip(ip);
++        let mut packet = Vec::new();
++        if use_tcp {
++            ip_step
++                .tcp_header(draw_tcp_header(&tc))
++                .write(&mut packet, &payload)
++                .unwrap();
++        } else {
++            ip_step
++                .udp(
++                    tc.draw(gens::integers::<u16>()),
++                    tc.draw(gens::integers::<u16>()),
++                )
++                .write(&mut packet, &payload)
++                .unwrap();
++        }
++
++        // corrupt 1..=8 bytes, biased towards the header area where
++        // the length fields live
++        let corruptions = tc.draw(gens::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..corruptions {
++            let position = tc.draw(hegel::one_of!(
++                gens::integers::<usize>().max_value(packet.len() - 1),
++                gens::integers::<usize>()
++                    .max_value(core::cmp::min(59, packet.len() - 1)),
++            ));
++            packet[position] = tc.draw(gens::integers::<u8>());
++        }
++
++        drop(SlicedPacket::from_ethernet(&packet));
++        drop(SlicedPacket::from_ip(&packet));
++        drop(PacketHeaders::from_ethernet_slice(&packet));
++        drop(PacketHeaders::from_ip_slice(&packet));
++        drop(LaxSlicedPacket::from_ethernet(&packet));
++        drop(LaxSlicedPacket::from_ip(&packet));
++        drop(LaxPacketHeaders::from_ethernet(&packet));
++        drop(LaxPacketHeaders::from_ip(&packet));
++    }
++
++    /// Truncation must always be detected: every strict prefix of a
++    /// valid Ethernet II + IPv4 + UDP packet must be rejected with an
++    /// error (the length fields cover all bytes) and must never panic,
++    /// while the complete packet parses fine.
++    #[hegel::test]
++    fn hegel_truncated_packet_returns_error(tc: hegel::TestCase) {
++        let payload: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(64));
++        let mut packet = Vec::new();
++        PacketBuilder::ethernet2(draw_mac(&tc), draw_mac(&tc))
++            .ip(IpHeaders::Ipv4(draw_ipv4_header(&tc), Default::default()))
++            .udp(
++                tc.draw(gens::integers::<u16>()),
++                tc.draw(gens::integers::<u16>()),
++            )
++            .write(&mut packet, &payload)
++            .unwrap();
++
++        for len in 0..packet.len() {
++            let prefix = &packet[..len];
++            assert!(
++                SlicedPacket::from_ethernet(prefix).is_err(),
++                "SlicedPacket: strict prefix of len {len} unexpectedly parsed"
++            );
++            assert!(
++                PacketHeaders::from_ethernet_slice(prefix).is_err(),
++                "PacketHeaders: strict prefix of len {len} unexpectedly parsed"
++            );
++        }
++        assert!(SlicedPacket::from_ethernet(&packet).is_ok());
++        assert!(PacketHeaders::from_ethernet_slice(&packet).is_ok());
++    }
++}
+diff --git a/etherparse/src/net/ipv4_header.rs b/etherparse/src/net/ipv4_header.rs
+index cf6733f..8c508ea 100644
+--- a/etherparse/src/net/ipv4_header.rs
++++ b/etherparse/src/net/ipv4_header.rs
+@@ -1435,3 +1435,128 @@ mod test {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod hegel_props {
++    use super::*;
++    use hegel::generators as gens;
++    use std::{format, string::ToString, vec::Vec};
++
++    /// Draws a structurally valid [`Ipv4Header`] with arbitrary field
++    /// values (checksum is left at zero, options len is drawn in
++    /// 4 byte steps as required by the IHL field).
++    fn draw_header(tc: &hegel::TestCase) -> Ipv4Header {
++        let options_len = usize::from(tc.draw(gens::integers::<u8>().max_value(10))) * 4;
++        let options: Vec<u8> = tc.draw(
++            gens::vecs(gens::integers::<u8>())
++                .min_size(options_len)
++                .max_size(options_len),
++        );
++        let header = Ipv4Header {
++            dscp: IpDscp::try_new(tc.draw(gens::integers::<u8>().max_value(0b11_1111))).unwrap(),
++            ecn: IpEcn::try_new(tc.draw(gens::integers::<u8>().max_value(0b11))).unwrap(),
++            total_len: tc.draw(gens::integers::<u16>()),
++            identification: tc.draw(gens::integers::<u16>()),
++            dont_fragment: tc.draw(gens::booleans()),
++            more_fragments: tc.draw(gens::booleans()),
++            fragment_offset: IpFragOffset::try_new(
++                tc.draw(gens::integers::<u16>().max_value(0x1fff)),
++            )
++            .unwrap(),
++            time_to_live: tc.draw(gens::integers::<u8>()),
++            protocol: IpNumber(tc.draw(gens::integers::<u8>())),
++            header_checksum: 0,
++            source: tc.draw(gens::arrays(gens::integers::<u8>())),
++            destination: tc.draw(gens::arrays(gens::integers::<u8>())),
++            options: (&options[..]).try_into().unwrap(),
++        };
++        header
++    }
++
++    /// RFC 1071 one's complement sum (big endian 16 bit words, odd
++    /// trailing byte padded with zero, end-around carry folded).
++    ///
++    /// Spec-transcribed oracle: data containing a valid internet
++    /// checksum sums to 0xFFFF.
++    fn ones_complement_sum(bytes: &[u8]) -> u16 {
++        let mut sum: u32 = 0;
++        let mut chunks = bytes.chunks_exact(2);
++        for word in &mut chunks {
++            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
++        }
++        if let [last] = chunks.remainder() {
++            sum += u32::from(u16::from_be_bytes([*last, 0]));
++        }
++        while sum > 0xFFFF {
++            sum = (sum & 0xFFFF) + (sum >> 16);
++        }
++        sum as u16
++    }
++
++    /// Roundtrip: serializing a header and parsing it back with
++    /// `from_slice` restores the header exactly, consumes exactly
++    /// `header_len()` bytes and returns the remaining bytes untouched.
++    #[hegel::test]
++    fn hegel_write_from_slice_roundtrip(tc: hegel::TestCase) {
++        let mut header = draw_header(&tc);
++        // `write` calculates the checksum on the fly; set it here so
++        // the serialized & in-memory versions are identical.
++        header.header_checksum = header.calc_header_checksum();
++
++        let mut buffer = Vec::with_capacity(header.header_len() + 32);
++        header.write_raw(&mut buffer).unwrap();
++        assert_eq!(buffer.len(), header.header_len());
++
++        // bytes after the header must be returned untouched as "rest"
++        let extra: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(32));
++        buffer.extend_from_slice(&extra);
++
++        let (decoded, rest) = Ipv4Header::from_slice(&buffer).unwrap();
++        assert_eq!(decoded, header);
++        assert_eq!(rest, &extra[..]);
++    }
++
++    /// `calc_header_checksum` must produce a checksum that is valid
++    /// according to RFC 1071 (one's complement sum over the serialized
++    /// header is 0xFFFF).
++    #[hegel::test]
++    fn hegel_header_checksum_matches_rfc1071(tc: hegel::TestCase) {
++        let mut header = draw_header(&tc);
++        header.header_checksum = header.calc_header_checksum();
++        let bytes = header.to_bytes();
++        assert_eq!(ones_complement_sum(&bytes), 0xFFFF);
++    }
++
++    /// Corruption check: flipping any single bit of a serialized header
++    /// with a valid checksum must make the checksum invalid (a single
++    /// bit flip changes a 16 bit word by ±2^k which is never congruent
++    /// to 0 modulo 0xFFFF).
++    #[hegel::test]
++    fn hegel_header_checksum_detects_bit_flip(tc: hegel::TestCase) {
++        let mut header = draw_header(&tc);
++        header.header_checksum = header.calc_header_checksum();
++        let mut bytes = header.to_bytes();
++        let byte_index = tc.draw(gens::integers::<usize>().max_value(bytes.len() - 1));
++        let bit = tc.draw(gens::integers::<u8>().max_value(7));
++        bytes[byte_index] ^= 1 << bit;
++        assert_ne!(ones_complement_sum(&bytes), 0xFFFF);
++    }
++
++    /// Every strict prefix of a serialized header must be rejected with
++    /// a length error (and must never panic), as the data can not
++    /// contain the complete header the IHL field announces.
++    #[hegel::test]
++    fn hegel_from_slice_on_prefix_returns_len_error(tc: hegel::TestCase) {
++        let header = draw_header(&tc);
++        let bytes = header.to_bytes();
++        for len in 0..bytes.len() {
++            match Ipv4Header::from_slice(&bytes[..len]) {
++                Err(err::ipv4::HeaderSliceError::Len(_)) => {}
++                Err(other) => panic!(
++                    "expected a length error for the prefix of len {len}, got {other:?}"
++                ),
++                Ok(_) => panic!("strict prefix of len {len} unexpectedly parsed"),
++            }
++        }
++    }
++}
+diff --git a/etherparse/src/transport/tcp_header.rs b/etherparse/src/transport/tcp_header.rs
+index 8538dc6..ac950c5 100644
+--- a/etherparse/src/transport/tcp_header.rs
++++ b/etherparse/src/transport/tcp_header.rs
+@@ -1886,3 +1886,130 @@ mod test {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod hegel_props {
++    use super::*;
++    use hegel::generators as gens;
++    use std::{format, string::ToString, vec::Vec};
++
++    /// Draws a structurally valid [`TcpHeader`] with arbitrary field
++    /// values. The raw options length is drawn in steps of 4 bytes as
++    /// `TcpOptions` pads other lengths with zeros (which would make an
++    /// exact roundtrip comparison unsound).
++    fn draw_header(tc: &hegel::TestCase) -> TcpHeader {
++        let mut header = TcpHeader::new(
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u16>()),
++            tc.draw(gens::integers::<u32>()),
++            tc.draw(gens::integers::<u16>()),
++        );
++        header.acknowledgment_number = tc.draw(gens::integers::<u32>());
++        header.urgent_pointer = tc.draw(gens::integers::<u16>());
++        header.checksum = tc.draw(gens::integers::<u16>());
++        header.ns = tc.draw(gens::booleans());
++        header.fin = tc.draw(gens::booleans());
++        header.syn = tc.draw(gens::booleans());
++        header.rst = tc.draw(gens::booleans());
++        header.psh = tc.draw(gens::booleans());
++        header.ack = tc.draw(gens::booleans());
++        header.ece = tc.draw(gens::booleans());
++        header.urg = tc.draw(gens::booleans());
++        header.cwr = tc.draw(gens::booleans());
++        let options_len = usize::from(tc.draw(gens::integers::<u8>().max_value(10))) * 4;
++        let options: Vec<u8> = tc.draw(
++            gens::vecs(gens::integers::<u8>())
++                .min_size(options_len)
++                .max_size(options_len),
++        );
++        header.set_options_raw(&options).unwrap();
++        header
++    }
++
++    /// RFC 1071 one's complement sum (big endian 16 bit words, odd
++    /// trailing byte padded with zero, end-around carry folded).
++    ///
++    /// Spec-transcribed oracle: data containing a valid internet
++    /// checksum sums to 0xFFFF.
++    fn ones_complement_sum(bytes: &[u8]) -> u16 {
++        let mut sum: u32 = 0;
++        let mut chunks = bytes.chunks_exact(2);
++        for word in &mut chunks {
++            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
++        }
++        if let [last] = chunks.remainder() {
++            sum += u32::from(u16::from_be_bytes([*last, 0]));
++        }
++        while sum > 0xFFFF {
++            sum = (sum & 0xFFFF) + (sum >> 16);
++        }
++        sum as u16
++    }
++
++    /// Roundtrip: serializing a header and parsing it back with
++    /// `from_slice` restores the header exactly (incl. all flags &
++    /// options), consumes exactly `header_len()` bytes and returns the
++    /// remaining bytes untouched.
++    #[hegel::test]
++    fn hegel_to_bytes_from_slice_roundtrip(tc: hegel::TestCase) {
++        let header = draw_header(&tc);
++        let bytes = header.to_bytes();
++        assert_eq!(bytes.len(), header.header_len());
++
++        let extra: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(32));
++        let mut buffer = Vec::with_capacity(bytes.len() + extra.len());
++        buffer.extend_from_slice(&bytes);
++        buffer.extend_from_slice(&extra);
++
++        let (decoded, rest) = TcpHeader::from_slice(&buffer).unwrap();
++        assert_eq!(decoded, header);
++        assert_eq!(rest, &extra[..]);
++    }
++
++    /// `calc_checksum_ipv4_raw` must produce a checksum that makes the
++    /// segment valid according to RFC 9293 / RFC 1071: the one's
++    /// complement sum over the IPv4 pseudo header, the TCP header and
++    /// the payload must be 0xFFFF.
++    #[hegel::test]
++    fn hegel_ipv4_checksum_matches_rfc1071(tc: hegel::TestCase) {
++        let mut header = draw_header(&tc);
++        let source: [u8; 4] = tc.draw(gens::arrays(gens::integers::<u8>()));
++        let destination: [u8; 4] = tc.draw(gens::arrays(gens::integers::<u8>()));
++        let payload: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(1024));
++
++        header.checksum = header
++            .calc_checksum_ipv4_raw(source, destination, &payload)
++            .unwrap();
++
++        // spec-transcribed pseudo header + segment
++        let mut data = Vec::new();
++        data.extend_from_slice(&source);
++        data.extend_from_slice(&destination);
++        data.push(0);
++        data.push(6); // TCP ip protocol number
++        let tcp_len = (header.header_len() + payload.len()) as u16;
++        data.extend_from_slice(&tcp_len.to_be_bytes());
++        data.extend_from_slice(&header.to_bytes());
++        data.extend_from_slice(&payload);
++
++        assert_eq!(ones_complement_sum(&data), 0xFFFF);
++    }
++
++    /// Every strict prefix of a serialized header must be rejected with
++    /// a length error (and must never panic), as the data can not
++    /// contain the complete header the data offset field announces.
++    #[hegel::test]
++    fn hegel_from_slice_on_prefix_returns_len_error(tc: hegel::TestCase) {
++        let header = draw_header(&tc);
++        let bytes = header.to_bytes();
++        for len in 0..bytes.len() {
++            match TcpHeader::from_slice(&bytes[..len]) {
++                Err(err::tcp::HeaderSliceError::Len(_)) => {}
++                Err(other) => panic!(
++                    "expected a length error for the prefix of len {len}, got {other:?}"
++                ),
++                Ok(_) => panic!("strict prefix of len {len} unexpectedly parsed"),
++            }
++        }
++    }
++}
+diff --git a/etherparse/src/transport/udp_header.rs b/etherparse/src/transport/udp_header.rs
+index 65e35bf..906f7b8 100644
+--- a/etherparse/src/transport/udp_header.rs
++++ b/etherparse/src/transport/udp_header.rs
+@@ -1097,3 +1097,114 @@ mod test {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod hegel_props {
++    use super::*;
++    use hegel::generators as gens;
++    use std::{format, string::ToString, vec::Vec};
++
++    /// RFC 1071 one's complement sum (big endian 16 bit words, odd
++    /// trailing byte padded with zero, end-around carry folded).
++    ///
++    /// Spec-transcribed oracle: data containing a valid internet
++    /// checksum sums to 0xFFFF.
++    fn ones_complement_sum(bytes: &[u8]) -> u16 {
++        let mut sum: u32 = 0;
++        let mut chunks = bytes.chunks_exact(2);
++        for word in &mut chunks {
++            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
++        }
++        if let [last] = chunks.remainder() {
++            sum += u32::from(u16::from_be_bytes([*last, 0]));
++        }
++        while sum > 0xFFFF {
++            sum = (sum & 0xFFFF) + (sum >> 16);
++        }
++        sum as u16
++    }
++
++    fn draw_header(tc: &hegel::TestCase) -> UdpHeader {
++        UdpHeader {
++            source_port: tc.draw(gens::integers::<u16>()),
++            destination_port: tc.draw(gens::integers::<u16>()),
++            length: tc.draw(gens::integers::<u16>()),
++            checksum: tc.draw(gens::integers::<u16>()),
++        }
++    }
++
++    /// Roundtrip: `to_bytes`/`from_bytes` are exact inverses and
++    /// `from_slice` restores the header exactly while returning the
++    /// bytes after the fixed 8 byte header untouched.
++    #[hegel::test]
++    fn hegel_to_bytes_from_slice_roundtrip(tc: hegel::TestCase) {
++        let header = draw_header(&tc);
++        let bytes = header.to_bytes();
++        assert_eq!(UdpHeader::from_bytes(bytes), header);
++
++        let extra: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(32));
++        let mut buffer = Vec::with_capacity(bytes.len() + extra.len());
++        buffer.extend_from_slice(&bytes);
++        buffer.extend_from_slice(&extra);
++
++        let (decoded, rest) = UdpHeader::from_slice(&buffer).unwrap();
++        assert_eq!(decoded, header);
++        assert_eq!(rest, &extra[..]);
++    }
++
++    /// `with_ipv4_checksum` must produce a checksum that makes the
++    /// datagram valid according to RFC 768 / RFC 1071: the one's
++    /// complement sum over the IPv4 pseudo header, the UDP header and
++    /// the payload must be 0xFFFF. Additionally a computed checksum is
++    /// never transmitted as 0 (0 is reserved for "no checksum").
++    #[hegel::test]
++    fn hegel_ipv4_checksum_matches_rfc768(tc: hegel::TestCase) {
++        let source: [u8; 4] = tc.draw(gens::arrays(gens::integers::<u8>()));
++        let destination: [u8; 4] = tc.draw(gens::arrays(gens::integers::<u8>()));
++        let source_port = tc.draw(gens::integers::<u16>());
++        let destination_port = tc.draw(gens::integers::<u16>());
++        let payload: Vec<u8> = tc.draw(gens::vecs(gens::integers::<u8>()).max_size(1024));
++
++        let ip_header = Ipv4Header::new(
++            (UdpHeader::LEN + payload.len()) as u16,
++            tc.draw(gens::integers::<u8>()),
++            IpNumber::UDP,
++            source,
++            destination,
++        )
++        .unwrap();
++        let header =
++            UdpHeader::with_ipv4_checksum(source_port, destination_port, &ip_header, &payload)
++                .unwrap();
++
++        // RFC 768: a zero checksum means "no checksum was computed"
++        assert_ne!(header.checksum, 0);
++
++        // spec-transcribed pseudo header + datagram
++        let mut data = Vec::new();
++        data.extend_from_slice(&source);
++        data.extend_from_slice(&destination);
++        data.push(0);
++        data.push(17); // UDP ip protocol number
++        let udp_len = (UdpHeader::LEN + payload.len()) as u16;
++        data.extend_from_slice(&udp_len.to_be_bytes());
++        data.extend_from_slice(&header.to_bytes());
++        data.extend_from_slice(&payload);
++
++        assert_eq!(ones_complement_sum(&data), 0xFFFF);
++    }
++
++    /// Every strict prefix of a serialized header must be rejected with
++    /// a length error and must never panic.
++    #[hegel::test]
++    fn hegel_from_slice_on_prefix_returns_len_error(tc: hegel::TestCase) {
++        let header = draw_header(&tc);
++        let bytes = header.to_bytes();
++        for len in 0..bytes.len() {
++            assert!(
++                UdpHeader::from_slice(&bytes[..len]).is_err(),
++                "strict prefix of len {len} unexpectedly parsed"
++            );
++        }
++    }
++}

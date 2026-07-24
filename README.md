@@ -9,6 +9,7 @@ A record of an investigation that used [hegel-rust](https://github.com/hegeldev/
 - **[CANDIDATES.md](CANDIDATES.md)** — the original candidate list.
 - **[results/](results/)** — the run log (`runs.md`, pinned commits per crate), full per-run evaluations (`batch2-eval.md`), per-candidate disposition (`coverage.md`), the extended-candidate selection heuristic (`extended-candidates.md`), and ready-to-file issue drafts (`draft-issues.md`).
 - **[SKILL_NOTES.md](SKILL_NOTES.md)** — the skill-feedback accumulator.
+- **[patches/](patches/)** + **[PATCHES.md](PATCHES.md)** — the actual property tests written for each crate, one `git apply`-able `.patch` per project. `PATCHES.md` records, for every patch, the upstream repository and the exact **base commit** (SHA, date, subject) the patch was written and verified against. Crates whose maintainers opted out of AI contributions are omitted.
 
 ## Method (triage bar)
 

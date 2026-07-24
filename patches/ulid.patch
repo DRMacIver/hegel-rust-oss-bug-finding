@@ -1,0 +1,468 @@
+diff --git a/.gitignore b/.gitignore
+index 91f5d8a..7c86d5d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ target/
+ **/*.rs.bk
++.hegel/
+ Cargo.lock
+ .idea
+ *.iml
+diff --git a/Cargo.toml b/Cargo.toml
+index f7ad21f..1ef2a8d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -35,6 +35,7 @@ web-time = "1"
+ 
+ [dev-dependencies]
+ bencher = "0.1"
++hegeltest = "0.28.2"
+ serde_derive = "1.0"
+ 
+ [target.wasm32-unknown-unknown.dev-dependencies]
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..492e7a2
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,97 @@
++# Hegel Property-Based Testing Report — `ulid` 3.0.0
++
++## 1. Setup
++
++- Added `hegeltest` (0.28.2) as a dev-dependency (`cargo add --dev hegeltest -p ulid`;
++  the package is a workspace with a `cli` member, so `-p ulid` targets the library).
++- Tests were added to the **existing** `#[cfg(test)]` modules in `src/lib.rs`,
++  `src/generator.rs`, and `src/time.rs` — no new test files.
++- `.hegel/` (hegel's failure database) added to `.gitignore`.
++- No AI-contribution opt-out was found (no `HUMAN_VS_MACHINE.md`, no `CONTRIBUTING.md`,
++  no anti-AI clause in README/LICENSE). Nothing is being upstreamed; work is local only.
++- Baseline before changes: 30 unit tests + 24 doc tests, all green.
++
++## 2. Properties Added (13 tests, 9 distinct properties)
++
++In `src/lib.rs::tests`:
++
++| Test | Property |
++|---|---|
++| `prop_string_roundtrip` | **Crown roundtrip**: any `u128` → `to_string()` (26 chars) → `from_string`/`FromStr`/`TryFrom<&str>` recovers the same Ulid; lowercase input decodes identically (Crockford case-insensitivity); inherent `to_string` agrees with the `Display` impl. |
++| `prop_integer_conversions_roundtrip` | `u128`, big-endian `[u8; 16]`, and `(u64, u64)` conversions are bijective views of the same 128 bits, with std's `to_be_bytes`/shifts as the oracle. |
++| `prop_from_parts_roundtrip` | `from_parts(ts, rand)` keeps exactly the low 48/80 bits ("Any overflow bits ... are discarded") and `timestamp_ms()`/`random()` recover them; full-width draws boosted with in-width draws so both the masking and the exact roundtrip are exercised. |
++| `prop_from_string_rejects_wrong_length` | Any length ≠ 26 (0..=52, all-valid characters) → `Err(DecodeError::InvalidLength)`. |
++| `prop_from_string_rejects_invalid_char` | Corrupting one position of a valid encoding with a non-Crockford ASCII byte (boosting the excluded letters I/L/O/U in both cases) → `Err(DecodeError::InvalidChar)`. |
++| `prop_from_string_never_panics` | Parse robustness: arbitrary Unicode text never panics `from_string`/`parse`. |
++| `prop_valid_string_canonical_roundtrip` | Any in-range 26-char Crockford string (first char `'0'..='7'`, mixed case) decodes, and re-encoding yields its uppercase canonical form (decode is injective on in-range strings modulo case). |
++| `prop_from_string_rejects_out_of_range` | Strings above `Ulid::max()` (`7ZZZZZZZZZZZZZZZZZZZZZZZZZ`) — first char encoding 8..=31 — must be rejected per the ULID spec. **FAILS — real bug, see §4.** |
++| `prop_string_order_matches_value_order` | "Lexicographically sortable": `String` ordering of two encoded Ulids equals `u128` ordering. |
++| `prop_timestamp_order_implies_string_order` | A strictly larger 48-bit timestamp sorts strictly later as a string, regardless of both random parts. |
++| `prop_increment` | `increment()` bumps the random part and keeps the timestamp; at the 80-bit random maximum (boosted by construction) it returns the next-millisecond Ulid in `Err`, saturating at `Ulid::max`. |
++
++In `src/generator.rs::tests`:
++
++| Test | Property |
++|---|---|
++| `prop_generator_monotonic` | The documented guarantee "each call provides a Ulid with a larger value than the last" holds for arbitrary timestamp sequences, including repeated and *backwards* clocks; a strictly advancing clock is reflected in `timestamp_ms()`. Overflow `Err`s are committed via `commit_overflow_increment()`; saturation at `Ulid::max` is the one documented exception. |
++
++In `src/time.rs::tests`:
++
++| Test | Property |
++|---|---|
++| `prop_datetime_roundtrip` | For any representable millisecond instant (48 bits), `from_datetime_with_source(dt, ..)` reports exactly `dt` back through both `timestamp_ms()` and `datetime()`. |
++
++Generator notes: randomness for the code under test goes through the crate's own
++`StepRng`, which is a *counter*, not a seeded PRNG — the hegel-drawn `value`/`increment`
++map directly onto the random bits consumed, so counterexamples shrink meaningfully.
++The `is_crockford_byte` oracle and the `draw_ulid_string` composite are written
++independently of the crate's `LOOKUP` table.
++
++## 3. Validation (Run and Reflect)
++
++- **Liveness**: five assertions were temporarily inverted — including inside the
++  guarded `Err` arm of `prop_increment` (proving the maxed-random branch fires; it is
++  boosted by construction) and inside `prop_generator_monotonic`'s advancing-clock
++  guard — and all five tests failed with shrunk counterexamples, then were reverted.
++- **Exploratory 10x run**: all hegel tests were run once at `test_cases = 1000`
++  (default 100), verified with an atomic case counter printed from
++  `prop_string_roundtrip` ("case 1000" observed, so the raised count genuinely ran).
++  No additional failures surfaced; counts and counter reverted for the committed tests.
++- Final suite: 42 of 43 unit tests pass, 24 doc tests pass. The single failure is the
++  deliberately pinned bug below.
++
++## 4. Bugs Found
++
++**`Ulid::from_string` / `base32::decode` accepts out-of-range ULID strings and
++silently discards the two overflow bits** (`src/base32.rs`, `decode`).
++
++- Minimal counterexample (hegel-shrunk): `"80000000000000000000000000"` decodes to
++  `Ok(Ulid(0))` — i.e. it collides with `"00000000000000000000000000"`.
++- 26 Crockford base32 characters carry 130 bits; a Ulid has 128. The ULID spec
++  (which the crate's docs link as what it implements) says the largest valid ULID is
++  `7ZZZZZZZZZZZZZZZZZZZZZZZZZ` and "Any attempt to decode or encode a ULID larger
++  than this should be rejected by all implementations, to prevent overflow bugs".
++  `decode`'s `value = (value << 5) | val` shifts the top bits out of the `u128`
++  silently, making `from_string` non-injective (each Ulid has 4 accepted spellings
++  per case variant).
++- Verified **not** an artifact of this checkout: the crate source is byte-identical
++  to `ulid 3.0.0` from crates.io (apart from these tests), so this is genuine
++  upstream behavior violating the spec.
++- Pinned by `tests::prop_from_string_rejects_out_of_range`, left failing per
++  instructions. The failure is fully deterministic: every input the test's generator
++  draws is out of range and every one is accepted, so it fails on the first case of
++  every run (no flakiness).
++- Note: a fix would need an error variant for overflow (or reuse `InvalidChar` /
++  `InvalidLength`), since `DecodeError` currently has no fitting variant.
++
++## 5. Notes and Recommendations
++
++- The `serde`, `uuid`, `postgres`, and `rkyv` feature-gated modules were not
++  property-tested (features off by default; the serde roundtrip would be a natural
++  follow-up with the `serde` feature enabled).
++- `prop_generator_monotonic` deliberately feeds *backwards* clocks — the
++  increment-on-same-or-earlier-millisecond path (`generator.rs`) is exercised on
++  essentially every run, not just the fresh-timestamp path.
++- If the out-of-range bug is ever fixed upstream, `prop_valid_string_canonical_roundtrip`
++  already covers the accept side of the boundary (first char `'0'..='7'`), so the
++  pair of tests fences the boundary exactly at `Ulid::max()`.
+diff --git a/src/generator.rs b/src/generator.rs
+index 10bf89a..bf0e94f 100644
+--- a/src/generator.rs
++++ b/src/generator.rs
+@@ -322,4 +322,49 @@ mod tests {
+         assert!(next_ulid > maxed_random);
+         assert_eq!(generator.previous, next_ulid);
+     }
++
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use hegel::generators;
++
++    /// The generator's documented guarantee: "Each call is guaranteed to
++    /// provide a Ulid with a larger value than the last call", for arbitrary
++    /// timestamp sequences — including repeated and backwards clocks.
++    #[hegel::test]
++    fn prop_generator_monotonic(tc: hegel::TestCase) {
++        const TIME_MASK: u64 = crate::bitmask!(Ulid::TIME_BITS);
++        let timestamps: Vec<u64> = tc.draw(
++            generators::vecs(generators::integers::<u64>().max_value(TIME_MASK))
++                .min_size(2)
++                .max_size(20),
++        );
++        // StepRng is a counter, not a seeded PRNG: the drawn value/increment
++        // map directly onto the random bits consumed per generation, so
++        // hegel can shrink them meaningfully.
++        let value = tc.draw(generators::integers::<u64>());
++        let increment = tc.draw(generators::integers::<u64>());
++        let mut source = crate::StepRng::new(value, increment);
++        let mut generator = Generator::new();
++        let mut prev: Option<Ulid> = None;
++        for ts in timestamps {
++            let dt = SystemTime::UNIX_EPOCH + Duration::from_millis(ts);
++            let next = match generator.generate_from_datetime_with_source(dt, &mut source) {
++                Ok(ulid) => ulid,
++                Err(overflow) => overflow.commit_overflow_increment(),
++            };
++            if let Some(p) = prev {
++                // saturation at Ulid::max is the one documented exception
++                if !p.is_max() {
++                    assert!(next > p, "generator went backwards: {} then {}", p, next);
++                }
++                // a strictly advancing clock is reflected in the timestamp
++                if ts > p.timestamp_ms() {
++                    assert_eq!(next.timestamp_ms(), ts);
++                }
++            }
++            prev = Some(next);
++        }
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 79aebe6..c2b5a4d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -464,4 +464,251 @@ mod tests {
+         println!("{}", DecodeError::InvalidLength);
+         println!("{}", DecodeError::InvalidChar);
+     }
++
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use hegel::generators::{self, Generator as _};
++
++    /// Bytes that are valid Crockford base32 input for this crate (the
++    /// uppercase alphabet plus its lowercase aliases). Written out
++    /// independently of the crate's LOOKUP table so it can act as an oracle.
++    fn is_crockford_byte(b: u8) -> bool {
++        b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b.to_ascii_uppercase())
++    }
++
++    /// Draw a 26-character Crockford base32 string. The first character's
++    /// alphabet index is drawn from `first_min..=first_max` (index 7 is '7',
++    /// the highest first char of any encoded u128), the remaining 25 from the
++    /// full alphabet, with random per-character lowercasing (decoding is
++    /// case-insensitive).
++    fn draw_ulid_string(tc: &hegel::TestCase, first_min: usize, first_max: usize) -> String {
++        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
++        let first = tc.draw(
++            generators::integers::<usize>()
++                .min_value(first_min)
++                .max_value(first_max),
++        );
++        let rest: Vec<usize> = tc.draw(
++            generators::vecs(generators::integers::<usize>().max_value(31))
++                .min_size(ULID_LEN - 1)
++                .max_size(ULID_LEN - 1),
++        );
++        let lower_mask: u32 = tc.draw(generators::integers::<u32>());
++        let mut s = String::with_capacity(ULID_LEN);
++        for (i, idx) in core::iter::once(first).chain(rest).enumerate() {
++            let mut b = ALPHABET[idx];
++            if lower_mask >> (i % 32) & 1 == 1 {
++                b = b.to_ascii_lowercase(); // digits are unaffected
++            }
++            s.push(b as char);
++        }
++        s
++    }
++
++    /// Crown roundtrip: any u128 encodes to a 26-char string which parses
++    /// back to the same Ulid via every parsing entry point, including the
++    /// lowercase form (Crockford base32 decoding is case-insensitive).
++    #[hegel::test]
++    fn prop_string_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u128>());
++        let ulid = Ulid(n);
++        let s = ulid.to_string();
++        assert_eq!(s.len(), ULID_LEN);
++        // the fast inherent to_string and the Display impl must agree
++        assert_eq!(s, format!("{}", ulid));
++        assert_eq!(Ulid::from_string(&s), Ok(ulid));
++        assert_eq!(Ulid::from_str(&s), Ok(ulid));
++        assert_eq!(Ulid::try_from(s.as_str()), Ok(ulid));
++        assert_eq!(Ulid::from_string(&s.to_lowercase()), Ok(ulid));
++    }
++
++    /// u128, big-endian bytes, and (u64, u64) conversions are all bijective
++    /// views of the same 128 bits (std's to_be_bytes/shifts as the oracle).
++    #[hegel::test]
++    fn prop_integer_conversions_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u128>());
++        let ulid = Ulid::from(n);
++        assert_eq!(ulid.0, n);
++        assert_eq!(u128::from(ulid), n);
++        assert_eq!(ulid.to_bytes(), n.to_be_bytes());
++        assert_eq!(Ulid::from_bytes(n.to_be_bytes()), ulid);
++        assert_eq!(<[u8; 16]>::from(ulid), n.to_be_bytes());
++        assert_eq!(Ulid::from(n.to_be_bytes()), ulid);
++        let (msb, lsb): (u64, u64) = ulid.into();
++        assert_eq!(msb, (n >> 64) as u64);
++        assert_eq!(lsb, n as u64);
++        assert_eq!(Ulid::from((msb, lsb)), ulid);
++    }
++
++    /// `from_parts` keeps exactly the low 48 timestamp bits and low 80 random
++    /// bits ("Any overflow bits in the given args are discarded"), and
++    /// `timestamp_ms`/`random` recover them. For in-width inputs the masks
++    /// are identities, so this subsumes the exact roundtrip.
++    #[hegel::test]
++    fn prop_from_parts_roundtrip(tc: hegel::TestCase) {
++        const TIME_MASK: u64 = bitmask!(Ulid::TIME_BITS);
++        const RAND_MASK: u128 = bitmask!(Ulid::RAND_BITS);
++        // boost in-width values so the exact-roundtrip case is well covered
++        let ts = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().max_value(TIME_MASK),
++            generators::integers::<u64>(),
++        ));
++        let random = tc.draw(hegel::one_of!(
++            generators::integers::<u128>().max_value(RAND_MASK),
++            generators::integers::<u128>(),
++        ));
++        let ulid = Ulid::from_parts(ts, random);
++        assert_eq!(ulid.timestamp_ms(), ts & TIME_MASK);
++        assert_eq!(ulid.random(), random & RAND_MASK);
++    }
++
++    /// Strings whose length is not exactly 26 are rejected with
++    /// InvalidLength, even when every character is valid Crockford base32.
++    #[hegel::test]
++    fn prop_from_string_rejects_wrong_length(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u128>());
++        let s = Ulid(n).to_string();
++        let len = tc.draw(
++            generators::integers::<usize>()
++                .max_value(2 * ULID_LEN)
++                .filter(|&l| l != ULID_LEN),
++        );
++        let mutated = if len <= ULID_LEN {
++            s[..len].to_string() // safe: encoded strings are ASCII
++        } else {
++            let mut m = s;
++            while m.len() < len {
++                m.push('0');
++            }
++            m
++        };
++        assert_eq!(Ulid::from_string(&mutated), Err(DecodeError::InvalidLength));
++    }
++
++    /// Corrupting one character of a valid encoding with a non-Crockford
++    /// ASCII byte (boosting the deliberately excluded letters I, L, O, U) is
++    /// rejected with InvalidChar.
++    #[hegel::test]
++    fn prop_from_string_rejects_invalid_char(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u128>());
++        let mut buf = [0u8; ULID_LEN];
++        Ulid(n).array_to_str(&mut buf);
++        let pos = tc.draw(generators::integers::<usize>().max_value(ULID_LEN - 1));
++        let bad = tc.draw(hegel::one_of!(
++            // Crockford base32 deliberately excludes these letters
++            generators::sampled_from(vec![b'I', b'L', b'O', b'U', b'i', b'l', b'o', b'u']),
++            generators::integers::<u8>()
++                .max_value(0x7F)
++                .filter(|b| !is_crockford_byte(*b)),
++        ));
++        buf[pos] = bad;
++        let s = core::str::from_utf8(&buf).unwrap();
++        assert_eq!(Ulid::from_string(s), Err(DecodeError::InvalidChar));
++    }
++
++    /// `from_string` returns (never panics) on arbitrary text.
++    #[hegel::test]
++    fn prop_from_string_never_panics(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text());
++        let _ = Ulid::from_string(&s);
++        let _ = s.parse::<Ulid>();
++    }
++
++    /// Any in-range 26-char Crockford string (first char '0'..='7', mixed
++    /// case) decodes, and re-encoding yields its uppercase canonical form —
++    /// i.e. decode is injective on in-range strings modulo case.
++    #[hegel::test]
++    fn prop_valid_string_canonical_roundtrip(tc: hegel::TestCase) {
++        let s = draw_ulid_string(&tc, 0, 7);
++        let ulid = Ulid::from_string(&s).expect("in-range Crockford base32 string must decode");
++        assert_eq!(ulid.to_string(), s.to_ascii_uppercase());
++    }
++
++    /// 26 Crockford base32 chars encode 130 bits, but a Ulid has only 128:
++    /// the ULID spec caps ULIDs at "7ZZZZZZZZZZZZZZZZZZZZZZZZZ" (which is
++    /// Ulid::max()), so any string whose first char encodes 8..=31 denotes a
++    /// value >= 2^128 and must be rejected rather than silently truncated.
++    ///
++    /// KNOWN FAILURE — real bug, deliberately left failing: `base32::decode`
++    /// never checks the two overflow bits, so every out-of-range string is
++    /// accepted and its top two bits are silently discarded. Minimal
++    /// counterexample: "80000000000000000000000000" decodes to Ok(Ulid(0)),
++    /// i.e. it collides with "00000000000000000000000000". This violates the
++    /// ULID spec ("Any attempt to decode or encode a ULID larger than
++    /// [7ZZZZZZZZZZZZZZZZZZZZZZZZZ] should be rejected ... to prevent
++    /// overflow bugs") and makes from_string non-injective. The failure is
++    /// deterministic: every input this generator draws is out of range, so
++    /// the property fails on the first case of every run.
++    #[hegel::test]
++    fn prop_from_string_rejects_out_of_range(tc: hegel::TestCase) {
++        let s = draw_ulid_string(&tc, 8, 31);
++        let res = Ulid::from_string(&s);
++        assert!(
++            res.is_err(),
++            "out-of-range ULID string {:?} decoded to {:?}",
++            s,
++            res
++        );
++    }
++
++    /// "Lexicographically sortable": comparing two Ulids as strings gives
++    /// the same ordering as comparing their 128-bit values.
++    #[hegel::test]
++    fn prop_string_order_matches_value_order(tc: hegel::TestCase) {
++        let a = tc.draw(generators::integers::<u128>());
++        let b = tc.draw(generators::integers::<u128>());
++        assert_eq!(Ulid(a).to_string().cmp(&Ulid(b).to_string()), a.cmp(&b));
++    }
++
++    /// A Ulid with a strictly larger timestamp sorts strictly later as a
++    /// string, regardless of the random parts (the documented reason the
++    /// timestamp occupies the high bits).
++    #[hegel::test]
++    fn prop_timestamp_order_implies_string_order(tc: hegel::TestCase) {
++        const TIME_MASK: u64 = bitmask!(Ulid::TIME_BITS);
++        const RAND_MASK: u128 = bitmask!(Ulid::RAND_BITS);
++        let ts_lo = tc.draw(generators::integers::<u64>().max_value(TIME_MASK - 1));
++        let ts_hi = tc.draw(
++            generators::integers::<u64>()
++                .min_value(ts_lo + 1)
++                .max_value(TIME_MASK),
++        );
++        let r_lo = tc.draw(generators::integers::<u128>().max_value(RAND_MASK));
++        let r_hi = tc.draw(generators::integers::<u128>().max_value(RAND_MASK));
++        let early = Ulid::from_parts(ts_lo, r_lo);
++        let late = Ulid::from_parts(ts_hi, r_hi);
++        assert!(early < late);
++        assert!(early.to_string() < late.to_string());
++    }
++
++    /// `increment` bumps the random part and keeps the timestamp; when the
++    /// random part is maxed it returns the overflowed (next-millisecond)
++    /// Ulid in Err, saturating at Ulid::max.
++    #[hegel::test]
++    fn prop_increment(tc: hegel::TestCase) {
++        const RAND_MASK: u128 = bitmask!(Ulid::RAND_BITS);
++        // boost the maxed-random boundary so the Err branch fires often
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u128>(),
++            generators::integers::<u64>().map(|ts| Ulid::from_parts(ts, RAND_MASK).0),
++        ));
++        let ulid = Ulid(n);
++        match ulid.increment() {
++            Ok(next) => {
++                assert!(ulid.random() < RAND_MASK);
++                assert_eq!(next.timestamp_ms(), ulid.timestamp_ms());
++                assert_eq!(next.random(), ulid.random() + 1);
++            }
++            Err(overflowed) => {
++                assert_eq!(ulid.random(), RAND_MASK);
++                assert_eq!(overflowed.0, ulid.0.saturating_add(1));
++                if !ulid.is_max() {
++                    assert_eq!(overflowed.timestamp_ms(), ulid.timestamp_ms() + 1);
++                    assert_eq!(overflowed.random(), 0);
++                }
++            }
++        }
++    }
+ }
+diff --git a/src/time.rs b/src/time.rs
+index 69aab9f..139366b 100644
+--- a/src/time.rs
++++ b/src/time.rs
+@@ -168,6 +168,27 @@ mod tests {
+         assert_eq!(Ulid::nil().datetime(), SystemTime::UNIX_EPOCH);
+     }
+ 
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use hegel::generators;
++
++    /// For any representable millisecond instant (48 bits), a Ulid created
++    /// at that instant reports exactly that instant back through both
++    /// timestamp_ms() and datetime(), regardless of the random bits.
++    #[hegel::test]
++    fn prop_datetime_roundtrip(tc: hegel::TestCase) {
++        let ts = tc.draw(generators::integers::<u64>().max_value(bitmask!(Ulid::TIME_BITS)));
++        // StepRng is a counter: the drawn value is the random bits, shrinkable
++        let value = tc.draw(generators::integers::<u64>());
++        let mut source = crate::StepRng::new(value, 1);
++        let dt = SystemTime::UNIX_EPOCH + Duration::from_millis(ts);
++        let ulid = Ulid::from_datetime_with_source(dt, &mut source);
++        assert_eq!(ulid.timestamp_ms(), ts);
++        assert_eq!(ulid.datetime(), dt);
++    }
++
+     #[test]
+     fn truncates_at_unix_epoch() {
+         if let Some(before_epoch) = SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(100)) {

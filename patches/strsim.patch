@@ -1,0 +1,572 @@
+diff --git a/.gitignore b/.gitignore
+index 41ddad1..733a08a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ /target
+ /Cargo.lock
++/.hegel
+ *.swp
+ *.swo
+ .DS_Store
+diff --git a/Cargo.toml b/Cargo.toml
+index e0d77cb..99c2ee7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,3 +16,6 @@ repository = "https://github.com/rapidfuzz/strsim-rs"
+ documentation = "https://docs.rs/strsim/"
+ exclude = ["/.github", "/dev"]
+ categories = ["text-processing"]
++
++[dev-dependencies]
++hegeltest = "0.28.2"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..ab19e1e
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,192 @@
++# Hegel Property-Based Testing Report: strsim 0.11.1
++
++Property-based tests were added to `tests/lib.rs` (module `hegel_props`) using
++`hegeltest` 0.28.2. Note: `cargo add --dev hegeltest` required
++`--ignore-rust-version` because strsim pins `rust-version = "1.56"` while
++hegeltest's MSRV is 1.86 — whether to accept that dev-dependency MSRV bump is a
++maintainer decision.
++
++## Properties tested
++
++All strings are generated as full Unicode: either arbitrary `text()` or a small
++overlapping alphabet mixing 1-, 2-, 3- and 4-byte UTF-8 characters (including
++NUL and the multi-byte whitespace U+3000), since every metric here operates on
++`char`s and repeated/overlapping characters are where matches and
++transpositions live. Pairs are boosted toward equality so distance-zero
++branches are exercised.
++
++1. **Identity axiom** (`hegel_identity_all_metrics`) — d(x,x) = 0 for
++   `levenshtein`, `osa_distance`, `damerau_levenshtein`, `hamming` (= `Ok(0)`),
++   and similarity(x,x) = exactly 1.0 for `jaro`, `jaro_winkler`,
++   `normalized_levenshtein`, `normalized_damerau_levenshtein`, `sorensen_dice`.
++   Evidence: docs of the normalized functions say "1.0 means the strings are
++   the same"; existing unit tests `*_same`/`*_identical_strings` pin single
++   examples of this.
++
++2. **Symmetry axiom** (`hegel_symmetry_all_metrics`) — d(a,b) = d(b,a) for all
++   nine public string functions, with *exact* float equality (swapping
++   arguments only swaps commutative float additions). Evidence: all these are
++   symmetric by mathematical definition; existing unit tests
++   (`jaro_multibyte`, `osa_distance_diff_reversed`, ...) check both directions
++   of single examples.
++
++3. **Edit-distance chain and bounds** (`hegel_edit_distance_chain_and_bounds`)
++   — `damerau_levenshtein <= osa_distance <= levenshtein <= max(char len)`,
++   `|len(a) - len(b)| <= damerau_levenshtein`, and for equal char counts
++   `levenshtein <= hamming`. Evidence: `damerau_levenshtein` docs ("Like
++   optimal string alignment, but substrings can be edited an unlimited number
++   of times") and `osa_distance` docs ("Like Levenshtein but allows for
++   adjacent transpositions") establish each allows a superset of the previous
++   one's operations; substituting every differing position is one valid edit
++   script, giving the hamming bound.
++
++4. **Identity of indiscernibles** (`hegel_distance_zero_iff_equal`) —
++   distance = 0 iff a = b for the three edit distances (a `char`-sequence
++   determines a `&str`, so this is exact).
++
++5. **Triangle inequality for the true metrics**
++   (`hegel_triangle_inequality_true_metrics`) — d(a,c) <= d(a,b) + d(b,c) for
++   `levenshtein` (a metric by construction) and `damerau_levenshtein`, whose
++   docs explicitly state "the triangle inequality holds". OSA and the Jaro
++   family are deliberately excluded (see Unsound properties abandoned).
++
++6. **Single-edit sanity** (`hegel_single_edit_gives_distance_one`) — applying
++   exactly one insertion, deletion, or substitution-with-a-different-char to a
++   string gives distance exactly 1 for `levenshtein`, `osa_distance`, and
++   `damerau_levenshtein`. Evidence: the doc contract "minimum number of
++   insertions, deletions, and substitutions".
++
++7. **Adjacent transposition** (`hegel_adjacent_transposition`) — swapping two
++   adjacent distinct chars gives `osa_distance` = `damerau_levenshtein` = 1,
++   `levenshtein` = 2 (equal-length strings differing in exactly two positions
++   cannot be one edit apart), and `hamming` = `Ok(2)`. Evidence: the
++   transposition operation is the defining difference of OSA/DL vs
++   Levenshtein; unit tests `*_beginning_transposition`/`*_end_transposition`
++   pin single examples.
++
++8. **Hamming contract** (`hegel_hamming_contract`) — `hamming` returns
++   `Err(DifferentLengthArgs)` iff char counts differ, otherwise `Ok(number of
++   differing positions)`; never panics. Equal-length pairs are generated
++   directly half the time so the `Ok` branch is actually exercised. Evidence:
++   function docs and the `DifferentLengthArgs` unit test.
++
++9. **Jaro/Jaro-Winkler bounds and prefix bonus**
++   (`hegel_jaro_winkler_bounds_and_prefix_bonus`) — both in [0,1]
++   (documented: "between 0.0 and 1.0"); `jaro_winkler >= jaro` (the Winkler
++   bonus `sim + 0.1 * prefix * (1 - sim)` can only raise the score); and
++   `jaro_winkler == jaro` exactly when `jaro <= 0.7` or the first chars
++   differ. Shared prefixes are generated explicitly half the time so the bonus
++   branch is exercised. Triangle inequality is *not* asserted — Jaro is not a
++   metric.
++
++10. **Normalized-score bounds** (`hegel_normalized_scores_bounds`) —
++    `normalized_levenshtein`, `normalized_damerau_levenshtein`, and
++    `sorensen_dice` stay in [0,1], and the two normalized edit scores equal
++    exactly 1.0 iff the strings are equal (documented: "between 0.0 and 1.0
++    (inclusive), where 1.0 means the strings are the same").
++
++11. **Two-implementation equivalence oracle**
++    (`hegel_damerau_implementations_agree`) — the crate ships two independent
++    Damerau-Levenshtein implementations: `damerau_levenshtein` (Zhao-Sahni
++    linear-space algorithm, `damerau_levenshtein_impl`) and
++    `generic_damerau_levenshtein` (classic Lowrance-Wagner with a `HashMap`).
++    They must agree on every input. They did, on every run including the 10x
++    pass — good evidence for the intricate `HybridGrowingHashmapChar` code.
++
++12. **Sørensen-Dice reference oracle**
++    (`hegel_sorensen_dice_matches_reference`) — `sorensen_dice` compared
++    against a direct implementation of the documented definition (the docs
++    link the Wikipedia bigram-based Dice coefficient):
++    `2 * |bigram multiset intersection| / (#bigrams(a) + #bigrams(b))` on the
++    whitespace-stripped strings. **FAILS — real bug, kept failing and pinned
++    deterministically** (see Suspected bugs).
++
++## Test results
++
++- `cargo test`: 88 existing unit tests pass, all 8 existing integration tests
++  pass, 19 of 20 tests in `tests/lib.rs` pass; `cargo test --doc` passes.
++- The single failure is the intended known-failure pin
++  `hegel_props::hegel_sorensen_dice_matches_reference`, which fails on every
++  run (verified twice from a clean state with the `.hegel` failure database
++  removed; a `one_of!` branch generates the exact minimal counterexample with
++  probability 1/2 per case, so 100 cases make the failure deterministic in
++  practice).
++- Liveness check performed per the skill: temporarily inverting the identity
++  assertion made hegel report a shrunk counterexample (`s = ""`); reverted.
++- Exploratory 10x run performed: all properties run once with
++  `test_cases = 1000`; no additional failures beyond the pinned bug, and the
++  same minimal counterexample was reached.
++
++## Suspected bugs
++
++### `sorensen_dice` divides by byte lengths instead of bigram counts
++
++- **Minimal counterexample** (found and shrunk by hegel):
++  `sorensen_dice("\u{80}aa", "aa")` returns **0.5**; the documented Dice
++  coefficient is **2/3** (bigrams of `"\u{80}aa"` = {(\u{80},a), (a,a)},
++  bigrams of `"aa"` = {(a,a)}, intersection = 1, so 2*1/(2+1)).
++- **Code path**: `src/lib.rs`, `sorensen_dice`, final expression
++  `(2 * intersection_size) as f64 / (a.len() + b.len() - 2) as f64`. Here `a`
++  and `b` are the whitespace-filtered `String`s, so `a.len()`/`b.len()` are
++  *byte* lengths, while `intersection_size` counts *char* bigrams (from
++  `bigrams()`, which iterates `chars()`). For ASCII input byte length equals
++  char count and the formula is correct; any non-ASCII character inflates the
++  denominator and deflates the score. (`"\u{80}"` is 2 bytes, so the
++  denominator becomes 4 + 2 - 2 = 4 instead of the correct 2 + 1 = 3.)
++  The correct denominator is `a.chars().count() + b.chars().count() - 2`.
++- **Blast radius**: every multibyte-containing comparison returns a too-small
++  similarity; the relative error grows with the byte/char ratio (e.g. CJK text
++  is penalized ~3x in the denominator). The related guard `a.len() < 2` also
++  uses bytes, but that one is harmless: a 1-char multibyte string produces 0
++  bigrams, so the result is 0.0 either way.
++- Not fixed, per instructions. The failing test is kept as the canonical pin
++  with a `KNOWN FAILURE` comment; no sibling property needed an exclusion
++  since none of them assert the affected value.
++
++## Unsound properties abandoned
++
++These were considered during design and rejected before being committed (none
++had to be retracted after a failing run):
++
++- **Triangle inequality for `osa_distance`** — OSA is famously not a metric:
++  `osa("ca", "abc") = 3 > osa("ca", "a") + osa("a", "abc") = 1 + 2` fails the
++  inequality-style reasoning in general (the classic counterexample). The
++  crate's own docs imply this by advertising the triangle inequality only on
++  `damerau_levenshtein` ("...and the triangle inequality holds").
++- **Triangle inequality for `jaro`/`jaro_winkler`** — similarities, not
++  metrics; `1 - jaro` does not satisfy the triangle inequality either
++  (e.g. jaro("ab","cd") = 0 while both are similar to "abcd").
++- **`sorensen_dice == 1.0` iff equal** — false: distinct strings can have
++  equal bigram multisets, and the function is explicitly
++  whitespace-insensitive (`sorensen_dice("apple event", "apple    event") =
++  1.0` per its own unit tests). The exactly-1.0-iff-equal assertion was kept
++  only for the two normalized edit distances.
++- **`generic_levenshtein` vs `levenshtein` equivalence** — a tautology, since
++  `levenshtein` merely wraps `generic_levenshtein` with `StringWrapper`;
++  rejected as "using the implementation as the oracle".
++
++## Skill feedback
++
++- The Rust reference's Setup section predicted the exact failure hit here
++  (`cargo add` MSRV error, fixed with `--ignore-rust-version`) — zero time
++  lost.
++- The "no dedicated `char` generator" idiom (draw a codepoint via `one_of!`
++  over ASCII/BMP/supplementary and `char::from_u32(...).unwrap_or('\u{FFFD}')`)
++  worked as documented, and the plane weighting mattered: the bug lives at the
++  ASCII/non-ASCII byte-length boundary and `\u{80}` is exactly the smallest
++  non-ASCII codepoint, which shrinking found because the BMP branch has its own
++  minimum. A built-in `chars()` generator would still be nicer.
++- The SKILL.md advice that overlap-heavy small alphabets beat uniform Unicode
++  for similarity metrics proved right; `sampled_from(Vec<char>)` +
++  `vecs(...).min_size(2)` composed cleanly, and `one_of!` accepted branches of
++  different generator types (composite vs `just`) without `.boxed()`.
++- No global case-count override (gotcha 13) makes the mandated 10x exploratory
++  run awkward on a 11-test suite — done here with a temporary `sed` over
++  `#[hegel::test]` and reverted. A `HEGEL_TEST_CASES`-style env override would
++  remove a manual, error-prone step.
++- The "pin real bugs deterministically via a `one_of!` branch with the exact
++  counterexample" recipe worked verbatim, and the failure reproduces from a
++  clean checkout without relying on the `.hegel` database.
++- Counterexample output (`let draw_1 = ("\u{80}aa", "aa");`) names composite
++  draws generically; naming them after the composite (`string_pair_1`) would
++  read better in multi-draw tests.
+diff --git a/tests/lib.rs b/tests/lib.rs
+index 991fc6f..282d0cc 100644
+--- a/tests/lib.rs
++++ b/tests/lib.rs
+@@ -69,3 +69,347 @@ fn jaro_works() {
+ fn jaro_winkler_works() {
+     assert_delta!(0.866, jaro_winkler("cheeseburger", "cheese fries"), 0.001);
+ }
++
++/// Property-based tests (hegel).
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use std::collections::HashMap;
++    use strsim::{
++        damerau_levenshtein, generic_damerau_levenshtein, hamming, jaro, jaro_winkler,
++        levenshtein, normalized_damerau_levenshtein, normalized_levenshtein, osa_distance,
++        sorensen_dice, StrSimError,
++    };
++
++    fn char_count(s: &str) -> usize {
++        s.chars().count()
++    }
++
++    /// Arbitrary Unicode scalar value, weighted across ASCII / BMP / supplementary
++    /// planes (all these metrics operate on `char`s, so multi-byte chars matter).
++    #[hegel::composite]
++    fn unicode_char(tc: hegel::TestCase) -> char {
++        tc.draw(
++            hegel::one_of!(
++                generators::integers::<u32>().max_value(0x7F),
++                generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++                generators::integers::<u32>()
++                    .min_value(0x1_0000)
++                    .max_value(0x10_FFFF),
++            )
++            .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++        )
++    }
++
++    /// Small alphabet with 1-, 2-, 3- and 4-byte UTF-8 encodings plus whitespace
++    /// (incl. multi-byte whitespace). Repeated/overlapping characters are where
++    /// the interesting edit-distance behaviour (matches, transpositions) lives.
++    fn small_alphabet() -> Vec<char> {
++        vec!['a', 'b', 'c', ' ', '\u{0}', '\u{3000}', 'à', 'ß', '香', '𝄞']
++    }
++
++    /// Strings drawn either from the small overlapping alphabet or as arbitrary text.
++    #[hegel::composite]
++    fn metric_string(tc: hegel::TestCase) -> String {
++        if tc.draw(generators::booleans()) {
++            tc.draw(generators::vecs(generators::sampled_from(small_alphabet())))
++                .into_iter()
++                .collect()
++        } else {
++            tc.draw(generators::text())
++        }
++    }
++
++    /// A pair of strings, boosted towards equal pairs so that "distance zero"
++    /// branches are actually exercised.
++    #[hegel::composite]
++    fn string_pair(tc: hegel::TestCase) -> (String, String) {
++        let a = tc.draw(metric_string());
++        let b = if tc.draw(generators::booleans()) {
++            a.clone()
++        } else {
++            tc.draw(metric_string())
++        };
++        (a, b)
++    }
++
++    /// Identity axiom: every distance is 0 (and every similarity is exactly 1.0)
++    /// when comparing a string with itself.
++    #[hegel::test]
++    fn hegel_identity_all_metrics(tc: hegel::TestCase) {
++        let s = tc.draw(metric_string());
++        assert_eq!(0, levenshtein(&s, &s));
++        assert_eq!(0, osa_distance(&s, &s));
++        assert_eq!(0, damerau_levenshtein(&s, &s));
++        assert_eq!(Ok(0), hamming(&s, &s));
++        assert_eq!(1.0, jaro(&s, &s));
++        assert_eq!(1.0, jaro_winkler(&s, &s));
++        assert_eq!(1.0, normalized_levenshtein(&s, &s));
++        assert_eq!(1.0, normalized_damerau_levenshtein(&s, &s));
++        assert_eq!(1.0, sorensen_dice(&s, &s));
++    }
++
++    /// Symmetry axiom: d(a, b) == d(b, a) for every metric in the crate.
++    /// (Exact float equality is intended: swapping the arguments only swaps
++    /// commutative float additions.)
++    #[hegel::test]
++    fn hegel_symmetry_all_metrics(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(string_pair());
++        assert_eq!(levenshtein(&a, &b), levenshtein(&b, &a));
++        assert_eq!(osa_distance(&a, &b), osa_distance(&b, &a));
++        assert_eq!(damerau_levenshtein(&a, &b), damerau_levenshtein(&b, &a));
++        assert_eq!(hamming(&a, &b), hamming(&b, &a));
++        assert_eq!(jaro(&a, &b), jaro(&b, &a));
++        assert_eq!(jaro_winkler(&a, &b), jaro_winkler(&b, &a));
++        assert_eq!(normalized_levenshtein(&a, &b), normalized_levenshtein(&b, &a));
++        assert_eq!(
++            normalized_damerau_levenshtein(&a, &b),
++            normalized_damerau_levenshtein(&b, &a)
++        );
++        assert_eq!(sorensen_dice(&a, &b), sorensen_dice(&b, &a));
++    }
++
++    /// The edit distances form a chain: damerau <= osa <= levenshtein (each allows
++    /// strictly more/cheaper operations than the next), all are bounded below by
++    /// the length difference and above by max(len). For equal-length strings,
++    /// levenshtein <= hamming (substituting every differing position is one way
++    /// to edit one string into the other).
++    #[hegel::test]
++    fn hegel_edit_distance_chain_and_bounds(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(string_pair());
++        let (la, lb) = (char_count(&a), char_count(&b));
++        let lev = levenshtein(&a, &b);
++        let osa = osa_distance(&a, &b);
++        let dl = damerau_levenshtein(&a, &b);
++        assert!(dl <= osa, "damerau {} > osa {}", dl, osa);
++        assert!(osa <= lev, "osa {} > levenshtein {}", osa, lev);
++        assert!(la.abs_diff(lb) <= dl, "damerau {} < length diff", dl);
++        assert!(lev <= la.max(lb), "levenshtein {} > max len", lev);
++        if la == lb {
++            let ham = hamming(&a, &b).expect("equal char counts");
++            assert!(lev <= ham, "levenshtein {} > hamming {}", lev, ham);
++        }
++    }
++
++    /// Identity of indiscernibles: distance is zero if and only if the strings
++    /// are equal (for the true edit distances).
++    #[hegel::test]
++    fn hegel_distance_zero_iff_equal(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(string_pair());
++        let equal = a == b;
++        assert_eq!(equal, levenshtein(&a, &b) == 0);
++        assert_eq!(equal, osa_distance(&a, &b) == 0);
++        assert_eq!(equal, damerau_levenshtein(&a, &b) == 0);
++    }
++
++    /// Triangle inequality for the two true metrics. levenshtein is a metric;
++    /// damerau_levenshtein's docs explicitly state "the triangle inequality
++    /// holds". (OSA is deliberately excluded — it does not satisfy it.)
++    #[hegel::test]
++    fn hegel_triangle_inequality_true_metrics(tc: hegel::TestCase) {
++        let a = tc.draw(metric_string());
++        let b = tc.draw(metric_string());
++        let c = tc.draw(metric_string());
++        assert!(
++            levenshtein(&a, &c) <= levenshtein(&a, &b) + levenshtein(&b, &c),
++            "levenshtein violates triangle inequality"
++        );
++        assert!(
++            damerau_levenshtein(&a, &c)
++                <= damerau_levenshtein(&a, &b) + damerau_levenshtein(&b, &c),
++            "damerau_levenshtein violates triangle inequality"
++        );
++    }
++
++    /// A single insertion, deletion, or substitution (with a different char)
++    /// yields distance exactly 1 for levenshtein, OSA, and Damerau-Levenshtein.
++    #[hegel::test]
++    fn hegel_single_edit_gives_distance_one(tc: hegel::TestCase) {
++        let mut chars: Vec<char> = tc.draw(metric_string()).chars().collect();
++        let a: String = chars.iter().collect();
++        let op = if chars.is_empty() {
++            0 // only insertion is possible on an empty string
++        } else {
++            tc.draw(generators::integers::<u8>().max_value(2))
++        };
++        match op {
++            0 => {
++                let pos = tc.draw(generators::integers::<usize>().max_value(chars.len()));
++                let ch = tc.draw(unicode_char());
++                chars.insert(pos, ch);
++            }
++            1 => {
++                let pos = tc.draw(generators::integers::<usize>().max_value(chars.len() - 1));
++                chars.remove(pos);
++            }
++            _ => {
++                let pos = tc.draw(generators::integers::<usize>().max_value(chars.len() - 1));
++                let ch = tc.draw(unicode_char());
++                tc.assume(ch != chars[pos]);
++                chars[pos] = ch;
++            }
++        }
++        let b: String = chars.iter().collect();
++        assert_eq!(1, levenshtein(&a, &b));
++        assert_eq!(1, osa_distance(&a, &b));
++        assert_eq!(1, damerau_levenshtein(&a, &b));
++    }
++
++    /// Swapping two adjacent distinct chars is one transposition: OSA and
++    /// Damerau-Levenshtein give exactly 1, plain levenshtein gives exactly 2
++    /// (equal-length strings differing in exactly two positions can't be one
++    /// edit apart), and hamming sees exactly the two swapped positions.
++    #[hegel::test]
++    fn hegel_adjacent_transposition(tc: hegel::TestCase) {
++        let mut chars: Vec<char> = tc.draw(
++            generators::vecs(generators::sampled_from(small_alphabet())).min_size(2),
++        );
++        let i = tc.draw(generators::integers::<usize>().max_value(chars.len() - 2));
++        tc.assume(chars[i] != chars[i + 1]);
++        let a: String = chars.iter().collect();
++        chars.swap(i, i + 1);
++        let b: String = chars.iter().collect();
++        assert_eq!(1, osa_distance(&a, &b));
++        assert_eq!(1, damerau_levenshtein(&a, &b));
++        assert_eq!(2, levenshtein(&a, &b));
++        assert_eq!(Ok(2), hamming(&a, &b));
++    }
++
++    /// hamming's documented contract: Err(DifferentLengthArgs) iff the char
++    /// counts differ, and otherwise Ok(number of positions whose chars differ)
++    /// — never a panic.
++    #[hegel::test]
++    fn hegel_hamming_contract(tc: hegel::TestCase) {
++        let a_chars: Vec<char> = tc.draw(generators::vecs(unicode_char()));
++        // Boost equal-length pairs: purely independent draws would almost
++        // always take the Err branch.
++        let b_chars: Vec<char> = if tc.draw(generators::booleans()) {
++            tc.draw(
++                generators::vecs(unicode_char())
++                    .min_size(a_chars.len())
++                    .max_size(a_chars.len()),
++            )
++        } else {
++            tc.draw(generators::vecs(unicode_char()))
++        };
++        let a: String = a_chars.iter().collect();
++        let b: String = b_chars.iter().collect();
++        let result = hamming(&a, &b);
++        if a_chars.len() == b_chars.len() {
++            let expected = a_chars.iter().zip(&b_chars).filter(|(x, y)| x != y).count();
++            assert_eq!(Ok(expected), result);
++        } else {
++            assert_eq!(Err(StrSimError::DifferentLengthArgs), result);
++        }
++    }
++
++    /// jaro and jaro_winkler stay in [0, 1]; the Winkler prefix bonus can only
++    /// raise the score (jaro_winkler >= jaro), and it does not apply at all when
++    /// jaro <= 0.7 or when there is no common first char.
++    #[hegel::test]
++    fn hegel_jaro_winkler_bounds_and_prefix_bonus(tc: hegel::TestCase) {
++        let (mut a, mut b) = tc.draw(string_pair());
++        // Boost shared prefixes so the bonus branch (jaro > 0.7, common prefix)
++        // is actually exercised.
++        if tc.draw(generators::booleans()) {
++            let prefix = tc.draw(metric_string());
++            a = format!("{}{}", prefix, a);
++            b = format!("{}{}", prefix, b);
++        }
++        let j = jaro(&a, &b);
++        let jw = jaro_winkler(&a, &b);
++        assert!((0.0..=1.0).contains(&j), "jaro {} out of [0, 1]", j);
++        assert!((0.0..=1.0).contains(&jw), "jaro_winkler {} out of [0, 1]", jw);
++        assert!(jw >= j, "jaro_winkler {} < jaro {}", jw, j);
++        if j <= 0.7 || a.chars().next() != b.chars().next() {
++            assert_eq!(j, jw, "prefix bonus applied when it shouldn't be");
++        }
++    }
++
++    /// The normalized scores stay in [0, 1] and hit exactly 1.0 iff the strings
++    /// are equal ("1.0 means the strings are the same" per the docs).
++    #[hegel::test]
++    fn hegel_normalized_scores_bounds(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(string_pair());
++        let nl = normalized_levenshtein(&a, &b);
++        let ndl = normalized_damerau_levenshtein(&a, &b);
++        let sd = sorensen_dice(&a, &b);
++        assert!((0.0..=1.0).contains(&nl), "normalized_levenshtein {}", nl);
++        assert!((0.0..=1.0).contains(&ndl), "normalized_damerau_levenshtein {}", ndl);
++        assert!((0.0..=1.0).contains(&sd), "sorensen_dice {}", sd);
++        assert_eq!(a == b, nl == 1.0);
++        assert_eq!(a == b, ndl == 1.0);
++    }
++
++    /// The crate ships two independent Damerau-Levenshtein implementations:
++    /// `damerau_levenshtein` (Zhao-Sahni linear-space algorithm) and
++    /// `generic_damerau_levenshtein` (classic Lowrance-Wagner with a HashMap).
++    /// They must agree on every input.
++    #[hegel::test]
++    fn hegel_damerau_implementations_agree(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(string_pair());
++        let a_chars: Vec<char> = a.chars().collect();
++        let b_chars: Vec<char> = b.chars().collect();
++        assert_eq!(
++            generic_damerau_levenshtein(&a_chars, &b_chars),
++            damerau_levenshtein(&a, &b)
++        );
++    }
++
++    /// Straightforward reference implementation of the documented
++    /// Sørensen-Dice coefficient (https://en.wikipedia.org/wiki/S%C3%B8rensen%E2%80%93Dice_coefficient):
++    /// 2 * |intersection of bigram multisets| / (#bigrams(a) + #bigrams(b)),
++    /// on the whitespace-stripped strings, mirroring the special cases of the
++    /// implementation under test (equal -> 1.0, fewer than 2 chars -> 0.0).
++    fn sorensen_dice_reference(a: &str, b: &str) -> f64 {
++        let a: Vec<char> = a.chars().filter(|c| !c.is_whitespace()).collect();
++        let b: Vec<char> = b.chars().filter(|c| !c.is_whitespace()).collect();
++        if a == b {
++            return 1.0;
++        }
++        if a.len() < 2 || b.len() < 2 {
++            return 0.0;
++        }
++        let mut a_bigrams: HashMap<(char, char), usize> = HashMap::new();
++        for w in a.windows(2) {
++            *a_bigrams.entry((w[0], w[1])).or_insert(0) += 1;
++        }
++        let mut intersection = 0_usize;
++        for w in b.windows(2) {
++            if let Some(count) = a_bigrams.get_mut(&(w[0], w[1])) {
++                if *count > 0 {
++                    *count -= 1;
++                    intersection += 1;
++                }
++            }
++        }
++        (2 * intersection) as f64 / ((a.len() - 1) + (b.len() - 1)) as f64
++    }
++
++    /// sorensen_dice must match the documented bigram-based Dice coefficient.
++    ///
++    /// KNOWN FAILURE: sorensen_dice divides by *byte* lengths
++    /// (`a.len() + b.len() - 2` on the whitespace-stripped `String`s) while the
++    /// numerator counts *char* bigrams, so any non-ASCII character inflates the
++    /// denominator and deflates the score. Minimal counterexample (found and
++    /// shrunk by hegel): sorensen_dice("\u{80}aa", "aa") = 0.5, but the
++    /// documented Dice coefficient is 2*1/(2+1) = 2/3. The `one_of!` branch
++    /// below pins that counterexample so this test fails deterministically on
++    /// every run until the bug is fixed.
++    #[hegel::test]
++    fn hegel_sorensen_dice_matches_reference(tc: hegel::TestCase) {
++        let (a, b) = tc.draw(hegel::one_of!(
++            string_pair(),
++            generators::just(("\u{80}aa".to_string(), "aa".to_string())),
++        ));
++        let expected = sorensen_dice_reference(&a, &b);
++        let actual = sorensen_dice(&a, &b);
++        assert!(
++            (expected - actual).abs() < 1e-9,
++            "sorensen_dice({:?}, {:?}) = {}, reference says {}",
++            a,
++            b,
++            actual,
++            expected
++        );
++    }
++}

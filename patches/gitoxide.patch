@@ -1,0 +1,943 @@
+diff --git a/.gitignore b/.gitignore
+index 78cd84318..61bfef3ac 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,3 +21,6 @@ $**/fuzz/Cargo.lock
+ 
+ # Instead of adding more environment-specific ignores here, like for the IDE in use, prefer Git's user-global
+ # `core.excludesFile` mechanism, see https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreexcludesFile.
++
++# hegel property-testing failure database
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 000000000..0beb7808a
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,204 @@
++# Hegel Property-Based Testing Report
++
++Property-based tests were added with `hegeltest` 0.28.2 (dev-dependency, added with
++`cargo add --dev hegeltest -p <crate> --ignore-rust-version` because the workspace pins
++`rust-version = "1.85"` while hegeltest requires 1.86) to three plumbing crates whose
++`fuzz/` targets only cover parse-robustness (no roundtrip/consistency assertions):
++`gix-url`, `gix-refspec`, and `gix-config`.
++
++All tests live in the crates' existing integration-test files, next to the unit tests they
++generalize. `.hegel/` was added to the root `.gitignore`.
++
++## Properties tested
++
++### gix-url (`gix-url/tests/url/parse/mod.rs`, mod `properties`)
++
++1. **`parsed_urls_roundtrip_through_to_bstring`** — for any input (arbitrary bytes, arbitrary
++   text, structured `scheme://[user[:pass]@]host[:port]/path` URLs including percent-escapes,
++   SCP-like targets) that `gix_url::parse()` accepts, `parse(url.to_bstring())` succeeds and
++   equals the original `Url`.
++   *Evidence:* `Url::write_to()` docs: "Write this URL losslessly to `out`, ready to be parsed
++   again"; the existing `assert_url_roundtrip()` helper checks exactly this for ~30 fixed examples.
++2. **`from_parts_preserves_components`** — `Url::from_parts()` built from valid components
++   (scheme in {http, https, ssh, git}, unicode user/password, host incl. IPv4/IPv6, port 1–65535,
++   `/`-prefixed path) preserves every component (modulo documented normalizations: lowercase
++   hosts, `/~` stripping for ssh/git, IPv6 bracket storage forms).
++   *Evidence:* field docs on `Url` ("Stored in decoded form... Re-encoded during canonical
++   serialization", the IPv6 bracket rules, the `/~` path normalization), and `from_parts()`
++   validating "by parsing them back".
++3. **`users_with_colons_roundtrip_through_to_bstring`** — KNOWN FAILURE, pins bug #1 below.
++
++### gix-refspec (`tests/refspec/write.rs`, `impls.rs`, `spec.rs`, mods `properties`)
++
++4. **`parsed_specs_reproduce_in_parseable_form`** — any refspec accepted by
++   `gix_refspec::parse()` (for both `Operation::Fetch` and `Operation::Push`, from arbitrary
++   text/bytes and structured `[+^]src[:dst]` shapes) serializes via `to_bstring()` to something
++   that reparses under the same operation with an equal `instruction()`.
++   *Evidence:* `RefSpecRef::to_bstring()` doc: "Reproduce ourselves in parseable form";
++   `PartialEq` for specs is defined via `instruction()`.
++5. **`one_sided_push_glob_specs_reproduce_in_parseable_form`** — KNOWN FAILURE, pins bug #2 below.
++6. **`to_owned_to_ref_is_identity`** — `spec.to_owned().to_ref()` equals the original spec and
++   serializes identically.
++   *Evidence:* `to_owned()` doc: "Convert this ref into a standalone, owned copy".
++7. **`prefix_is_a_prefix_of_the_relevant_side`** — whenever `prefix()` returns `Some(p)`, `p` is
++   a string prefix of the relevant side (source for fetch, destination for push).
++   *Evidence:* `prefix()` docs ("Exact refs starting with `refs/` are returned unchanged...
++   glob refspecs return the portion up to their single `*`") and the example-based tests in
++   `tests/refspec/spec.rs::prefix`.
++
++### gix-config (`tests/config/file/write.rs`, `tests/config/file/access/raw/set_raw_value.rs`)
++
++8. **`serialization_is_a_fixed_point`** — for any parseable input (a `config_ish` generator
++   producing sections/subsections in both quoted and dotted form, values with escapes, quotes,
++   line continuations, trailing comments, `\n`/`\r\n` newline styles, plus raw text/bytes
++   branches), `file.to_bstring()` parses again, and serializing the reparse is byte-identical.
++   *Evidence:* `write_to()` doc "reproduce this file mostly losslessly as it was parsed"
++   (normalizations happen only on the *first* cycle, see `inserted_newlines_use_each_sections_
++   newline_style`); the crate's own fuzz target reparses `to_bstring()` output.
++9. **`roundtrip_preserves_sections_and_values`** — a parse/serialize cycle preserves the ordered
++   list of sections (name, subsection) and each section's (value-name, value) pairs.
++   *Evidence:* generalization of the existing `complex_lossless_roundtrip` test.
++10. **`subsection_names_roundtrip_through_serialization`** — a value stored under an arbitrary
++    valid subsection name (anything without `\n`/`\0`, boosted with `"`/`\`/brackets/whitespace)
++    is retrievable under the same name after a serialize/parse cycle.
++    *Evidence:* `is_valid_subsection()`, `write_escaped_subsection()`, and the existing
++    `decoded_subsection_names_keep_their_raw_spelling` test.
++11. **`set_value_can_be_read_back_after_serialization`** — `set_raw_value_by()` with arbitrary
++    byte values (binary and unicode) reads back identically via `raw_value_by()`, both
++    immediately and after a serialize/parse cycle. This evolves the hand-picked
++    `assert_set_value()` examples in the same file into a property.
++    *Evidence:* `set_raw_value()` doctests assert exactly this for fixed values; `escape_value()`
++    escapes `\n`, `\t`, `"`, `\` on write and `value::normalize()` decodes on read.
++
++That is 9 distinct properties plus 2 deterministic known-failure pins.
++
++## Test results
++
++- Liveness verified: every property was observed reporting a shrunk counterexample at least once
++  during development; for gix-config (whose final properties never failed naturally) an assertion
++  was temporarily inverted and hegel reported a minimal counterexample
++  (`section="a", key="a", value=[]`), then reverted.
++- Exploratory 10x run (`test_cases = 1000` on all 11 tests, then reverted to the default):
++  identical outcome to the default run — only the two KNOWN FAILURE tests fail.
++- Final full runs:
++  - `cargo test -p gix-config`: **all green** (392 tests passed, incl. 4 new properties).
++  - `cargo test -p gix-url`: 114 passed, **1 failed**: `users_with_colons_roundtrip_through_to_bstring`
++    (intentional, pins bug #1).
++  - `cargo test -p gix-refspec`: 78 passed, **1 failed**: `one_sided_push_glob_specs_reproduce_in_parseable_form`
++    (intentional, pins bug #2).
++  Both failing tests fail deterministically on every run: their generators only produce inputs
++  inside the buggy region, so every one of the 100 cases fails and hegel shrinks to the minimal
++  counterexample each time.
++
++## Suspected bugs
++
++### 1. gix-url: `Url::to_bstring()` is lossy for users containing `:` (silent user/password corruption)
++
++- **Minimal counterexample** (shrunk by hegel): `parse("http://%3A@host/")` →
++  `Url { user: Some(":"), password: None, .. }` → `to_bstring()` = `"http://:@host/"` →
++  reparses as `Url { user: None, password: None, .. }`. Non-degenerate form:
++  `parse("http://a%3Ab@host/")` → user `a:b` → serializes `http://a:b@host/` → reparses as
++  user `a`, password `b`.
++- **Why it's a library bug:** `Url::user` is documented as "Stored in decoded form...
++  Re-encoded during canonical serialization", and `write_to()` promises "Write this URL
++  losslessly to `out`, ready to be parsed again". A colon inside the user component must be
++  percent-encoded because the first unencoded `:` in userinfo delimits user from password —
++  round-tripping turns part of a username into a password, which the crate's own security notes
++  treat as sensitive. `Url::from_parts(user: Some("a:b"), ..)` also silently returns a `Url`
++  with user `a` and password `b`.
++- **Code path:** `write_canonical_form_to()` in `gix-url/src/lib.rs` — `USERINFO_ENCODE_SET`
++  contains `@`, `/`, `[`, `]` etc. but not `:`; the user is written with
++  `percent_encode(user)` and the reparse splits userinfo at the first `:`
++  (`simple_url.rs::parse`, `rsplit_once('@')` then `split_once(':')`).
++- **Pinned by:** `gix-url/tests/url/parse/mod.rs::properties::users_with_colons_roundtrip_through_to_bstring`.
++  Excluded (with comments referencing the canonical test) from the two sibling properties.
++
++### 2. gix-refspec: one-sided push specs with complex globs serialize to an unparseable form
++
++- **Minimal counterexample** (shrunk by hegel): `parse("**", Operation::Push)` succeeds; its
++  `instruction()` is `Push::Matching { src: "**", dst: "**" }`; `to_bstring()` yields `"**:**"`,
++  which fails to reparse with `PatternUnsupported { pattern: "**" }`. Also found with invalid
++  ref-name bytes: `parse("\0*", Push)` → `to_bstring()` = `"\0*:\0*"` → `InvalidByte` on reparse.
++- **Why it's a library bug:** `to_bstring()` documents "Reproduce ourselves in parseable form".
++  The parser intentionally relaxes validation for one-sided specs (`validated()` in
++  `gix-refspec/src/parse.rs` skips *all* validation when `is_one_sided && has_globs`, per the
++  intentional behavior change noted in `tests/refspec/parse/mod.rs::baseline`), but
++  `RefSpecRef::instruction()` maps a one-sided push spec to `Push::Matching { src, dst: src }`,
++  whose serialization `src:src` is a *two-sided* spec subject to the strict validation
++  (single `*`, valid ref-name bytes). Anything accepted only thanks to the one-sided relaxation
++  therefore cannot round-trip; consumers persisting `spec.to_bstring()` (the advertised way to
++  re-store a spec) write configuration they can no longer read.
++- **Code path:** `gix-refspec/src/parse.rs::validated()` (one-sided glob bypass) +
++  `gix-refspec/src/spec.rs::instruction()` (`(Normal|Force, Some(src), None)` →
++  `Push::Matching { src, dst: src }`) + `gix-refspec/src/write.rs` (writes `src:dst`).
++- **Pinned by:** `gix-refspec/tests/refspec/write.rs::properties::one_sided_push_glob_specs_reproduce_in_parseable_form`.
++  Excluded (with a comment referencing the canonical test) from the sibling roundtrip property.
++
++### Minor observation (not pinned, arguably doc-vs-behavior)
++
++`gix-url`'s `Url::host` docs say IPv6 hosts are stored *with* brackets for non-SSH schemes, but
++brackets are only added during serialization when a port is present (`needs_brackets` in
++`write_canonical_form_to`). So `from_parts(Http, host: Some("::1"), port: None, ..)` yields a
++`Url` whose host is stored `"::1"` (serializes as the non-RFC form `http://::1/`), while the
++same call with a port stores `"[::1]"`. The representation of the same host thus depends on the
++presence of a port. The roundtrip property still holds in both cases, so this was handled by
++generating the documented storage form (bracketed for non-SSH) rather than pinned as a failing
++test; it may be worth a maintainer's attention.
++
++## Unsound properties abandoned
++
++- **`from_parts` preserves `Some("")` user/password** — abandoned. `http://@host/` and
++  `http://u:@host/` reparse with `None` user/password; empty userinfo components are degenerate
++  values that essentially every URL implementation treats as absent, and the field docs describe
++  the user as "the user to impersonate", which an empty string is not. Generators now require
++  non-empty user/password (documented in comments).
++- **`from_parts` preserves port `0`** — not asserted; port 0 is explicitly outside the domain
++  (existing test `invalid::port_zero_is_invalid`, error "invalid port number - must be between
++  1-65535"). Generator constrained to 1–65535 with a comment.
++- **Byte-exact `to_bstring() == input` for gix-config** — deliberately *not* asserted for the
++  first parse/serialize cycle. `write_to()` promises only "mostly losslessly": the existing
++  `inserted_newlines_use_each_sections_newline_style` test shows a documented normalization
++  (e.g. `[b]y=2` gains a newline after the header). The property was formulated as a fixed point
++  after one cycle instead, which is the strongest sound version and did hold.
++- An earlier formulation of the **refspec `prefix()` property** rejected too many inputs
++  (hegel's `FilterTooMuch` health check fired because `prefix()` is `None` for most arbitrary
++  specs). It was reworked with a generator biased toward `refs/`-prefixed sides rather than by
++  suppressing the health check.
++
++## Skill feedback
++
++Overall the skill worked well; both real bugs were found by the workflow it prescribes
++(roundtrip properties on parse/serialize pairs, reading the crate's `fuzz/` directory to see
++what is *not* covered, broad generators first, investigate on failure). Specific notes:
++
++1. **The MSRV gotcha in the Rust reference was exactly right.** `cargo add --dev hegeltest`
++   failed with the predicted resolution error and `--ignore-rust-version` fixed it. Having that
++   in the Setup section saved real time.
++2. **The "boundary conjunctions need help" advice proved itself.** The colon-user bug was
++   invisible to `text()`-based generation at default *and* 10x counts (it needs `%3A` or a raw
++   `:` inside userinfo in an otherwise-valid URL). It was found only by reading the encode-set
++   in the source and then targeting the suspicious gap. The skill covers this ("read the code
++   for suspicious arithmetic... and target the conjunction it implies") — it may be worth
++   stating for *character sets* too, e.g. "when a serializer has an explicit encode-set,
++   generate characters just outside it".
++3. **`FilterTooMuch` guidance worked as designed** — the health-check failure message plus the
++   skill's "restructure generators to produce valid inputs directly" led to the biased
++   `prefixy_side()` generator instead of suppressing the check.
++4. **Known-failure pinning guidance was actionable** (boost the generator to the failing region
++   so the test fails every run; exclude the region from siblings with a comment referencing the
++   canonical test). Both pinned tests fail on 100/100 cases and shrink to minimal
++   counterexamples on every run.
++5. **Minor reference gap:** the composite/closure interplay — `#[hegel::composite]` functions
++   cannot be *returned* as values from other generators, and helper closures taking
++   `&hegel::TestCase` (documented) were the right tool inside composites; an example of a
++   composite that internally uses per-branch helper closures would have matched real usage here.
++6. **Minor reference gap:** counterexample output labels draws from inside `one_of!`/composites
++   as `draw_1`, `host_1` etc. — the reference mentions unnamed draws for helpers, but not that
++   `one_of!` branches inside composites show the composite parameter name with a suffix.
++   Harmless, but knowing what output to expect would help when reading failures.
++7. **One place the skill's file-placement rule needed interpretation:** "add tests to the
++   appropriate existing test file" worked (properties were placed beside the unit tests they
++   generalize in `write.rs`, `spec.rs`, `impls.rs`, `set_raw_value.rs`), but sharing one
++   generator across several existing files required making the generator module `pub(crate)`
++   inside one of them, which felt slightly against the grain; a sentence blessing a shared
++   `pub(crate)` generator inside one of the existing files would remove the hesitation.
+diff --git a/gix-config/Cargo.toml b/gix-config/Cargo.toml
+index fd5e40273..162e79561 100644
+--- a/gix-config/Cargo.toml
++++ b/gix-config/Cargo.toml
+@@ -46,6 +46,7 @@ serial_test = { version = "3.4.0", default-features = false }
+ bytesize = "2.3.1"
+ cap = { version = "0.1.2", features = ["stats"] }
+ insta = "1.46.3"
++hegeltest = "0.28.2"
+ 
+ [[bench]]
+ name = "large_config_file"
+diff --git a/gix-config/tests/config/file/access/raw/set_raw_value.rs b/gix-config/tests/config/file/access/raw/set_raw_value.rs
+index 7bcf9820c..a7cf72bbd 100644
+--- a/gix-config/tests/config/file/access/raw/set_raw_value.rs
++++ b/gix-config/tests/config/file/access/raw/set_raw_value.rs
+@@ -85,3 +85,54 @@ fn invalid_value_names_fail_without_creating_a_section() {
+     ));
+     assert_eq!(file.sections().count(), 0, "validation precedes section creation");
+ }
++
++/// Property-based tests (hegel) — the generalization of `assert_set_value()` above:
++/// instead of hand-picked values, draw arbitrary byte values.
++mod properties {
++    use bstr::{BStr, ByteSlice};
++    use hegel::generators::{self, Generator};
++
++    /// Property: `set_raw_value()` documents that the assigned value is returned by
++    /// `raw_value()` afterwards, and values are escaped on write (`escape_value()`) and
++    /// normalized on read, so the value must also survive a serialize/parse cycle.
++    #[hegel::test]
++    fn set_value_can_be_read_back_after_serialization(tc: hegel::TestCase) {
++        let section: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9-]{1,8}").fullmatch(true));
++        let key: String = tc.draw(generators::from_regex(r"[a-zA-Z][a-zA-Z0-9-]{0,7}").fullmatch(true));
++        let value: Vec<u8> = tc.draw(hegel::one_of!(
++            generators::binary().max_size(20),
++            generators::text().max_size(20).map(String::into_bytes),
++        ));
++
++        let mut file = gix_config::File::default();
++        file.set_raw_value_by(&section, None::<&BStr>, &key, value.as_bstr())
++            .expect("setting a value in a fresh file always succeeds");
++        assert_eq!(
++            file.raw_value_by(&section, None::<&BStr>, &key)
++                .expect("the just-set value exists"),
++            value.as_bstr(),
++            "raw_value must return exactly what was set"
++        );
++
++        let serialized = file.to_bstring();
++        let reparsed = gix_config::File::from_bytes_no_includes(
++            &serialized,
++            gix_config::file::Metadata::api(),
++            gix_config::file::init::Options::default(),
++        )
++        .unwrap_or_else(|err| {
++            panic!(
++                "serialization {:?} after set_raw_value must be parseable, but failed with: {err}",
++                serialized.as_bstr()
++            )
++        });
++        assert_eq!(
++            reparsed
++                .raw_value_by(&section, None::<&BStr>, &key)
++                .expect("the value exists after reparsing"),
++            value.as_bstr(),
++            "the set value must survive a serialize/parse cycle (serialized: {:?})",
++            serialized.as_bstr()
++        );
++    }
++}
+diff --git a/gix-config/tests/config/file/write.rs b/gix-config/tests/config/file/write.rs
+index 223ce1089..3a83467aa 100644
+--- a/gix-config/tests/config/file/write.rs
++++ b/gix-config/tests/config/file/write.rs
+@@ -195,3 +195,211 @@ mod to_filter {
+         Ok(())
+     }
+ }
++
++/// Property-based tests (hegel).
++mod properties {
++    use bstr::{BString, ByteSlice};
++    use gix_config::file::{Metadata, init::Options};
++    use hegel::generators::{self, Generator};
++
++    fn parse(input: &[u8]) -> Result<gix_config::File, gix_config::file::init::Error> {
++        gix_config::File::from_bytes_no_includes(input, Metadata::api(), Options::default())
++    }
++
++    /// A quoted subsection name with `"` and `\` escaped as the parser requires.
++    fn escape_subsection(name: &str) -> String {
++        name.replace('\\', r"\\").replace('"', r#"\""#)
++    }
++
++    /// git-config-ish input: mostly well-formed sections/values/comments, plus raw text and bytes.
++    #[hegel::composite]
++    pub(crate) fn config_ish(tc: hegel::TestCase) -> Vec<u8> {
++        match tc.draw(generators::integers::<u8>().max_value(7)) {
++            0 => return tc.draw(generators::binary().max_size(60)),
++            1 => return tc.draw(generators::text().max_size(60)).into_bytes(),
++            _ => {}
++        }
++        let newline = tc.draw(generators::sampled_from(vec!["\n", "\r\n"]));
++        let ws = |tc: &hegel::TestCase| -> String { tc.draw(generators::from_regex(r"[ \t]{0,3}").fullmatch(true)) };
++        let mut out = String::new();
++        let line_count: usize = tc.draw(generators::integers::<usize>().max_value(8));
++        for _ in 0..line_count {
++            match tc.draw(generators::integers::<u8>().max_value(5)) {
++                // comment line
++                0 => {
++                    out.push_str(&ws(&tc));
++                    out.push_str(tc.draw(generators::sampled_from(vec![";", "#"])));
++                    let comment: String = tc.draw(generators::from_regex(r"[^\r\n\x00]{0,10}").fullmatch(true));
++                    out.push_str(&comment);
++                }
++                // blank line
++                1 => out.push_str(&ws(&tc)),
++                // section header
++                2 | 3 => {
++                    out.push_str(&ws(&tc));
++                    out.push('[');
++                    let name: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9-]{1,8}").fullmatch(true));
++                    out.push_str(&name);
++                    match tc.draw(generators::integers::<u8>().max_value(2)) {
++                        0 => {}
++                        1 => {
++                            let sub: String = tc.draw(generators::from_regex(r"[^\r\n\x00]{0,8}").fullmatch(true));
++                            out.push_str(" \"");
++                            out.push_str(&escape_subsection(&sub));
++                            out.push('"');
++                        }
++                        _ => {
++                            let sub: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9.-]{1,8}").fullmatch(true));
++                            out.push('.');
++                            out.push_str(&sub);
++                        }
++                    }
++                    out.push(']');
++                    out.push_str(&ws(&tc));
++                }
++                // key-value line
++                _ => {
++                    out.push_str(&ws(&tc));
++                    let key: String = tc.draw(generators::from_regex(r"[a-zA-Z][a-zA-Z0-9-]{0,6}").fullmatch(true));
++                    out.push_str(&key);
++                    if tc.draw(generators::booleans()) {
++                        out.push_str(&ws(&tc));
++                        out.push('=');
++                        out.push_str(&ws(&tc));
++                        let pieces: usize = tc.draw(generators::integers::<usize>().max_value(3));
++                        for _ in 0..pieces {
++                            let piece: String = tc.draw(hegel::one_of!(
++                                // plain value text
++                                generators::from_regex(r"[a-zA-Z0-9 ._${}<>@()/-]{0,8}").fullmatch(true),
++                                // supported escape sequences
++                                generators::sampled_from(vec![
++                                    r"\n".to_string(),
++                                    r"\t".to_string(),
++                                    r"\b".to_string(),
++                                    r#"\""#.to_string(),
++                                    r"\\".to_string(),
++                                ]),
++                                // quoted stretch
++                                generators::from_regex(r#""[a-zA-Z0-9 ;#\t._-]{0,6}""#).fullmatch(true),
++                            ));
++                            out.push_str(&piece);
++                        }
++                        // line continuation followed by more value content
++                        if tc.draw(generators::booleans()) {
++                            out.push('\\');
++                            out.push_str(newline);
++                            let cont: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9 \t._-]{0,8}").fullmatch(true));
++                            out.push_str(&cont);
++                        }
++                        // trailing comment
++                        if tc.draw(generators::booleans()) {
++                            let comment: String = tc.draw(generators::from_regex(r"[;#][^\r\n\x00]{0,8}").fullmatch(true));
++                            out.push_str(&comment);
++                        }
++                    }
++                }
++            }
++            out.push_str(newline);
++        }
++        out.into_bytes()
++    }
++
++    /// Property: serialization is a fixed point after one parse/serialize cycle.
++    ///
++    /// `File::write_to()` documents that it "reproduce[s] this file mostly losslessly as it was
++    /// parsed" (the "mostly" covers normalizations like inserting a newline after a header, see
++    /// `inserted_newlines_use_each_sections_newline_style`). Therefore serializing a parseable
++    /// file must yield bytes that parse again, and a second serialization must be byte-identical
++    /// to the first — otherwise output would drift on every load/store cycle.
++    #[hegel::test]
++    fn serialization_is_a_fixed_point(tc: hegel::TestCase) {
++        let input = tc.draw(config_ish());
++        let Ok(file) = parse(&input) else { tc.reject() };
++        let first: BString = file.to_bstring();
++        let reparsed = parse(&first).unwrap_or_else(|err| {
++            panic!(
++                "serialization {:?} of a parsed file must be parseable, but failed with: {err}",
++                first.as_bstr()
++            )
++        });
++        let second: BString = reparsed.to_bstring();
++        assert_eq!(
++            second,
++            first,
++            "serialization must be stable after the first parse/serialize cycle (input was {:?})",
++            input.as_bstr()
++        );
++    }
++
++    /// Property: a parse/serialize cycle preserves the semantic content of the file:
++    /// every section (name, subsection) and its values, in order. This is the generalization of
++    /// `complex_lossless_roundtrip` and what the crate's own fuzz target implies by reparsing
++    /// the serialization of a mutated file.
++    #[hegel::test]
++    fn roundtrip_preserves_sections_and_values(tc: hegel::TestCase) {
++        fn snapshot(file: &gix_config::File) -> Vec<(String, Option<BString>, Vec<(String, BString)>)> {
++            file.sections()
++                .map(|section| {
++                    let header = section.header();
++                    (
++                        header.name().to_string(),
++                        header.subsection_name().map(ToOwned::to_owned),
++                        section.body().into_iter().collect(),
++                    )
++                })
++                .collect()
++        }
++
++        let input = tc.draw(config_ish());
++        let Ok(file) = parse(&input) else { tc.reject() };
++        let serialized: BString = file.to_bstring();
++        let reparsed = parse(&serialized).unwrap_or_else(|err| {
++            panic!(
++                "serialization {:?} of a parsed file must be parseable, but failed with: {err}",
++                serialized.as_bstr()
++            )
++        });
++        assert_eq!(
++            snapshot(&reparsed),
++            snapshot(&file),
++            "sections and values must survive a parse/serialize cycle (serialized form was {:?})",
++            serialized.as_bstr()
++        );
++    }
++
++    /// Property: subsection names may contain anything but `\n` and `\0`
++    /// (see `gix_config::parse::section::header::is_valid_subsection`), are escaped on write and
++    /// decoded on parse (see `decoded_subsection_names_keep_their_raw_spelling`), so a value
++    /// stored under an arbitrary valid subsection must be retrievable under the same name after
++    /// a serialize/parse cycle.
++    #[hegel::test]
++    fn subsection_names_roundtrip_through_serialization(tc: hegel::TestCase) {
++        let subsection: String = tc.draw(
++            hegel::one_of!(
++                generators::text().max_size(15),
++                // boost characters with special meaning in headers
++                generators::from_regex(r#"[\\" \t.\[\]]{1,6}"#).fullmatch(true),
++            )
++            .map(|s: String| s.replace(['\n', '\0'], "_")),
++        );
++        let mut file = gix_config::File::new(Metadata::api());
++        file.set_raw_value_by("section", Some(subsection.as_str().into()), "key", "value")
++            .expect("subsection without newline/NUL is valid");
++        let serialized = file.to_bstring();
++        let reparsed = parse(&serialized).unwrap_or_else(|err| {
++            panic!(
++                "serialization {:?} with escaped subsection must be parseable, but failed with: {err}",
++                serialized.as_bstr()
++            )
++        });
++        let value = reparsed
++            .raw_value_by("section", Some(subsection.as_str().into()), "key")
++            .unwrap_or_else(|err| {
++                panic!(
++                    "value must be found under subsection {subsection:?} after roundtrip (serialized: {:?}): {err}",
++                    serialized.as_bstr()
++                )
++            });
++        assert_eq!(value, "value");
++    }
++}
+diff --git a/gix-refspec/Cargo.toml b/gix-refspec/Cargo.toml
+index ee764b8a1..5af0fef8d 100644
+--- a/gix-refspec/Cargo.toml
++++ b/gix-refspec/Cargo.toml
+@@ -35,6 +35,7 @@ smallvec = "1.15.1"
+ gix-testtools = { path = "../tests/tools" }
+ gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
+ insta = "1.46.3"
++hegeltest = "0.28.2"
+ 
+ [package.metadata.docs.rs]
+ features = ["sha1"]
+diff --git a/gix-refspec/tests/refspec/impls.rs b/gix-refspec/tests/refspec/impls.rs
+index 9094f19f7..4fbba6356 100644
+--- a/gix-refspec/tests/refspec/impls.rs
++++ b/gix-refspec/tests/refspec/impls.rs
+@@ -24,3 +24,29 @@ fn eq() {
+     let specs = pair();
+     assert_eq!(&specs[0], &specs[1]);
+ }
++
++/// Property-based tests (hegel).
++mod properties {
++    use bstr::ByteSlice;
++    use gix_refspec::parse::Operation;
++    use hegel::generators;
++
++    /// Property: `RefSpecRef::to_owned()` is documented to produce a "standalone, owned copy",
++    /// so going to the owned representation and back must be the identity, both under the
++    /// instruction-based equality and under serialization.
++    #[hegel::test]
++    fn to_owned_to_ref_is_identity(tc: hegel::TestCase) {
++        let op = tc.draw(generators::sampled_from(vec![Operation::Fetch, Operation::Push]));
++        let input = tc.draw(crate::write::properties::refspec_ish());
++        let Ok(spec) = gix_refspec::parse(input.as_bstr(), op) else {
++            tc.reject()
++        };
++        let owned = spec.to_owned();
++        assert_eq!(owned.to_ref(), spec, "owned copy must compare equal to the original");
++        assert_eq!(
++            owned.to_ref().to_bstring(),
++            spec.to_bstring(),
++            "owned copy must serialize identically"
++        );
++    }
++}
+diff --git a/gix-refspec/tests/refspec/spec.rs b/gix-refspec/tests/refspec/spec.rs
+index 9a8ec1db1..4498cbed5 100644
+--- a/gix-refspec/tests/refspec/spec.rs
++++ b/gix-refspec/tests/refspec/spec.rs
+@@ -171,3 +171,53 @@ mod expand_prefixes {
+         out.into_iter().map(|b| b.to_string()).collect()
+     }
+ }
++
++/// Property-based tests (hegel).
++mod properties {
++    use bstr::ByteSlice;
++    use gix_refspec::parse::Operation;
++    use hegel::generators;
++
++    /// A refspec whose relevant side is likely `refs/`-prefixed, so that `prefix()` is often `Some`.
++    #[hegel::composite]
++    fn prefixy_side(tc: hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::from_regex(r"refs/(heads|tags|namespaces/[a-z]{1,4}/refs/heads)/[a-zA-Z0-9._-]{1,8}")
++                .fullmatch(true),
++            generators::from_regex(r"refs/[a-zA-Z0-9._-]{1,8}/(\*|[a-zA-Z0-9._-]{0,4}\*?)").fullmatch(true),
++            generators::just("HEAD".to_string()),
++            generators::from_regex(r"[a-zA-Z0-9._-]{1,8}").fullmatch(true),
++        ))
++    }
++
++    /// Property: `prefix()` is documented to return the source (fetch) / destination (push) side
++    /// unchanged for exact `refs/`-prefixed refs, or "the portion up to their single `*`" for
++    /// simple glob refspecs — so whatever it returns must be a prefix of that side.
++    #[hegel::test]
++    fn prefix_is_a_prefix_of_the_relevant_side(tc: hegel::TestCase) {
++        let op = tc.draw(generators::sampled_from(vec![Operation::Fetch, Operation::Push]));
++        let input = {
++            let mut spec = String::new();
++            spec.push_str(tc.draw(generators::sampled_from(vec!["", "+"])));
++            spec.push_str(&tc.draw(prefixy_side()));
++            if tc.draw(generators::booleans()) {
++                spec.push(':');
++                spec.push_str(&tc.draw(prefixy_side()));
++            }
++            spec
++        };
++        let Ok(spec) = gix_refspec::parse(input.as_str().into(), op) else {
++            tc.reject()
++        };
++        let Some(prefix) = spec.prefix() else { tc.reject() };
++        let side = match op {
++            Operation::Fetch => spec.source(),
++            Operation::Push => spec.destination(),
++        }
++        .expect("a spec with a prefix has the corresponding side");
++        assert!(
++            side.starts_with(prefix.as_bytes()),
++            "prefix {prefix:?} must be a prefix of {side:?}"
++        );
++    }
++}
+diff --git a/gix-refspec/tests/refspec/write.rs b/gix-refspec/tests/refspec/write.rs
+index 57c61bcba..8846fe22b 100644
+--- a/gix-refspec/tests/refspec/write.rs
++++ b/gix-refspec/tests/refspec/write.rs
+@@ -96,3 +96,90 @@ mod fetch {
+         );
+     }
+ }
++
++/// Property-based tests (hegel).
++pub(crate) mod properties {
++    use bstr::ByteSlice;
++    use gix_refspec::parse::Operation;
++    use hegel::generators;
++
++    /// Refspec-ish input: arbitrary text plus structured `[+^]src[:dst]` shapes built from
++    /// refname-like fragments, globs, object hashes and `HEAD`.
++    #[hegel::composite]
++    pub(crate) fn refspec_ish(tc: hegel::TestCase) -> Vec<u8> {
++        let side = |tc: &hegel::TestCase| -> String {
++            tc.draw(hegel::one_of!(
++                generators::from_regex(r"(refs/(heads|tags|remotes)/)?[a-zA-Z0-9*._@{}/-]{0,15}").fullmatch(true),
++                generators::just("HEAD".to_string()),
++                generators::from_regex(r"[0-9a-f]{40}").fullmatch(true),
++            ))
++        };
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => tc.draw(generators::text().max_size(30)).into_bytes(),
++            1 => {
++                let mut out = String::new();
++                out.push_str(tc.draw(generators::sampled_from(vec!["", "+", "^"])));
++                out.push_str(&side(&tc));
++                if tc.draw(generators::booleans()) {
++                    out.push(':');
++                    out.push_str(&side(&tc));
++                }
++                out.into_bytes()
++            }
++            _ => tc.draw(generators::binary().max_size(30)),
++        }
++    }
++
++    /// Property: `RefSpecRef::to_bstring()` is documented to "reproduce ourselves in parseable form",
++    /// so serializing any successfully parsed refspec must parse again under the same operation and
++    /// yield the same instruction.
++    #[hegel::test]
++    fn parsed_specs_reproduce_in_parseable_form(tc: hegel::TestCase) {
++        let op = tc.draw(generators::sampled_from(vec![Operation::Fetch, Operation::Push]));
++        let input = tc.draw(refspec_ish());
++        let Ok(spec) = gix_refspec::parse(input.as_bstr(), op) else {
++            tc.reject()
++        };
++        // KNOWN BUG exclusion: one-sided push specs skip source validation when they contain globs,
++        // but serialize via `Push::Matching` to `src:src` which is validated strictly on reparse.
++        // See `one_sided_push_glob_specs_reproduce_in_parseable_form` for the canonical failing test.
++        tc.assume(
++            !(op == Operation::Push
++                && spec.destination().is_none()
++                && spec.source().is_some_and(|src| src.contains(&b'*'))),
++        );
++        let serialized = spec.to_bstring();
++        let reparsed = gix_refspec::parse(serialized.as_bstr(), op).unwrap_or_else(|err| {
++            panic!("serialization {serialized:?} of a parsed refspec must be parseable, but failed with: {err}")
++        });
++        assert_eq!(
++            reparsed.instruction(),
++            spec.instruction(),
++            "reparsing the serialization {serialized:?} must reproduce the same instruction"
++        );
++    }
++
++    /// KNOWN FAILURE: pins a real bug — one-sided push specs with complex globs (or other content
++    /// that only passes the relaxed one-sided validation) serialize to an unparseable form.
++    ///
++    /// `parse("a*b*", Push)` succeeds because `validated()` in src/parse.rs skips all validation
++    /// for one-sided specs containing globs ("we allow complex glob patterns in one-sided refspecs").
++    /// Its instruction is `Push::Matching { src: "a*b*", dst: "a*b*" }`, so `to_bstring()` yields
++    /// `"a*b*:a*b*"` — which fails to reparse with `PatternUnsupported` since two-sided specs allow
++    /// at most one `*` per side. This violates the documented contract of `to_bstring()`:
++    /// "Reproduce ourselves in parseable form". The same happens for invalid ref-name bytes next to
++    /// a glob, e.g. `parse("\x01*", Push)` serializes to `"\x01*:\x01*"` (`InvalidByte` on reparse).
++    #[hegel::test]
++    fn one_sided_push_glob_specs_reproduce_in_parseable_form(tc: hegel::TestCase) {
++        let a: String = tc.draw(generators::from_regex(r"[a-z]{0,4}").fullmatch(true));
++        let b: String = tc.draw(generators::from_regex(r"[a-z]{0,4}").fullmatch(true));
++        let input = format!("{a}*{b}*");
++        let spec = gix_refspec::parse(input.as_str().into(), Operation::Push)
++            .expect("one-sided push specs accept complex globs");
++        let serialized = spec.to_bstring();
++        let reparsed = gix_refspec::parse(serialized.as_bstr(), Operation::Push).unwrap_or_else(|err| {
++            panic!("serialization {serialized:?} of a parsed refspec must be parseable, but failed with: {err}")
++        });
++        assert_eq!(reparsed.instruction(), spec.instruction());
++    }
++}
+diff --git a/gix-url/Cargo.toml b/gix-url/Cargo.toml
+index fcd26e2d9..0d5c9e202 100644
+--- a/gix-url/Cargo.toml
++++ b/gix-url/Cargo.toml
+@@ -32,6 +32,7 @@ document-features = { version = "0.2.0", optional = true }
+ [dev-dependencies]
+ assert_matches = "1.5.0"
+ gix-testtools = { path = "../tests/tools" }
++hegeltest = "0.28.2"
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+diff --git a/gix-url/tests/url/parse/mod.rs b/gix-url/tests/url/parse/mod.rs
+index cd377428c..58eeee383 100644
+--- a/gix-url/tests/url/parse/mod.rs
++++ b/gix-url/tests/url/parse/mod.rs
+@@ -163,3 +163,219 @@ mod unknown {
+         )
+     }
+ }
++
++/// Property-based tests (hegel).
++///
++/// The generalized version of the `assert_url_roundtrip()` checks above: instead of a fixed list
++/// of example URLs, generate both arbitrary bytes and structured URL-ish inputs.
++mod properties {
++    use bstr::{BString, ByteSlice};
++    use gix_url::Scheme;
++    use hegel::generators::{self, Generator};
++
++    /// A host that stays within what the serializer writes verbatim (it does not percent-encode hosts).
++    #[hegel::composite]
++    fn host_ish(tc: hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::from_regex(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,20}").fullmatch(true),
++            generators::just("127.0.0.1".to_string()),
++            generators::just("::1".to_string()),
++            generators::just("2606:50c0:8000::153".to_string()),
++        ))
++    }
++
++    /// URL-ish input: arbitrary bytes, canonical `scheme://` URLs, SCP-like targets, and local paths.
++    #[hegel::composite]
++    fn url_ish(tc: hegel::TestCase) -> Vec<u8> {
++        let structured = |tc: &hegel::TestCase| -> Vec<u8> {
++            let mut out: Vec<u8> = Vec::new();
++            let scheme: String = tc.draw(generators::sampled_from(vec![
++                "ssh".into(),
++                "git".into(),
++                "http".into(),
++                "https".into(),
++                "file".into(),
++                "abc".into(),
++            ]));
++            out.extend_from_slice(scheme.as_bytes());
++            out.extend_from_slice(b"://");
++            if tc.draw(generators::booleans()) {
++                // Deliberately includes valid and invalid percent-escapes to exercise decode/re-encode.
++                let user: String =
++                    tc.draw(generators::from_regex(r"([a-zA-Z0-9._+-]|%[0-9a-fA-F]{2}|%){0,6}").fullmatch(true));
++                out.extend_from_slice(user.as_bytes());
++                if tc.draw(generators::booleans()) {
++                    let pass: String =
++                        tc.draw(generators::from_regex(r"([a-zA-Z0-9._+-]|%[0-9a-fA-F]{2}|%){0,6}").fullmatch(true));
++                    out.push(b':');
++                    out.extend_from_slice(pass.as_bytes());
++                }
++                out.push(b'@');
++            }
++            let host = tc.draw(host_ish());
++            if host.contains(':') {
++                out.push(b'[');
++                out.extend_from_slice(host.as_bytes());
++                out.push(b']');
++            } else {
++                out.extend_from_slice(host.as_bytes());
++            }
++            if tc.draw(generators::booleans()) {
++                let port: u16 = tc.draw(generators::integers::<u16>());
++                out.extend_from_slice(format!(":{port}").as_bytes());
++            }
++            let path: String = tc.draw(generators::from_regex(r"(/[a-zA-Z0-9~._-]{0,8}){0,4}").fullmatch(true));
++            out.extend_from_slice(path.as_bytes());
++            out
++        };
++        let scp_like = |tc: &hegel::TestCase| -> Vec<u8> {
++            let mut out: Vec<u8> = Vec::new();
++            if tc.draw(generators::booleans()) {
++                let user: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9._-]{1,10}").fullmatch(true));
++                out.extend_from_slice(user.as_bytes());
++                out.push(b'@');
++            }
++            let host = tc.draw(host_ish());
++            if host.contains(':') {
++                out.push(b'[');
++                out.extend_from_slice(host.as_bytes());
++                out.push(b']');
++            } else {
++                out.extend_from_slice(host.as_bytes());
++            }
++            out.push(b':');
++            let path: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9~/._-]{0,20}").fullmatch(true));
++            out.extend_from_slice(path.as_bytes());
++            out
++        };
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => tc.draw(generators::binary().max_size(100)),
++            1 => structured(&tc),
++            2 => scp_like(&tc),
++            _ => tc.draw(generators::text().max_size(50)).into_bytes(),
++        }
++    }
++
++    /// Property: `Url::to_bstring()` is documented to serialize "losslessly, ready to be parsed again"
++    /// (see `Url::write_to()`), so any successfully parsed URL must reparse from its own serialization
++    /// to an equal `Url`. This is `assert_url_roundtrip()` generalized over generated inputs.
++    #[hegel::test]
++    fn parsed_urls_roundtrip_through_to_bstring(tc: hegel::TestCase) {
++        let input = tc.draw(url_ish());
++        let Ok(url) = gix_url::parse(input.as_bstr()) else {
++            tc.reject()
++        };
++        // KNOWN BUG exclusion: users with `:` (e.g. parsed from `%3A`) do not serialize losslessly,
++        // see `users_with_colons_roundtrip_through_to_bstring` for the canonical failing test.
++        tc.assume(!url.user().is_some_and(|user| user.contains(':')));
++        let serialized: BString = url.to_bstring();
++        let reparsed = gix_url::parse(serialized.as_bstr()).unwrap_or_else(|err| {
++            panic!("serialization {serialized:?} of a parsed URL must be parseable, but failed with: {err}")
++        });
++        assert_eq!(
++            reparsed, url,
++            "reparsing the serialization {serialized:?} must reproduce the original URL"
++        );
++    }
++
++    /// Property: the field docs on `Url` state that `user`, `password` and `path` are stored in decoded
++    /// form and re-encoded during canonical serialization, and `Url::from_parts()` validates by
++    /// parsing the serialized form back. Therefore constructing a URL from valid parts must preserve
++    /// each component (modulo the documented `/~` path normalization for ssh/git).
++    #[hegel::test]
++    fn from_parts_preserves_components(tc: hegel::TestCase) {
++        let scheme: Scheme = tc.draw(generators::sampled_from(vec![
++            Scheme::Http,
++            Scheme::Https,
++            Scheme::Ssh,
++            Scheme::Git,
++        ]));
++        // Documented storage form: "IPv6 addresses are stored *without* brackets for SSH schemes,
++        // but *with* brackets for other schemes." Supply the documented form as input.
++        let host: String = {
++            let host = tc.draw(host_ish());
++            if host.contains(':') && !matches!(scheme, Scheme::Ssh) {
++                format!("[{host}]")
++            } else {
++                host
++            }
++        };
++        // An empty user (`Some("")`) serializes as `@host` which parses back as "no user" —
++        // a degenerate value outside the intent of "the user to impersonate on the remote".
++        // KNOWN BUG exclusion: users containing `:` are serialized without percent-encoding the
++        // colon and thus reparse as user + password, see `users_with_colons_roundtrip_through_to_bstring`.
++        let user: Option<String> = tc.draw(generators::optional(
++            generators::text()
++                .min_size(1)
++                .max_size(10)
++                .map(|s: String| s.replace(':', "_")),
++        ));
++        // Like an empty user, an empty password (`user:@host`) parses back as "no password".
++        let password: Option<String> = if user.is_some() {
++            tc.draw(generators::optional(generators::text().min_size(1).max_size(10)))
++        } else {
++            None
++        };
++        // Port 0 is explicitly outside the domain: "invalid port number - must be between 1-65535"
++        // (see `invalid::port_zero_is_invalid`).
++        let port: Option<u16> = tc.draw(generators::optional(generators::integers::<u16>().min_value(1)));
++        let path: String = {
++            let tail: String = tc.draw(generators::from_regex(r"[a-zA-Z0-9~/._-]{0,20}").fullmatch(true));
++            format!("/{tail}")
++        };
++
++        let url = gix_url::Url::from_parts(
++            scheme.clone(),
++            user.clone(),
++            password.clone(),
++            Some(host.clone()),
++            port,
++            path.clone().into(),
++            false,
++        )
++        .unwrap_or_else(|err| panic!("valid parts must produce a valid URL, but failed with: {err}"));
++
++        let expected_path: BString = if matches!(scheme, Scheme::Ssh | Scheme::Git) && path.starts_with("/~") {
++            // Documented normalization: ssh/git strip the leading `/` of `/~` paths.
++            path[1..].into()
++        } else {
++            path.clone().into()
++        };
++        assert_eq!(url.scheme, scheme, "scheme must be preserved");
++        assert_eq!(url.user(), user.as_deref(), "user must be preserved");
++        assert_eq!(url.password(), password.as_deref(), "password must be preserved");
++        // Hosts are case-insensitive and normalized to lowercase during parsing.
++        assert_eq!(
++            url.host(),
++            Some(host.to_ascii_lowercase().as_str()),
++            "host must be preserved (modulo lowercase normalization)"
++        );
++        assert_eq!(url.port, port, "port must be preserved");
++        assert_eq!(url.path, expected_path, "path must be preserved");
++    }
++
++    /// KNOWN FAILURE: pins a real bug — `Url::to_bstring()` is not lossless for users containing `:`.
++    ///
++    /// `parse("http://a%3Ab@host/")` percent-decodes the user to `a:b` (as documented on `Url::user`),
++    /// but `USERINFO_ENCODE_SET` in `write_canonical_form_to()` (src/lib.rs) does not include `:`,
++    /// so `to_bstring()` yields `http://a:b@host/` which reparses as user `a` with password `b`.
++    /// This violates the documented contract of `write_to()`: "Write this URL losslessly to `out`,
++    /// ready to be parsed again". A colon inside the user component must be percent-encoded because
++    /// the first unencoded `:` in userinfo delimits user from password.
++    #[hegel::test]
++    fn users_with_colons_roundtrip_through_to_bstring(tc: hegel::TestCase) {
++        let head: String = tc.draw(generators::from_regex(r"[a-z]{0,4}").fullmatch(true));
++        let tail: String = tc.draw(generators::from_regex(r"[a-z]{0,4}").fullmatch(true));
++        let input = format!("http://{head}%3A{tail}@host/");
++        let url = gix_url::parse(input.as_str()).expect("a percent-encoded user is a valid URL");
++        assert_eq!(url.user(), Some(format!("{head}:{tail}").as_str()), "documented decoding");
++        let serialized = url.to_bstring();
++        let reparsed = gix_url::parse(&serialized).unwrap_or_else(|err| {
++            panic!("serialization {serialized:?} of a parsed URL must be parseable, but failed with: {err}")
++        });
++        assert_eq!(
++            reparsed, url,
++            "user with colon must survive the documented lossless roundtrip, serialized form was {serialized:?}"
++        );
++    }
++}

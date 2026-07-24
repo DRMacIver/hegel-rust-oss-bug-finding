@@ -1,0 +1,480 @@
+diff --git a/.gitignore b/.gitignore
+index 617e324..9fc3c21 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,6 @@
+ target
+ 
+ .vscode
++
++# hegel property-test failure database
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index a955891..67f4f71 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -110,6 +110,7 @@ pulldown-cmark = "0.13.4"
+ 
+ gluon_completion = { path = "completion", version = "0.18.3" } # GLUON
+ gluon_codegen = { path = "codegen", version = "0.18.3" }       # GLUON
++hegeltest = "0.28.2"
+ 
+ [workspace.dependencies]
+ env_logger = "0.11"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..2fff104
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,163 @@
++# Hegel property-based testing report — gluon
++
++Property-based tests added with **hegel** (`hegeltest` crate) to the `gluon`
++crate. All tests live in `tests/stack_overflow.rs`, module `hegel_tests`
++(the existing robustness-focused test file — no new parallel test file was
++created, per the skill).
++
++Build/run: the crate only compiles its test targets with the `gluon_completion`
++feature enabled (a pre-existing `tests/vm.rs` completion test needs it), so tests
++run with:
++
++```
++cargo test --test stack_overflow --features gluon_completion hegel_tests
++```
++
++`.hegel/` was added to `.gitignore`.
++
++---
++
++## 1. Properties tested (+ evidence)
++
++Nine passing properties, one deterministically-pinned failing regression per real
++bug (two), and one `#[ignore]`d process-abort reproducer.
++
++| # | Property | Kind | Evidence |
++|---|----------|------|----------|
++| 1 | `parse_token_soup_never_panics` — parser returns Ok/Err (never panics) on source built from a vocabulary of gluon tokens (keywords, operators, punctuation, literals) | robustness / no-panic | Task's "compile/typecheck never panics on gluon-shaped token soup"; `parser::parse_expr` returns `Result` |
++| 2 | `parse_arbitrary_text_never_panics` — parser never panics on arbitrary `String`; tolerates *only* the two known pinned panics (asserts any other panic is a new bug) | robustness / no-panic | Parse-robustness catalogue pattern; this net *found both real bugs below* |
++| 3 | `parse_deep_parens_never_aborts` — parser survives nested `((((0))))` sweeping depth to 20 000 without aborting | recursion-depth robustness | Skill "probe recursion depth directly"; the highest-value class for interpreters/parsers |
++| 4 | `int_arithmetic_matches_checked_i64_oracle` — `#Int+ - * /` vs a Rust `i64` `checked_*` oracle (overflow / div-0 / `MIN`/`-1` → error) | differential oracle + boundary | `vm/src/thread.rs:2458` uses `VmInt::checked_{add,sub,mul,div}`; `binop_int` maps `None` → `Error::Message("Arithmetic overflow")` |
++| 5 | `evaluation_is_deterministic` — same source evaluated twice yields the same result | invariant | interpreter determinism |
++| 6 | `int_literal_roundtrips_through_eval` — `eval(n.to_string()) == n` for all `i64` incl. `MIN`/`MAX` | roundtrip + boundary | lexer `numeric_literal` (`parser/src/token.rs`); `VmInt = i64` |
++| 7 | `float_literal_roundtrips_through_eval` — `eval("{f:?}") == f` for finite `f64` in a no-exponent magnitude range | roundtrip | lexer float literal parses via Rust `str::parse::<f64>()`; gluon has **no exponent literal syntax** (verified: `1e30` fails to lex) |
++| 8 | `record_field_roundtrips_through_eval` — `{ a=.., b=.., c=.. }.field` returns the stored field | roundtrip / structural | task's "record field roundtrip"; verified `r.a` projection |
++| 9 | `string_literal_roundtrips_through_eval` — a string of safe (non-escape) codepoints round-trips through a gluon string literal | roundtrip | lexer `string_literal`; string eval verified |
++| P1 | `parse_invalid_string_escape_is_err` (**pinned failing**) — invalid escape must yield `Err`, not panic | no-panic contract | see bug 1 |
++| P2 | `parse_non_ascii_char_is_err` (**pinned failing**) — stray non-ASCII char must yield `Err`, not panic | no-panic contract | see bug 2 |
++| I1 | `typecheck_deep_nesting_stack_overflows` (**`#[ignore]`d**) — typecheck of deeply nested source aborts the process | recursion-depth abort | see bug 3 |
++
++**Liveness verified.** Every eval-based property (4–9) was mutation-checked: the
++core assertion was inverted and each test failed (counterexamples showed the
++assertion body executing, including for the guarded float/string properties, so
++none pass vacuously). The three no-panic parse properties funnel through the same
++`try_parse` helper that empirically panicked on the real bugs, and property 2
++caught both real panics before its known-bug tolerance was added.
++
++**Exploratory 10x run.** All nine passing properties were run at
++`test_cases = 1000` (single-threaded); all remained green with no new
++counterexamples, then reverted to the default count for commit.
++
++---
++
++## 2. Test results
++
++Default committed state (`--test-threads=1`):
++
++```
++9 passed; 2 failed; 1 ignored
++```
++
++The 2 failures are the deterministically-pinned real bugs (P1, P2); the 1 ignored
++test is the process-aborting stack overflow (I1). All other properties pass.
++
++---
++
++## 3. Suspected bugs
++
++### Bug 1 — Parser panics on invalid string escape (oracle-independent)
++
++- **Symptom:** parsing a string literal with an unrecognised escape (e.g. `"\q"`)
++  panics instead of returning a parse error.
++- **Panic:** `parser/src/token.rs:223` — `panic!("Invalid escape")` in
++  `unescape_string_literal`.
++- **Code path:** the lexer's `escape_code` (token.rs:519) *recovers* an unexpected
++  escape gracefully (`UnexpectedEscapeCode`), but the string token is stored as
++  `StringLiteral::Escaped(raw_slice)` and later re-scanned by
++  `unescape_string_literal`, whose `match` has a hard `_ => panic!("Invalid
++  escape")` arm. The two escape tables are inconsistent.
++- **Repro:** `parse_invalid_string_escape_is_err` (`try_parse(r#" "\q" "#)`).
++- **Severity:** a parser handling untrusted source must return `Err`, never panic.
++
++### Bug 2 — Parser panics on any non-ASCII character in an unexpected position (oracle-independent)
++
++- **Symptom:** any codepoint ≥ U+0080 in a position the grammar doesn't expect
++  (e.g. a bare `é`, `€`, or `"\u{80}"` as a whole expression) panics instead of
++  producing a parse error. ASCII controls such as `\u{7f}` (DEL) are handled
++  gracefully (return `Err`); the panic is specific to multi-byte UTF-8.
++- **Panic:** `parser/src/str_suffix.rs:83` —
++  `str::from_utf8(&buf).expect("UTF-8 string")` in `restore_char`
++  (`Utf8Error { valid_up_to: 0, error_len: Some(1) }`).
++- **Code path:** the "unexpected character" recovery arm of the tokenizer
++  (`token.rs:838`) calls `self.chars.chars.as_str_suffix().restore_char(&[ch])`
++  with a single lead byte; `restore_char` reassembles a 4-byte buffer and unwraps
++  `from_utf8`, which fails for the reconstructed lead byte and panics.
++- **Repro:** `parse_non_ascii_char_is_err` (`try_parse("é")`).
++- **Severity:** high — *any* source file containing a stray non-ASCII byte outside
++  a string/identifier crashes the front-end. Found by the arbitrary-text property.
++
++### Bug 3 — Typechecker/compiler stack overflow on deeply nested source (process abort)
++
++- **Symptom:** the parser alone handles nesting to depth 50 000 fine, but
++  `typecheck_str` (and thus `run_expr`) recurses per syntactic level and
++  **overflows the stack (SIGABRT)** at depth ≈ 1000. Reproduces with nested
++  parens `((((0))))`, operator chains `0 #Int+ 1 #Int+ …`, nested lambdas
++  `\x -> \x -> … 0`, and nested `let … in`.
++- **Code path:** post-parse tree walks (macro expansion / typecheck / compile) are
++  unbounded recursion over AST depth; there is no depth guard on untrusted source.
++- **Repro:** `#[ignore]`d `typecheck_deep_nesting_stack_overflows` (depth 5000).
++  Confirmed to abort with `signal: 6, SIGABRT` when run with `--ignored`.
++- **Why ignored:** the abort is not a catchable panic — an un-ignored failing test
++  would take the whole test binary down with it. Kept as a documented, ignored
++  reproducer per the skill's process-abort guidance. This is the classic
++  high-value untrusted-source stack-overflow class.
++- **Note:** gluon already has `dont_stack_overflow_on_let_bindings` (this file)
++  exercising ~360 shallow let bindings, showing the maintainers care about this
++  class — but the limit is not enforced at typecheck depth.
++
++---
++
++## 4. Unsound properties abandoned / adjusted
++
++- **Float roundtrip via `{:?}` with exponents.** An initial float roundtrip using
++  Rust's shortest-form `{:?}` fails for large/small magnitudes because gluon has
++  **no exponent literal syntax** (`1e30`, `1.23e30` fail to lex). This is an
++  unsupported-syntax input, not a value-corruption bug, so the property bounds the
++  magnitude to `[-1e15, 1e15]` and `tc.assume`s the formatted string contains no
++  `e`/`E` — keeping the roundtrip sound and exact (same `f64` parser on both ends).
++- **No property was abandoned outright.** The two escape/non-ASCII panics are kept
++  as pinned real bugs rather than being treated as generator over-breadth — a
++  parser must not panic on any input.
++- The broad `parse_arbitrary_text_never_panics` net does **not** suppress the two
++  known panics silently; it asserts a caught panic is one of the two known
++  messages and fails on anything else, so it keeps hunting for a third panic while
++  the two known ones are pinned by dedicated canonical tests.
++
++---
++
++## 5. Skill feedback
++
++- **The recursion-depth guidance paid off immediately.** Sweeping nesting depth
++  upward (rather than hoping a recursive generator wanders deep) found the
++  process-aborting typecheck stack overflow directly, and separately established
++  that the *parser* is robust to depth 50 000 — a useful "parser OK, later stage
++  not" split the skill's advice made easy to surface.
++- **The "arbitrary text no-panic" net over-delivered.** The plain
++  `generators::text()` property found bug 2 (non-ASCII panic) with a 1-character
++  counterexample — a reminder that the cheapest, broadest property is often the
++  most productive on parsers. Worth emphasising even more strongly that the
++  fully-arbitrary-text net should be written *first*, before fancier token-soup
++  generators.
++- **The known-bug tolerance pattern worked well** ("assert the caught panic is a
++  known one, else fail") to keep a broad no-panic net green and still hunting after
++  pinning specific bugs — matches the skill's "exclude known-buggy input from
++  sibling properties" advice; a short worked example of the *catch_unwind +
++  message match* form in the Rust reference would help.
++- **`catch_unwind` ergonomics:** the Rust reference could note that silencing the
++  panic hook around `catch_unwind` (and restoring it) avoids flooding stderr when a
++  no-panic property is expected to catch known panics frequently.
++- **Feature-flag build gotcha:** the workspace's default test build failed to
++  compile `tests/vm.rs` until `--features gluon_completion` was added. The skill's
++  "build the code under test" advice is fine, but a line about *reading CI scripts
++  to discover the required feature set* before assuming a build blocker would save
++  time (here `scripts/ci.sh` used `--all-features`).
+diff --git a/tests/stack_overflow.rs b/tests/stack_overflow.rs
+index 05d4a9e..73a614a 100644
+--- a/tests/stack_overflow.rs
++++ b/tests/stack_overflow.rs
+@@ -732,3 +732,283 @@ in 1
+     let vm = new_vm();
+     vm.load_script("", text).unwrap();
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel) for front-end robustness and evaluation.
++//
++// Themes:
++//   * parse / typecheck / run never *panic* on arbitrary source (they return Err)
++//   * the parser survives deeply-nested source without aborting the process
++//   * Int arithmetic matches a Rust i64 checked-arithmetic oracle
++//   * evaluation is deterministic
++//   * primitive / record / string literals round-trip through evaluation
++//
++// See HEGEL_REPORT.md for the two bugs these surfaced.
++// ---------------------------------------------------------------------------
++#[cfg(test)]
++mod hegel_tests {
++    use gluon::base::types::TypeCache;
++    use gluon::{ThreadExt, new_vm};
++    use hegel::generators;
++    use std::panic::{self, AssertUnwindSafe};
++
++    /// Parse only (no typecheck / compile). Returns Ok/Err; may *panic* on the
++    /// known invalid-escape bug (see `parse_invalid_string_escape_is_err`).
++    fn try_parse(src: &str) -> Result<(), String> {
++        let vm = new_vm();
++        vm.get_database_mut().implicit_prelude(false);
++        match vm.parse_expr(&TypeCache::default(), "prop", src) {
++            Ok(_) => Ok(()),
++            Err(e) => Err(e.to_string()),
++        }
++    }
++
++    fn eval_int(src: &str) -> Result<i64, String> {
++        let vm = new_vm();
++        vm.get_database_mut().implicit_prelude(false);
++        let r: Result<(i64, _), _> = vm.run_expr("prop", src);
++        r.map(|x| x.0).map_err(|e| e.to_string())
++    }
++
++    fn eval_f64(src: &str) -> Result<f64, String> {
++        let vm = new_vm();
++        vm.get_database_mut().implicit_prelude(false);
++        let r: Result<(f64, _), _> = vm.run_expr("prop", src);
++        r.map(|x| x.0).map_err(|e| e.to_string())
++    }
++
++    fn eval_string(src: &str) -> Result<String, String> {
++        let vm = new_vm();
++        vm.get_database_mut().implicit_prelude(false);
++        let r: Result<(String, _), _> = vm.run_expr("prop", src);
++        r.map(|x| x.0).map_err(|e| e.to_string())
++    }
++
++    // A vocabulary of gluon-shaped tokens for building "token soup" that stresses
++    // the parser/typechecker structurally far more than uniform-random text.
++    const TOKENS: &[&str] = &[
++        "let", "in", "type", "if", "then", "else", "match", "with", "do", "rec",
++        "\\", "->", "=", "=>", "|", ".", ",", ":", "@", "?",
++        "(", ")", "{", "}", "[", "]",
++        "x", "y", "f", "foo", "Bar", "True", "False",
++        "1", "0", "-1", "42", "1.5", "\"s\"",
++        "#Int+", "#Int-", "#Int*", "#Int/", "+", "*", "&&", "||", "==",
++        " ", "\n",
++    ];
++
++    // Property 1: the parser must never panic on gluon-shaped token soup — only
++    // return Ok or Err. Highest structural coverage of the grammar.
++    #[hegel::test]
++    fn parse_token_soup_never_panics(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(60));
++        let mut src = String::new();
++        for _ in 0..n {
++            let tok = tc.draw(generators::sampled_from(TOKENS.to_vec()));
++            src.push_str(tok);
++        }
++        // Must return without panicking.
++        let _ = try_parse(&src);
++    }
++
++    // Property 2: the parser must never panic on *arbitrary* text either. This is
++    // the true robustness net. It tolerates exactly one known panic — the invalid
++    // string-escape bug pinned by `parse_invalid_string_escape_is_err` — and fails
++    // on any other panic.
++    #[hegel::test]
++    fn parse_arbitrary_text_never_panics(tc: hegel::TestCase) {
++        let src = tc.draw(generators::text().max_size(200));
++        let prev = panic::take_hook();
++        panic::set_hook(Box::new(|_| {})); // silence expected known-bug panics
++        let result = panic::catch_unwind(AssertUnwindSafe(|| try_parse(&src)));
++        panic::set_hook(prev);
++        if let Err(payload) = result {
++            let msg = payload
++                .downcast_ref::<&str>()
++                .map(|s| s.to_string())
++                .or_else(|| payload.downcast_ref::<String>().cloned())
++                .unwrap_or_default();
++            // TWO KNOWN BUGS are tolerated here (each pinned by its own canonical
++            // failing test); any *other* panic is a new bug and fails this test:
++            //   1. "Invalid escape" — invalid string escapes panic in the lexer's
++            //      `unescape_string_literal` (parser/src/token.rs). Pinned by
++            //      `parse_invalid_string_escape_is_err`.
++            //   2. "UTF-8 string" — a non-ASCII char in an unexpected position
++            //      panics in `restore_char` (parser/src/str_suffix.rs). Pinned by
++            //      `parse_non_ascii_char_is_err`.
++            let known = msg.contains("Invalid escape") || msg.contains("UTF-8 string");
++            assert!(known, "parser panicked on {src:?}: {msg}");
++        }
++    }
++
++    // Property 3: the parser survives deeply-nested parentheses without aborting
++    // the process (it returns Ok/Err). The typechecker does NOT — see the
++    // `#[ignore]`d reproducer `typecheck_deep_nesting_stack_overflows` below.
++    #[hegel::test]
++    fn parse_deep_parens_never_aborts(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(20_000));
++        let src = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
++        // Should return a result, never abort/panic.
++        let _ = try_parse(&src);
++    }
++
++    // Property 4: Int `+ - * /` match a Rust i64 checked-arithmetic oracle. gluon
++    // uses checked_{add,sub,mul,div}; overflow and division-by-zero (including
++    // MIN / -1) surface as an "Arithmetic overflow" error rather than Ok.
++    #[hegel::test]
++    fn int_arithmetic_matches_checked_i64_oracle(tc: hegel::TestCase) {
++        let a = tc.draw(generators::integers::<i64>());
++        let b = tc.draw(generators::integers::<i64>());
++        let op = tc.draw(generators::sampled_from(vec!['+', '-', '*', '/']));
++        let expected = match op {
++            '+' => a.checked_add(b),
++            '-' => a.checked_sub(b),
++            '*' => a.checked_mul(b),
++            '/' => a.checked_div(b),
++            _ => unreachable!(),
++        };
++        let src = format!("{a} #Int{op} {b}");
++        let got = eval_int(&src);
++        match expected {
++            Some(v) => assert_eq!(got, Ok(v), "expr `{src}`"),
++            None => assert!(got.is_err(), "expr `{src}` expected overflow error, got {got:?}"),
++        }
++    }
++
++    // Property 5: evaluation is deterministic — the same source evaluated twice
++    // yields the same result.
++    #[hegel::test]
++    fn evaluation_is_deterministic(tc: hegel::TestCase) {
++        // Build a small chain of Int operations that always typechecks.
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        let mut src = tc.draw(generators::integers::<i32>()).to_string();
++        for _ in 0..n {
++            let op = tc.draw(generators::sampled_from(vec!['+', '-', '*']));
++            let v = tc.draw(generators::integers::<i32>());
++            src = format!("({src}) #Int{op} {v}");
++        }
++        let first = eval_int(&src);
++        let second = eval_int(&src);
++        assert_eq!(first, second, "non-deterministic eval of `{src}`");
++    }
++
++    // Property 6: Int literal round-trip — `parse(show(n)) == n` through the full
++    // evaluator, including i64::MIN and MAX.
++    #[hegel::test]
++    fn int_literal_roundtrips_through_eval(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i64>());
++        let src = n.to_string();
++        assert_eq!(eval_int(&src), Ok(n), "int literal `{src}`");
++    }
++
++    // Property 7: Float literal round-trip. gluon has no exponent syntax, so we
++    // stay in a magnitude range where Rust's shortest-round-trip `{:?}` never
++    // emits an exponent; parsing then goes through the same f64 parser, exactly.
++    #[hegel::test]
++    fn float_literal_roundtrips_through_eval(tc: hegel::TestCase) {
++        let f = tc.draw(
++            generators::floats::<f64>()
++                .min_value(-1.0e15)
++                .max_value(1.0e15)
++                .allow_nan(false)
++                .allow_infinity(false),
++        );
++        let src = format!("{f:?}");
++        // Skip the rare case where the shortest form still uses exponent notation
++        // (gluon's lexer has no exponent literals — an unsupported-syntax input,
++        // not a round-trip failure).
++        tc.assume(!src.contains('e') && !src.contains('E'));
++        assert_eq!(eval_f64(&src), Ok(f), "float literal `{src}`");
++    }
++
++    // Property 8: record construction + field projection round-trip. Each drawn
++    // field value must come back unchanged when projected.
++    #[hegel::test]
++    fn record_field_roundtrips_through_eval(tc: hegel::TestCase) {
++        let a = tc.draw(generators::integers::<i32>()) as i64;
++        let b = tc.draw(generators::integers::<i32>()) as i64;
++        let c = tc.draw(generators::integers::<i32>()) as i64;
++        let field = tc.draw(generators::sampled_from(vec!["a", "b", "c"]));
++        let src = format!("let r = {{ a = {a}, b = {b}, c = {c} }} in r.{field}");
++        let expected = match field {
++            "a" => a,
++            "b" => b,
++            _ => c,
++        };
++        assert_eq!(eval_int(&src), Ok(expected), "record projection `{src}`");
++    }
++
++    // Property 9: String literal round-trip. A string built from "safe" chars
++    // (no quote/backslash/control) must evaluate back to itself.
++    #[hegel::test]
++    fn string_literal_roundtrips_through_eval(tc: hegel::TestCase) {
++        // Draw codepoints avoiding `"` `\` and controls, which need escaping.
++        let n = tc.draw(generators::integers::<usize>().max_value(40));
++        let mut s = String::new();
++        for _ in 0..n {
++            let cp = tc.draw(hegel::one_of!(
++                generators::integers::<u32>().min_value(0x20).max_value(0x7E),
++                generators::integers::<u32>().min_value(0xA0).max_value(0xFFFF),
++            ));
++            if let Some(ch) = char::from_u32(cp) {
++                if ch != '"' && ch != '\\' && !ch.is_control() {
++                    s.push(ch);
++                }
++            }
++        }
++        let src = format!("{s:?}"); // Rust debug quoting matches gluon's for this safe subset
++        // Only proceed if the debug form introduced no escapes beyond the quotes.
++        tc.assume(!src[1..src.len() - 1].contains('\\'));
++        assert_eq!(eval_string(&src), Ok(s), "string literal `{src}`");
++    }
++
++    // ---- Pinned regression for a REAL bug (KNOWN FAILURE) -------------------
++    // Invalid string escape codes panic the parser instead of returning Err.
++    // `unescape_string_literal` (parser/src/token.rs) hits `panic!("Invalid
++    // escape")` on any escape the match arm doesn't cover, even though the lexer's
++    // `escape_code` recovers the same case gracefully. A parser MUST return Err on
++    // bad source, never panic. This test asserts the contract and therefore FAILS
++    // (panics) until the bug is fixed.
++    #[test]
++    fn parse_invalid_string_escape_is_err() {
++        // `\q` is not a valid escape; parsing must return Err, not panic.
++        assert!(
++            try_parse(r#" "\q" "#).is_err(),
++            "expected a parse error for an invalid string escape"
++        );
++    }
++
++    // Pinned regression for a second REAL bug (KNOWN FAILURE): any non-ASCII
++    // character (codepoint >= U+0080) in an unexpected position panics the parser.
++    // The "unexpected character" recovery path calls `restore_char`
++    // (parser/src/str_suffix.rs), whose `str::from_utf8(&buf).expect("UTF-8
++    // string")` panics on the reconstructed byte buffer. A bare identifier-invalid
++    // non-ASCII char such as `é` reproduces it. The parser MUST return Err, not
++    // panic, so this test FAILS (panics) until the bug is fixed.
++    #[test]
++    fn parse_non_ascii_char_is_err() {
++        assert!(
++            try_parse("é").is_err(),
++            "expected a parse error for a stray non-ASCII character"
++        );
++    }
++
++    // ---- Process-aborting bug: documented, IGNORED reproducer --------------
++    // The typechecker/compiler recurses per syntactic nesting level and overflows
++    // the stack (SIGABRT — NOT a catchable panic) on deeply-nested source at depth
++    // ~1000. Reproduces with nested parens, operator chains, lambdas and let
++    // bindings. Because it aborts the whole process it cannot be an ordinary
++    // failing test — it would take the entire suite down. Kept `#[ignore]`d.
++    // The *parser* alone handles depth 50_000 fine (see property 3); the abort is
++    // in the typecheck/compile stage. This is the classic high-value
++    // untrusted-source stack-overflow bug.
++    #[test]
++    #[ignore = "KNOWN BUG: typecheck/compile stack-overflows (SIGABRT) on deeply nested source (~depth 1000)"]
++    fn typecheck_deep_nesting_stack_overflows() {
++        let vm = new_vm();
++        vm.get_database_mut().implicit_prelude(false);
++        let depth = 5000;
++        let src = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
++        // This aborts the process with a stack overflow.
++        let _ = vm.typecheck_str("prop", &src, None);
++    }
++}

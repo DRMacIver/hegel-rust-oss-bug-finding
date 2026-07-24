@@ -1,0 +1,1257 @@
+diff --git a/.gitignore b/.gitignore
+index b77197e..0833db2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,3 +8,4 @@ Cargo.lock
+ Session.vim
+ .cargo-ok
+ cargo-timing*.html
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index a93182e..1ed4fc8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -85,6 +85,7 @@ zerocopy-derive = { version = "0.8", optional = true, default-features = false }
+ arbitrary = { version = "1.4.2", default-features = false, optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ # rand_xoshiro is required for tests if rand is enabled
+ rand_xoshiro = "0.8"
+ # "alloc" is needed to support to_bytes()/deserialize() in tests.
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..bb4a9b4
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,180 @@
++# Hegel Property-Based Testing Report: glam
++
++Property-based tests written with `hegeltest` v0.28.2 (library crate name:
++`hegel`), added as a dev-dependency with
++`cargo add --dev hegeltest --ignore-rust-version` (glam pins
++`rust-version = 1.68.2`; hegeltest's MSRV is 1.86 — a maintainer decision if
++these tests are upstreamed).
++
++Note: the task brief mentioned an existing proptest dev-dependency, but glam
++0.33.2 has **no** proptest dependency and no existing property-based tests
++(`grep -ri proptest` over the repo is empty); the existing suite is entirely
++example-based `macro_rules!`-instantiated unit tests plus a 15-degree-grid
++euler sweep. The hegel tests below therefore supplement the unit suite rather
++than port anything.
++
++Tests live at the end of the existing integration-test files, in
++`mod hegel_props` / `impl_hegel_*` macro blocks gated
++`#[cfg(not(target_family = "wasm"))]` (hegel drives the native test runner):
++
++- `tests/vec3.rs` (3 properties + 1 deterministic bug pin)
++- `tests/vec4.rs` (2 properties)
++- `tests/mat3.rs` (2 properties)
++- `tests/mat4.rs` (2 properties × {`Mat4`, `DMat4`})
++- `tests/quat.rs` (3 properties × {`Quat`, `DQuat`})
++- `tests/affine3.rs` (3 properties)
++- `tests/euler.rs` (1 property × {`Quat`, `DQuat`})
++
++The highest-value angle for glam's architecture is the **SIMD-vs-scalar
++differential**: within one default build, `Vec3`/`Mat3` are always scalar
++while `Vec3A`/`Mat3A` use the SIMD backend (NEON here; SSE2/WASM elsewhere),
++so building both from identical components and comparing is a direct
++backend differential. `Vec4`/`Quat`/`Mat4`/`Affine3A` (SIMD, no scalar twin)
++are checked against hand-written scalar references on the components and
++against the always-scalar f64 types (`DVec4`, `DQuat`, `DMat4`, `DAffine3`)
++as higher-precision oracles. The full suite was additionally run with
++`--features scalar-math`, which swaps in the scalar backend for everything —
++a differential-by-rerun on top of the in-build differentials.
++
++## Properties tested
++
++| # | Test | Property | Evidence |
++|---|------|----------|----------|
++| 1 | `vec3.rs hegel_vec3_vec3a_lanewise_ops_agree_exactly` | `Vec3` (scalar) and `Vec3A` (SIMD) agree **exactly** on `+ - * min max abs neg` | Lane-wise IEEE ops have no reassociation freedom; lib.rs "SIMD and scalar consistency" section promises the types are interchangeable representations |
++| 2 | `vec3.rs hegel_vec3_and_vec3a_match_f64_oracle` | `dot`, `cross`, `length` of both `Vec3` and `Vec3A` match the `DVec3` f64 oracle within magnitude-calibrated tolerance | `as_dvec3` exists precisely for widening; the SIMD-divergence bug class from the property catalogue |
++| 3 | `vec3.rs hegel_vec3_normalize_family_contract` | For any input (incl. NaN/inf/huge/subnormal): `try_normalize` returns `None` or a unit vector; `normalize_or_zero` returns zero or a unit vector | Doc comments: "normalized to length 1.0 if possible, else returns `None`" / "else returns zero"; `is_normalized` documents its ~1e-4 threshold |
++| 4 | `vec4.rs hegel_vec4_lanewise_ops_match_scalar_reference` | SIMD `Vec4` lane-wise ops agree exactly with a hand-written scalar reference on the components | Fast-path-vs-generic oracle: the scalar backend computes exactly these expressions (src/f32/scalar/vec4.rs) |
++| 5 | `vec4.rs hegel_vec4_dot_length_match_f64_oracle` | `Vec4::dot`/`length` match the f64 oracle; `length_squared == dot(self, self)` exactly | `length_squared` doc: "the dot product of `self` with itself"; SIMD reduction-order divergence class |
++| 6 | `mat3.rs hegel_mat3_vs_mat3a_ops_agree` | `Mat3` vs `Mat3A` from the same 9 components: `transpose` exact; `mul_vec3`, `mat*mat`, `determinant` within element-magnitude tolerance | Same-crate SIMD/scalar twin types; ARCHITECTURE.md documents the storage-only difference |
++| 7 | `mat3.rs hegel_mat3_vs_mat3a_inverse_agree` | `Mat3::inverse` and `Mat3A::inverse` agree element-wise (scale `max\|m\|²/\|det\|`), for f64-verified-invertible matrices | Both backends implement adjugate/determinant; `inverse` doc: result invalid only if not invertible |
++| 8 | `mat4.rs hegel_mat4_inverse_roundtrip` (`Mat4` + `DMat4`) | For well-conditioned SRT matrices: `try_inverse` is `Some` and `m * m.inverse() ≈ IDENTITY` (tolerance scaled by `max\|m\|·max\|m⁻¹\|`) | `inverse` doc panics/invalid only for non-invertible input; existing unit tests check specific SRT instances |
++| 9 | `mat4.rs hegel_mat4_cols_array_roundtrip` (`Mat4` + `DMat4`) | `from_cols_array`/`to_cols_array`/`_2d` are exact roundtrips; `transpose` is an exact involution — full finite range incl. huge/subnormal | Conversions are pure memcpy/lane-shuffles; existing `test_const` checks one hardcoded array |
++| 10 | `quat.rs hegel_quat_from_axis_angle_unit_and_fixes_axis` (`Quat` + `DQuat`) | `from_axis_angle(unit_axis, any finite angle)` is normalized and leaves its own (scaled) axis fixed | `from_axis_angle` requires a normalized axis (glam_assert); sin²+cos²=1 for any finite angle; axis is the rotation's eigenvector |
++| 11 | `quat.rs hegel_quat_conjugate_is_inverse` (`Quat` + `DQuat`) | For unit q: `q * q.conjugate() ≈ IDENTITY` and `q.inverse() ≈ q.conjugate()` (32·eps) | `conjugate` doc: "equal to its inverse" if normalized; `inverse` doc: conjugate for unit quaternions |
++| 12 | `quat.rs hegel_quat_rotation_preserves_length_and_matches_mat3` (`Quat` + `DQuat`) | Unit-quat rotation preserves length; sandwich product agrees with `Mat3::from_quat(q).mul_vec3(v)` | Rotations are isometries; matrix path is an independently implemented sibling (existing `test_mul_vec3` checks 90° instances) |
++| 13 | `affine3.rs hegel_affine3a_matches_mat4_transform_point` | `Affine3A` and `Mat4` from the same SRT transform points identically (vs shared `DAffine3` f64 oracle); `project_point3` agrees for affine matrices | `Mat4::transform_point3` doc: "the equivalent of multiplying [...] as a 4D vector where `w` is `1.0`"; both types document the same SRT semantics |
++| 14 | `affine3.rs hegel_affine3a_composition_matches_sequential` | `(a * b).transform_point3(p) ≈ a.transform_point3(b.transform_point3(p))`, both vs the f64 oracle | Affine `Mul` doc/semantics; associativity of transform application |
++| 15 | `affine3.rs hegel_affine3a_inverse_roundtrips_points` | `a.inverse().transform_point3(a.transform_point3(p)) ≈ p` for well-conditioned SRT | `inverse` doc: "Note that if the transformation is not invertible the result will be invalid" — ours are invertible by construction |
++| 16 | `euler.rs hegel_euler_roundtrip_preserves_rotation` (`Quat` + `DQuat`) | `from_euler → to_euler → from_euler` preserves the rotation for **any** of the 24 orders and arbitrary finite radian angles (canonical ±q comparison) | Existing grid tests check the same roundtrip at 15° increments only; this fills the space between grid points and near the gimbal-lock poles |
++
++Generator notes (per the skill's generator discipline):
++
++- Bounds on float generators exist only to protect the tests' tolerance
++  models from intermediate overflow (|component| ≤ 1e18 where squares are
++  formed, ≤ 1e15 where quaternion sandwiches run, ≤ 1e3 for matrix elements
++  where triple products appear); each bound carries an in-source comment
++  saying it protects the error model, not a library contract.
++- The normalize-contract test uses the full f32 range *including NaN and
++  infinities*, with a magnitude-class generator (`extreme_triple`) that puts
++  all three components in the same class (any/tiny/huge) — independent draws
++  essentially never make `length_squared` underflow or overflow, and this
++  boundary-conjunction boost is what surfaced the pinned bug.
++- Unit quaternions/axes are constructed (draw in [-1,1]⁴, reject only
++  near-zero raw length, normalize) rather than filtered.
++- Angles are full-finite-range wherever the property is magnitude-independent
++  (axis-angle, euler roundtrip).
++- Euler order is drawn with `sampled_from` over all 24 `EulerRot` variants,
++  not a canned subset.
++
++## Test results
++
++Final committed state, default (NEON SIMD) build:
++**3439 passed; 1 failed** — the single failure is the deterministic pin of
++the real bug below (baseline before this work: 3417 passed, 0 failed; 23 new
++tests). With `--features scalar-math` (scalar backend): **3439 passed; 1
++failed** — the identical pin, since the buggy code is the shared scalar
++`Vec3` path.
++
++Run-and-Reflect checks performed:
++
++- **Liveness**: temporarily inverted the `+` assertion in
++  `hegel_vec3_vec3a_lanewise_ops_agree_exactly`; hegel reported a shrunk
++  counterexample (all six draws shrunk to `0.0`). Reverted, `.hegel/`
++  database deleted (and `.hegel/` added to `.gitignore`).
++- **Exploratory 10x runs**: all hegel tests were run at `test_cases = 1000`
++  five times with fresh random seeds on the default build and twice under
++  `--features scalar-math`, then reverted to the default count. One run
++  surfaced a tolerance-model error in my own length property (see Unsound
++  properties below), which was fixed; after the fix all 10x runs are green
++  apart from the pin.
++
++## Suspected bugs
++
++### 1. `Vec3::try_normalize` returns `Some(v)` with `v.length() ≈ 1.07` for subnormal-length-squared inputs
++
++- **Test**: `hegel_pin_vec3_try_normalize_subnormal_length_not_unit`
++  (tests/vec3.rs, plain `#[test]` with the exact counterexample — marked
++  `KNOWN FAILURE`, fails deterministically on every run, both backends).
++- **Counterexample**: `Vec3::new(4e-23, 0.0, 0.0).try_normalize()` returns
++  `Some(Vec3(1.0685495, 0.0, 0.0))` — length 1.0685, while `is_normalized()`
++  documents a ~1e-4 threshold. Neither `None` nor unit length.
++- **Documented contract** (src/f32/vec3.rs): "Returns `self` normalized to
++  length 1.0 if possible, else returns `None`. In particular, if the input is
++  zero (or very close to zero), or non-finite, the result of this operation
++  will be `None`."
++- **Code path**: `try_normalize` computes `rcp = self.length_recip()` and
++  returns `Some(self * rcp)` whenever `rcp.is_finite() && rcp > 0.0`. For
++  `|v| ∈ [~2.5e-23, ~3.7e-21]`, `length_squared()` lands in the f32
++  *subnormal* range (quantum 1.4e-45), so it is quantized with huge relative
++  error — e.g. `(4e-23)² = 1.6e-45` rounds to `1.4e-45` — while `1/sqrt(ls)`
++  is still finite and positive. The guard admits the value; the result is off
++  by up to ~7% of unit length. `normalize_or_zero`/`normalize_or` share the
++  same guard and the same behavior (`Vec3A`, and by code inspection the
++  other float vector widths, likewise).
++- **Sibling handling**: the general property
++  `hegel_vec3_normalize_family_contract` excludes only the pinned region
++  (`0 < ls_f64 < 1e-37`, with a comment referencing the canonical test) and
++  still checks zero, huge, non-finite and ordinary inputs — it passes.
++- Not fixed, per instructions.
++
++## Unsound properties abandoned
++
++- **Purely relative tolerance for `length` vs the f64 oracle**: my initial
++  tolerance `8·eps·length` was violated (found in a 10x run) for
++  `Vec3(1.36e-20, 0, 0)` — not a glam divergence but the same subnormal
++  quantization as the pinned bug, amplified through `sqrt`: for subnormal
++  `length_squared` the absolute error is bounded by ~`sqrt(1.4e-45) ≈ 3.7e-23`
++  but is unboundedly large *relative* to the result. The committed tests add
++  an absolute `4e-23` term with a comment. (Kept as a tolerance-model fix
++  rather than an input exclusion, so the region stays covered.)
++- **Bitwise SIMD-vs-scalar equality for reductions (`dot`, `cross`,
++  `length`, inverses)**: glam only promises serialization/Display consistency
++  between backends, not bitwise arithmetic identity — SIMD backends may
++  reassociate or fuse (the NEON cross uses `vmlsq_f32`). Asserted exact
++  equality only for lane-wise ops (properties 1, 4) and calibrated tolerances
++  everywhere else.
++- **Exact `q * q.conjugate() == IDENTITY`**: the xyz cancellations are exact
++  only if no FMA contraction occurs; with SIMD fused ops an eps-scale residue
++  is legitimate. Used `32·eps` instead of exactness.
++- **`to_axis_angle` component-level roundtrip**: near the identity rotation
++  the axis is ill-conditioned (`acos(w)` for `w → 1` loses half the
++  significand, and the axis is `xyz / sin(θ/2)`), so
++  `from_axis_angle(to_axis_angle(q)) == q` with a tight component tolerance
++  is not a promise the code makes. Replaced by the axis-fixing and
++  matrix-agreement properties (10, 12), which are well-conditioned
++  everywhere.
++- **Grid-tolerance euler roundtrip (2e-6) on arbitrary angles**: the existing
++  grid tests' epsilon is only achievable away from the gimbal-lock poles;
++  extracting euler angles near a pole legitimately costs ~sqrt(eps). The
++  committed property uses 2e-3 (f32) / 1e-7 (f64), which still pins wrong
++  axis order or sign errors; a tighter bound would fail on legitimate
++  numerics, not bugs.
++
++## Skill feedback
++
++- The Oracle Sourcing section's "fast-path-vs-generic" pattern mapped
++  perfectly onto glam's twin types (`Vec3`/`Vec3A`, `Mat3`/`Mat3A`) — having
++  both backends in one build made the differential cheap. The
++  `--features scalar-math` rerun was nearly free extra coverage.
++- The boundary-conjunction advice ("some bugs require several drawn values to
++  hit boundaries simultaneously") was directly responsible for the real find:
++  per-component extreme draws never produced a subnormal `length_squared`;
++  the shared magnitude-class generator found it immediately.
++- The "keep a canonical deterministic pin, exclude the region from siblings"
++  guidance worked well; a plain `#[test]` with the exact input was the
++  cleanest deterministic pin.
++- One gap: the skill's tolerance guidance ("calibrated to magnitude") reads
++  as purely relative; a note that *subnormal intermediates make relative
++  tolerances unsound* (add an absolute floor derived from the subnormal
++  quantum) would have saved one 10x-run iteration — this exact issue appeared
++  twice here (once as a test-model bug, once as the real library bug).
+diff --git a/tests/affine3.rs b/tests/affine3.rs
+index 46894e2..55bb32f 100644
+--- a/tests/affine3.rs
++++ b/tests/affine3.rs
+@@ -436,3 +436,140 @@ mod daffine3 {
+ 
+     impl_affine3_tests!(f64, DAffine3, DQuat, DVec3, DMat3, DMat4);
+ }
++
++// Hegel property-based tests.
++//
++// `Affine3A` (SIMD-backed Vec3A columns) and `Mat4` (SIMD-backed Vec4
++// columns) implement the same affine transform through different storage and
++// code paths, so building both from identical scale/rotation/translation
++// inputs and comparing their action on points is a sibling-implementation
++// differential. `DAffine3` (always scalar f64) serves as the high-precision
++// oracle for composition.
++#[cfg(not(target_family = "wasm"))]
++mod hegel_props {
++    use glam::{Affine3A, DAffine3, DQuat, DVec3, Mat4, Quat, Vec3};
++    use hegel::generators;
++
++    fn unit_quat(tc: &hegel::TestCase) -> Quat {
++        let c = || generators::floats::<f32>().min_value(-1.0).max_value(1.0);
++        let q = Quat::from_xyzw(tc.draw(c()), tc.draw(c()), tc.draw(c()), tc.draw(c()));
++        // Rejecting near-zero raw quaternions protects the normalization
++        // step of the generator, not a library contract.
++        tc.assume(q.length_squared() > 0.01);
++        q.normalize()
++    }
++
++    /// Scale, rotation and translation with moderate magnitudes (|scale| in
++    /// [0.05, 20], |translation| <= 1e3) so the f64-oracle tolerance below
++    /// stays a faithful error model for the f32 computation.
++    fn srt(tc: &hegel::TestCase) -> (Vec3, Quat, Vec3) {
++        let s = || {
++            let mag = tc.draw(generators::floats::<f32>().min_value(0.05).max_value(20.0));
++            if tc.draw(generators::booleans()) {
++                -mag
++            } else {
++                mag
++            }
++        };
++        let t = || tc.draw(generators::floats::<f32>().min_value(-1e3).max_value(1e3));
++        (
++            Vec3::new(s(), s(), s()),
++            unit_quat(tc),
++            Vec3::new(t(), t(), t()),
++        )
++    }
++
++    fn point(tc: &hegel::TestCase) -> Vec3 {
++        let c = || tc.draw(generators::floats::<f32>().min_value(-1e3).max_value(1e3));
++        Vec3::new(c(), c(), c())
++    }
++
++    fn to_daffine((s, q, t): (Vec3, Quat, Vec3)) -> DAffine3 {
++        DAffine3::from_scale_rotation_translation(
++            s.as_dvec3(),
++            DQuat::from_xyzw(q.x as f64, q.y as f64, q.z as f64, q.w as f64),
++            t.as_dvec3(),
++        )
++    }
++
++    fn assert_close(label: &str, got: Vec3, want: DVec3, tol: f64) {
++        for c in 0..3 {
++            let (g, w) = (got.to_array()[c] as f64, want.to_array()[c]);
++            assert!(
++                (g - w).abs() <= tol,
++                "{}: component {} of {:?} vs f64 oracle {:?} (tol {})",
++                label,
++                c,
++                got,
++                want,
++                tol
++            );
++        }
++    }
++
++    // Property: Affine3A and Mat4 built from the same SRT transform points
++    // identically (within f32 rounding of the shared f64 oracle result).
++    #[hegel::test]
++    fn hegel_affine3a_matches_mat4_transform_point(tc: hegel::TestCase) {
++        let srt_val = srt(&tc);
++        let (s, q, t) = srt_val;
++        let a = Affine3A::from_scale_rotation_translation(s, q, t);
++        let m = Mat4::from_scale_rotation_translation(s, q, t);
++        let p = point(&tc);
++
++        let oracle = to_daffine(srt_val).transform_point3(p.as_dvec3());
++        // Result magnitude <= |s|*|p|*sqrt3 + |t| ~ 4e4; error is a modest
++        // multiple of eps at that magnitude.
++        let scale = 1.0 + oracle.abs().max_element();
++        let tol = 64.0 * f32::EPSILON as f64 * scale;
++
++        assert_close("Affine3A::transform_point3", a.transform_point3(p), oracle, tol);
++        assert_close("Mat4::transform_point3", m.transform_point3(p), oracle, tol);
++        assert_close("Mat4::project_point3", m.project_point3(p), oracle, tol);
++    }
++
++    // Property: composing affine transforms then applying equals applying
++    // them in sequence: (a * b).transform_point3(p) == a.transform(b.transform(p)),
++    // both compared against the f64 oracle of the same computation.
++    #[hegel::test]
++    fn hegel_affine3a_composition_matches_sequential(tc: hegel::TestCase) {
++        let srt_a = srt(&tc);
++        let srt_b = srt(&tc);
++        let a = Affine3A::from_scale_rotation_translation(srt_a.0, srt_a.1, srt_a.2);
++        let b = Affine3A::from_scale_rotation_translation(srt_b.0, srt_b.1, srt_b.2);
++        let p = point(&tc);
++
++        let da = to_daffine(srt_a);
++        let db = to_daffine(srt_b);
++        let oracle = da.transform_point3(db.transform_point3(p.as_dvec3()));
++
++        // Two chained transforms: result magnitude can reach ~1e6 and the
++        // f32 path accumulates rounding across both applications.
++        let scale = 1.0 + oracle.abs().max_element();
++        let tol = 512.0 * f32::EPSILON as f64 * scale;
++
++        let composed = (a * b).transform_point3(p);
++        let sequential = a.transform_point3(b.transform_point3(p));
++        assert_close("(a*b).transform_point3", composed, oracle, tol);
++        assert_close("a.transform(b.transform(p))", sequential, oracle, tol);
++    }
++
++    // Property: for well-conditioned affine transforms, transform_point3
++    // followed by the inverse transform returns to the starting point.
++    #[hegel::test]
++    fn hegel_affine3a_inverse_roundtrips_points(tc: hegel::TestCase) {
++        let srt_val = srt(&tc);
++        let a = Affine3A::from_scale_rotation_translation(srt_val.0, srt_val.1, srt_val.2);
++        let p = point(&tc);
++
++        let there = a.transform_point3(p);
++        let back = a.inverse().transform_point3(there);
++
++        // Error amplification ~ cond(a) = max|scale| / min|scale| <= 400,
++        // applied to point magnitudes up to ~4e4.
++        let mag = 1.0 + p.as_dvec3().abs().max_element()
++            + there.as_dvec3().abs().max_element() / srt_val.0.abs().min_element() as f64;
++        let tol = 64.0 * f32::EPSILON as f64 * mag;
++        assert_close("inverse roundtrip", back, p.as_dvec3(), tol);
++    }
++}
+diff --git a/tests/euler.rs b/tests/euler.rs
+index b15384b..000c632 100644
+--- a/tests/euler.rs
++++ b/tests/euler.rs
+@@ -289,3 +289,115 @@ mod euler {
+         impl_mat_euler_test!(DMat4, f64);
+     }
+ }
++
++// Hegel property-based tests.
++//
++// The existing euler tests sweep a 15-degree grid; these properties draw
++// arbitrary radian angles (including values between grid points and near the
++// gimbal-lock poles) and any of the 24 rotation orders, checking that
++// quat -> euler -> quat preserves the rotation.
++#[cfg(not(target_family = "wasm"))]
++macro_rules! impl_hegel_euler_props {
++    ($t:ident, $quat:ident, $eps:expr) => {
++        use glam::EulerRot;
++        use hegel::generators;
++
++        fn all_orders() -> Vec<EulerRot> {
++            vec![
++                EulerRot::XYZ,
++                EulerRot::XZY,
++                EulerRot::YZX,
++                EulerRot::YXZ,
++                EulerRot::ZXY,
++                EulerRot::ZYX,
++                EulerRot::XZX,
++                EulerRot::XYX,
++                EulerRot::YXY,
++                EulerRot::YZY,
++                EulerRot::ZYZ,
++                EulerRot::ZXZ,
++                EulerRot::XYZEx,
++                EulerRot::XZYEx,
++                EulerRot::YZXEx,
++                EulerRot::YXZEx,
++                EulerRot::ZXYEx,
++                EulerRot::ZYXEx,
++                EulerRot::XZXEx,
++                EulerRot::XYXEx,
++                EulerRot::YXYEx,
++                EulerRot::YZYEx,
++                EulerRot::ZYZEx,
++                EulerRot::ZXZEx,
++            ]
++        }
++
++        /// q and -q represent the same rotation; canonicalize before
++        /// comparing (same convention as the grid-based tests above).
++        fn canonical(q: $quat) -> $quat {
++            if q.w < 0.0 {
++                -q
++            } else {
++                q
++            }
++        }
++
++        // Property: from_euler -> to_euler -> from_euler reproduces the same
++        // rotation, for any order and any finite angles. The tolerance is
++        // larger than the grid tests' epsilon because extracting euler
++        // angles near the gimbal-lock poles legitimately loses ~half the
++        // significand (sqrt(eps)); the property still pins gross errors such
++        // as wrong axis order or sign flips.
++        #[hegel::test]
++        fn hegel_euler_roundtrip_preserves_rotation(tc: hegel::TestCase) {
++            let order = tc.draw(generators::sampled_from(all_orders()));
++            let angle = || {
++                tc.draw(
++                    generators::floats::<$t>()
++                        .allow_nan(false)
++                        .allow_infinity(false),
++                )
++            };
++            let (a, b, c) = (angle(), angle(), angle());
++            let q = $quat::from_euler(order, a, b, c);
++
++            let (i, j, k) = q.to_euler(order);
++            assert!(
++                i.is_finite() && j.is_finite() && k.is_finite(),
++                "to_euler({:?}) returned non-finite angles ({}, {}, {}) for {:?}",
++                order,
++                i,
++                j,
++                k,
++                q
++            );
++            let q2 = $quat::from_euler(order, i, j, k);
++
++            let (qc, q2c) = (canonical(q), canonical(q2));
++            for (x, y) in qc.to_array().iter().zip(q2c.to_array().iter()) {
++                assert!(
++                    (*x as f64 - *y as f64).abs() <= $eps,
++                    "euler roundtrip changed rotation for order {:?}, angles ({}, {}, {}): \
++                     {:?} vs {:?}",
++                    order,
++                    a,
++                    b,
++                    c,
++                    qc,
++                    q2c
++                );
++            }
++        }
++    };
++}
++
++#[cfg(not(target_family = "wasm"))]
++mod hegel_euler_quat {
++    use glam::Quat;
++    impl_hegel_euler_props!(f32, Quat, 2e-3);
++}
++
++#[cfg(all(not(target_family = "wasm"), feature = "f64"))]
++mod hegel_euler_dquat {
++    use glam::DQuat;
++    impl_hegel_euler_props!(f64, DQuat, 1e-7);
++}
+diff --git a/tests/mat3.rs b/tests/mat3.rs
+index a708825..e1049e0 100644
+--- a/tests/mat3.rs
++++ b/tests/mat3.rs
+@@ -564,3 +564,137 @@ mod dmat3 {
+     impl_mat3_tests!(f64, dmat3, DMat3, DMat2, DMat4, DQuat, dvec3, DVec3, DVec2);
+     impl_as_ref_tests!(DMat3);
+ }
++
++// Hegel property-based tests.
++//
++// `Mat3` uses scalar `Vec3` columns while `Mat3A` uses SIMD-backed `Vec3A`
++// columns, so building both from the same components and comparing results is
++// a direct SIMD-vs-scalar backend differential within a single build.
++#[cfg(not(target_family = "wasm"))]
++mod hegel_props {
++    use glam::{Mat3, Mat3A, Vec3};
++    use hegel::generators;
++
++    /// Finite f32 with |x| <= 1e3. The bound keeps intermediate products of
++    /// the 3x3 determinant / adjugate (products of up to three elements plus
++    /// sums) far from overflow so the tolerance analysis below is valid; it
++    /// protects the property's error model, not a library contract.
++    fn component(tc: &hegel::TestCase) -> f32 {
++        tc.draw(generators::floats::<f32>().min_value(-1e3).max_value(1e3))
++    }
++
++    fn matrix_array(tc: &hegel::TestCase) -> [f32; 9] {
++        core::array::from_fn(|_| component(tc))
++    }
++
++    fn max_abs(m: &[f32]) -> f64 {
++        m.iter().fold(0.0f64, |acc, &x| acc.max((x as f64).abs()))
++    }
++
++    // Property: Mat3 (scalar) and Mat3A (SIMD) built from the same components
++    // agree on transpose (exactly), matrix*vector, matrix*matrix and
++    // determinant (within a tolerance scaled to element magnitudes).
++    #[hegel::test]
++    fn hegel_mat3_vs_mat3a_ops_agree(tc: hegel::TestCase) {
++        let a = matrix_array(&tc);
++        let b = matrix_array(&tc);
++        let m = Mat3::from_cols_array(&a);
++        let ma = Mat3A::from_cols_array(&a);
++        let n = Mat3::from_cols_array(&b);
++        let na = Mat3A::from_cols_array(&b);
++
++        // transpose is a pure lane shuffle: exact agreement required
++        assert_eq!(
++            m.transpose().to_cols_array(),
++            ma.transpose().to_cols_array()
++        );
++
++        // matrix * vector: each component is a 3-term dot product; error
++        // bound K * eps * max|m| * max|v| per component.
++        let vcomps = [component(&tc), component(&tc), component(&tc)];
++        let v = Vec3::from_array(vcomps);
++        let mv = m.mul_vec3(v).to_array();
++        let mav = ma.mul_vec3a(v.into()).to_array();
++        let tol_mv = 16.0 * f32::EPSILON as f64 * 3.0 * max_abs(&a) * max_abs(&vcomps)
++            + f32::MIN_POSITIVE as f64;
++        for c in 0..3 {
++            assert!(
++                (mv[c] as f64 - mav[c] as f64).abs() <= tol_mv,
++                "mul_vec3 diverges at component {}: Mat3 {:?} vs Mat3A {:?} (tol {})",
++                c,
++                mv,
++                mav,
++                tol_mv
++            );
++        }
++
++        // matrix * matrix: same 3-term dot product error model
++        let mn = (m * n).to_cols_array();
++        let mana = (ma * na).to_cols_array();
++        let tol_mm = 16.0 * f32::EPSILON as f64 * 3.0 * max_abs(&a) * max_abs(&b)
++            + f32::MIN_POSITIVE as f64;
++        for c in 0..9 {
++            assert!(
++                (mn[c] as f64 - mana[c] as f64).abs() <= tol_mm,
++                "mat mul diverges at element {}: {:?} vs {:?} (tol {})",
++                c,
++                mn,
++                mana,
++                tol_mm
++            );
++        }
++
++        // determinant: six products of three elements; error bound
++        // K * eps * max|m|^3.
++        let det = m.determinant() as f64;
++        let deta = ma.determinant() as f64;
++        let tol_det =
++            32.0 * f32::EPSILON as f64 * max_abs(&a).powi(3) + f32::MIN_POSITIVE as f64;
++        assert!(
++            (det - deta).abs() <= tol_det,
++            "determinant diverges: Mat3 {} vs Mat3A {} (tol {})",
++            det,
++            deta,
++            tol_det
++        );
++    }
++
++    // Property: Mat3 and Mat3A compute the same inverse (both use the
++    // adjugate-over-determinant formula; per-element divergence must stay
++    // within a few ULP of the shared element scale max|m|^2 / |det|).
++    #[hegel::test]
++    fn hegel_mat3_vs_mat3a_inverse_agree(tc: hegel::TestCase) {
++        let a = matrix_array(&tc);
++        let m = Mat3::from_cols_array(&a);
++        let ma = Mat3A::from_cols_array(&a);
++
++        // Compute the determinant in f64 to decide invertibility soundly.
++        // Excluding near-singular matrices protects the error model of the
++        // comparison (1/det amplification), not a library contract:
++        // inverse() documents that the result is invalid for non-invertible
++        // input.
++        let d = |i: usize| a[i] as f64;
++        let det64 = d(0) * (d(4) * d(8) - d(5) * d(7)) - d(3) * (d(1) * d(8) - d(2) * d(7))
++            + d(6) * (d(1) * d(5) - d(2) * d(4));
++        let scale = {
++            let s = a.iter().fold(0.0f64, |acc, &x| acc.max((x as f64).abs()));
++            s * s
++        };
++        tc.assume(det64.abs() > 1e-6 * scale.max(1e-30));
++
++        let inv = m.inverse().to_cols_array();
++        let inva = ma.inverse().to_cols_array();
++        let elem_scale = 2.0 * scale / det64.abs();
++        let tol = 32.0 * f32::EPSILON as f64 * elem_scale + f32::MIN_POSITIVE as f64;
++        for c in 0..9 {
++            assert!(
++                (inv[c] as f64 - inva[c] as f64).abs() <= tol,
++                "inverse diverges at element {}: Mat3 {:?} vs Mat3A {:?} (tol {})",
++                c,
++                inv,
++                inva,
++                tol
++            );
++        }
++    }
++}
+diff --git a/tests/mat4.rs b/tests/mat4.rs
+index 0d21b4b..47855ce 100644
+--- a/tests/mat4.rs
++++ b/tests/mat4.rs
+@@ -770,3 +770,124 @@ mod dmat4 {
+     impl_mat4_tests!(f64, dmat4, dvec4, dvec3, DMat4, DMat3, DQuat, DVec4, DVec3);
+     impl_as_ref_tests!(DMat4);
+ }
++
++// Hegel property-based tests.
++//
++// `Mat4` is SIMD-backed (NEON/SSE2/WASM) when available while `DMat4` always
++// uses scalar f64 columns, so instantiating the same properties for both
++// exercises both backends. Inverse correctness is checked as the roundtrip
++// `m * m.inverse() ≈ IDENTITY` on well-conditioned generated matrices.
++#[cfg(not(target_family = "wasm"))]
++macro_rules! impl_hegel_mat4_props {
++    ($t:ident, $mat4:ident, $quat:ident, $vec3:ident) => {
++        use hegel::generators;
++
++        /// A random unit quaternion: draw four components in [-1, 1] and
++        /// normalize. Rejecting near-zero raw quaternions protects the
++        /// normalization step of the generator, not a library contract.
++        fn unit_quat(tc: &hegel::TestCase) -> $quat {
++            let c = || generators::floats::<$t>().min_value(-1.0).max_value(1.0);
++            let q = $quat::from_xyzw(tc.draw(c()), tc.draw(c()), tc.draw(c()), tc.draw(c()));
++            tc.assume(q.length_squared() > 0.01);
++            q.normalize()
++        }
++
++        /// A well-conditioned scale: per-axis |s| in [0.05, 20], random sign.
++        fn well_conditioned_scale(tc: &hegel::TestCase) -> $vec3 {
++            let c = || {
++                let mag = tc.draw(generators::floats::<$t>().min_value(0.05).max_value(20.0));
++                if tc.draw(generators::booleans()) {
++                    -mag
++                } else {
++                    mag
++                }
++            };
++            $vec3::new(c(), c(), c())
++        }
++
++        fn translation(tc: &hegel::TestCase) -> $vec3 {
++            let c = || tc.draw(generators::floats::<$t>().min_value(-1e3).max_value(1e3));
++            $vec3::new(c(), c(), c())
++        }
++
++        fn max_abs(m: &$mat4) -> f64 {
++            m.to_cols_array()
++                .iter()
++                .fold(0.0f64, |acc, &x| acc.max((x as f64).abs()))
++        }
++
++        // Property: for well-conditioned scale/rotation/translation
++        // matrices, the inverse exists (try_inverse is Some) and
++        // m * m.inverse() is the identity within a tolerance scaled to the
++        // magnitudes of m and its inverse.
++        #[hegel::test]
++        fn hegel_mat4_inverse_roundtrip(tc: hegel::TestCase) {
++            let m = $mat4::from_scale_rotation_translation(
++                well_conditioned_scale(&tc),
++                unit_quat(&tc),
++                translation(&tc),
++            );
++
++            let inv = m.inverse();
++            assert!(
++                m.try_inverse().is_some(),
++                "try_inverse returned None for well-conditioned {:?}",
++                m
++            );
++
++            let product = (m * inv).to_cols_array();
++            let identity = $mat4::IDENTITY.to_cols_array();
++            // Error model: each product element is a 4-term dot of elements
++            // bounded by max|m| and max|inv|; K covers accumulated rounding
++            // in from_scale_rotation_translation, the inverse and the
++            // product.
++            let tol = 64.0 * $t::EPSILON as f64 * (1.0 + max_abs(&m) * max_abs(&inv));
++            for c in 0..16 {
++                assert!(
++                    (product[c] as f64 - identity[c] as f64).abs() <= tol,
++                    "m * m.inverse() differs from identity at element {}: {} (tol {}, m {:?})",
++                    c,
++                    product[c],
++                    tol,
++                    m
++                );
++            }
++        }
++
++        // Property: to/from cols-array conversions are exact roundtrips and
++        // transpose is a self-inverse lane shuffle, for arbitrary finite
++        // component values (including huge and subnormal magnitudes).
++        #[hegel::test]
++        fn hegel_mat4_cols_array_roundtrip(tc: hegel::TestCase) {
++            let finite = || {
++                generators::floats::<$t>()
++                    .allow_nan(false)
++                    .allow_infinity(false)
++            };
++            let mut arr = [0.0; 16];
++            for c in arr.iter_mut() {
++                *c = tc.draw(finite());
++            }
++
++            let m = $mat4::from_cols_array(&arr);
++            assert_eq!(arr, m.to_cols_array());
++
++            let arr2d = m.to_cols_array_2d();
++            assert_eq!(m, $mat4::from_cols_array_2d(&arr2d));
++
++            assert_eq!(m, m.transpose().transpose());
++        }
++    };
++}
++
++#[cfg(not(target_family = "wasm"))]
++mod hegel_mat4 {
++    use glam::{Mat4, Quat, Vec3};
++    impl_hegel_mat4_props!(f32, Mat4, Quat, Vec3);
++}
++
++#[cfg(all(not(target_family = "wasm"), feature = "f64"))]
++mod hegel_dmat4 {
++    use glam::{DMat4, DQuat, DVec3};
++    impl_hegel_mat4_props!(f64, DMat4, DQuat, DVec3);
++}
+diff --git a/tests/quat.rs b/tests/quat.rs
+index fe87cdd..465e556 100644
+--- a/tests/quat.rs
++++ b/tests/quat.rs
+@@ -902,3 +902,167 @@ mod dquat {
+ 
+     impl_quat_tests!(f64, dquat, DMat3, DMat4, DQuat, DVec2, DVec3, DVec4);
+ }
++
++// Hegel property-based tests.
++//
++// `Quat` is SIMD-backed (NEON/SSE2/WASM) when available while `DQuat` always
++// uses scalar storage, so instantiating the same properties for both
++// exercises both backends. The matrix-rotation comparison uses
++// `Mat3::from_quat` as an independently implemented sibling of the
++// quaternion sandwich product.
++#[cfg(not(target_family = "wasm"))]
++macro_rules! impl_hegel_quat_props {
++    ($t:ident, $quat:ident, $vec3:ident, $mat3:ident) => {
++        use hegel::generators;
++
++        /// A random unit quaternion: draw four components in [-1, 1] and
++        /// normalize. Rejecting near-zero raw quaternions protects the
++        /// normalization step of the generator, not a library contract.
++        fn unit_quat(tc: &hegel::TestCase) -> $quat {
++            let c = || generators::floats::<$t>().min_value(-1.0).max_value(1.0);
++            let q = $quat::from_xyzw(tc.draw(c()), tc.draw(c()), tc.draw(c()), tc.draw(c()));
++            tc.assume(q.length_squared() > 0.01);
++            q.normalize()
++        }
++
++        /// A random unit axis.
++        fn unit_axis(tc: &hegel::TestCase) -> $vec3 {
++            let c = || generators::floats::<$t>().min_value(-1.0).max_value(1.0);
++            let v = $vec3::new(tc.draw(c()), tc.draw(c()), tc.draw(c()));
++            tc.assume(v.length_squared() > 0.01);
++            v.normalize()
++        }
++
++        // Property: from_axis_angle yields a unit quaternion (sin² + cos² = 1
++        // for any finite angle) and the rotation it represents leaves its own
++        // axis fixed.
++        #[hegel::test]
++        fn hegel_quat_from_axis_angle_unit_and_fixes_axis(tc: hegel::TestCase) {
++            let axis = unit_axis(&tc);
++            let angle: $t = tc.draw(
++                generators::floats::<$t>()
++                    .allow_nan(false)
++                    .allow_infinity(false),
++            );
++            let q = $quat::from_axis_angle(axis, angle);
++            assert!(
++                q.is_normalized(),
++                "from_axis_angle({:?}, {}) is not normalized: {:?} (length {})",
++                axis,
++                angle,
++                q,
++                q.length()
++            );
++
++            // |scale| <= 1e15 keeps |v| far from overflow in the sandwich
++            // product's intermediates; protects the tolerance model, not a
++            // library contract.
++            let scale: $t = tc.draw(generators::floats::<$t>().min_value(-1e15).max_value(1e15));
++            let v = axis * scale;
++            let rotated = q.mul_vec3(v);
++            let tol = 32.0 * $t::EPSILON as f64 * (scale as f64).abs() + 1e-30;
++            for c in 0..3 {
++                let (r, e) = (rotated.to_array()[c] as f64, v.to_array()[c] as f64);
++                assert!(
++                    (r - e).abs() <= tol,
++                    "rotation moved its own axis: {:?} -> {:?} (tol {})",
++                    v,
++                    rotated,
++                    tol
++                );
++            }
++        }
++
++        // Property: for a unit quaternion, q * q.conjugate() is the identity
++        // rotation and q.inverse() coincides with q.conjugate().
++        #[hegel::test]
++        fn hegel_quat_conjugate_is_inverse(tc: hegel::TestCase) {
++            let q = unit_quat(&tc);
++
++            let p = q * q.conjugate();
++            let tol = 32.0 * $t::EPSILON as f64;
++            assert!(
++                (p.w as f64 - 1.0).abs() <= tol
++                    && (p.x as f64).abs() <= tol
++                    && (p.y as f64).abs() <= tol
++                    && (p.z as f64).abs() <= tol,
++                "q * q.conjugate() = {:?} is not the identity (tol {})",
++                p,
++                tol
++            );
++
++            let inv = q.inverse();
++            let conj = q.conjugate();
++            for (a, b) in inv.to_array().iter().zip(conj.to_array().iter()) {
++                assert!(
++                    (*a as f64 - *b as f64).abs() <= tol,
++                    "inverse {:?} != conjugate {:?} for unit quat {:?} (tol {})",
++                    inv,
++                    conj,
++                    q,
++                    tol
++                );
++            }
++        }
++
++        // Property: rotating by a unit quaternion preserves vector length,
++        // and the quaternion sandwich product agrees with the independently
++        // implemented rotation-matrix path (Mat3::from_quat).
++        #[hegel::test]
++        fn hegel_quat_rotation_preserves_length_and_matches_mat3(tc: hegel::TestCase) {
++            let q = unit_quat(&tc);
++            // |components| <= 1e15: keeps the sandwich product and length
++            // computation away from overflow; protects the tolerance model,
++            // not a library contract.
++            let c = || generators::floats::<$t>().min_value(-1e15).max_value(1e15);
++            let v = $vec3::new(tc.draw(c()), tc.draw(c()), tc.draw(c()));
++
++            let len64 = |u: $vec3| -> f64 {
++                u.to_array()
++                    .iter()
++                    .map(|&x| (x as f64) * (x as f64))
++                    .sum::<f64>()
++                    .sqrt()
++            };
++            let rotated = q.mul_vec3(v);
++            let vlen = len64(v);
++            let rlen = len64(rotated);
++            let tol_len = 32.0 * $t::EPSILON as f64 * vlen + 1e-30;
++            assert!(
++                (rlen - vlen).abs() <= tol_len,
++                "rotation changed length: |{:?}| = {} vs |{:?}| = {} (tol {})",
++                v,
++                vlen,
++                rotated,
++                rlen,
++                tol_len
++            );
++
++            let m = $mat3::from_quat(q);
++            let mv = m.mul_vec3(v);
++            let tol_mv = 64.0 * $t::EPSILON as f64 * vlen + 1e-30;
++            for c in 0..3 {
++                let (a, b) = (rotated.to_array()[c] as f64, mv.to_array()[c] as f64);
++                assert!(
++                    (a - b).abs() <= tol_mv,
++                    "quat rotation {:?} disagrees with Mat3::from_quat rotation {:?} (tol {})",
++                    rotated,
++                    mv,
++                    tol_mv
++                );
++            }
++        }
++    };
++}
++
++#[cfg(not(target_family = "wasm"))]
++mod hegel_quat {
++    use glam::{Mat3, Quat, Vec3};
++    impl_hegel_quat_props!(f32, Quat, Vec3, Mat3);
++}
++
++#[cfg(all(not(target_family = "wasm"), feature = "f64"))]
++mod hegel_dquat {
++    use glam::{DMat3, DQuat, DVec3};
++    impl_hegel_quat_props!(f64, DQuat, DVec3, DMat3);
++}
+diff --git a/tests/vec3.rs b/tests/vec3.rs
+index f937ae0..c0e38de 100644
+--- a/tests/vec3.rs
++++ b/tests/vec3.rs
+@@ -2910,3 +2910,233 @@ mod usizevec3 {
+     impl_vec3_scalar_bit_op_tests!(USizeVec3, 0, 2);
+     impl_vec3_bit_op_tests!(USizeVec3, 0, 2);
+ }
++
++// Hegel property-based tests.
++//
++// glam selects a SIMD backend (NEON/SSE2/WASM) or a scalar backend per type:
++// `Vec3` always uses scalar `f32` storage while `Vec3A` uses the SIMD backend
++// when available, so comparing them on identical inputs is a direct
++// SIMD-vs-scalar differential within a single build. `DVec3` (always scalar
++// f64) additionally serves as a higher-precision oracle for the f32 math.
++#[cfg(not(target_family = "wasm"))]
++mod hegel_props {
++    use glam::{Vec3, Vec3A};
++    use hegel::generators;
++
++    /// Finite f32 with |x| <= 1e18 so that squares and pairwise products stay
++    /// well below f32::MAX. This bound protects the tolerance analysis of the
++    /// differential properties (no intermediate overflow on either side), not
++    /// a library contract; `hegel_vec3_normalize_family_contract` below covers
++    /// the full range including huge, subnormal and non-finite values.
++    fn bounded_component(tc: &hegel::TestCase) -> f32 {
++        tc.draw(generators::floats::<f32>().min_value(-1e18).max_value(1e18))
++    }
++
++    fn bounded_triple(tc: &hegel::TestCase) -> [f32; 3] {
++        [
++            bounded_component(tc),
++            bounded_component(tc),
++            bounded_component(tc),
++        ]
++    }
++
++    // Property: for lane-wise operations with no reassociation freedom
++    // (IEEE-defined per-lane results), the SIMD-backed Vec3A must agree
++    // exactly with the scalar Vec3.
++    #[hegel::test]
++    fn hegel_vec3_vec3a_lanewise_ops_agree_exactly(tc: hegel::TestCase) {
++        let a = bounded_triple(&tc);
++        let b = bounded_triple(&tc);
++        let (v, w) = (Vec3::from_array(a), Vec3::from_array(b));
++        let (va, wa) = (Vec3A::from_array(a), Vec3A::from_array(b));
++
++        assert_eq!((v + w).to_array(), (va + wa).to_array());
++        assert_eq!((v - w).to_array(), (va - wa).to_array());
++        assert_eq!((v * w).to_array(), (va * wa).to_array());
++        assert_eq!(v.min(w).to_array(), va.min(wa).to_array());
++        assert_eq!(v.max(w).to_array(), va.max(wa).to_array());
++        assert_eq!(v.abs().to_array(), va.abs().to_array());
++        assert_eq!((-v).to_array(), (-va).to_array());
++    }
++
++    // Property: dot, cross and length of both the scalar Vec3 and the
++    // SIMD Vec3A agree with a higher-precision f64 oracle (DVec3) within a
++    // tolerance calibrated to the magnitude of the intermediate products.
++    #[hegel::test]
++    fn hegel_vec3_and_vec3a_match_f64_oracle(tc: hegel::TestCase) {
++        let a = bounded_triple(&tc);
++        let b = bounded_triple(&tc);
++        let (v, w) = (Vec3::from_array(a), Vec3::from_array(b));
++        let (va, wa) = (Vec3A::from_array(a), Vec3A::from_array(b));
++        let (dv, dw) = (v.as_dvec3(), w.as_dvec3());
++
++        // dot: |err| <= K * eps * sum(|a_i * b_i|)
++        let dot64 = dv.dot(dw);
++        let dot_scale: f64 = dv
++            .to_array()
++            .iter()
++            .zip(dw.to_array().iter())
++            .map(|(x, y)| (x * y).abs())
++            .sum();
++        let dot_tol = 8.0 * f32::EPSILON as f64 * dot_scale + f32::MIN_POSITIVE as f64;
++        assert!(
++            (v.dot(w) as f64 - dot64).abs() <= dot_tol,
++            "Vec3 dot {} vs f64 oracle {} (tol {})",
++            v.dot(w),
++            dot64,
++            dot_tol
++        );
++        assert!(
++            (va.dot(wa) as f64 - dot64).abs() <= dot_tol,
++            "Vec3A dot {} vs f64 oracle {} (tol {})",
++            va.dot(wa),
++            dot64,
++            dot_tol
++        );
++
++        // cross: per component |err| <= K * eps * (|a_j*b_k| + |a_k*b_j|)
++        let cross64 = dv.cross(dw).to_array();
++        let cross32 = v.cross(w).to_array();
++        let cross32a = va.cross(wa).to_array();
++        let idx = [(1usize, 2usize), (2, 0), (0, 1)];
++        let a64 = dv.to_array();
++        let b64 = dw.to_array();
++        for c in 0..3 {
++            let (j, k) = idx[c];
++            let scale = (a64[j] * b64[k]).abs() + (a64[k] * b64[j]).abs();
++            let tol = 8.0 * f32::EPSILON as f64 * scale + f32::MIN_POSITIVE as f64;
++            assert!(
++                (cross32[c] as f64 - cross64[c]).abs() <= tol,
++                "Vec3 cross[{}] = {} vs f64 oracle {} (tol {})",
++                c,
++                cross32[c],
++                cross64[c],
++                tol
++            );
++            assert!(
++                (cross32a[c] as f64 - cross64[c]).abs() <= tol,
++                "Vec3A cross[{}] = {} vs f64 oracle {} (tol {})",
++                c,
++                cross32a[c],
++                cross64[c],
++                tol
++            );
++        }
++
++        // length: |err| <= K * eps * length, plus an absolute term for the
++        // subnormal regime: when length_squared lands in the f32 subnormal
++        // range its quantization error is amplified by the square root, with
++        // absolute error bounded by ~sqrt(min_subnormal) = sqrt(1.4e-45).
++        let len64 = dv.length();
++        let len_tol = 8.0 * f32::EPSILON as f64 * len64 + 4e-23;
++        assert!(
++            (v.length() as f64 - len64).abs() <= len_tol,
++            "Vec3 length {} vs f64 oracle {} (tol {})",
++            v.length(),
++            len64,
++            len_tol
++        );
++        assert!(
++            (va.length() as f64 - len64).abs() <= len_tol,
++            "Vec3A length {} vs f64 oracle {} (tol {})",
++            va.length(),
++            len64,
++            len_tol
++        );
++    }
++
++    /// A whole vector drawn from one magnitude class, so that the boundary
++    /// classes (length_squared underflowing to a subnormal/zero, or
++    /// overflowing to +inf) are actually reached — independent per-component
++    /// draws almost never put all three components in the same extreme class.
++    /// Classes: any float (incl. NaN/inf), tiny, and huge magnitudes.
++    fn extreme_triple(tc: &hegel::TestCase) -> [f32; 3] {
++        let class: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++        let draw = || match class {
++            0 => tc.draw(generators::floats::<f32>()),
++            1 => tc.draw(generators::floats::<f32>().min_value(-1e-18).max_value(1e-18)),
++            _ => tc.draw(hegel::one_of!(
++                generators::floats::<f32>().min_value(1e18).max_value(f32::MAX),
++                generators::floats::<f32>().min_value(f32::MIN).max_value(-1e18),
++            )),
++        };
++        [draw(), draw(), draw()]
++    }
++
++    // KNOWN FAILURE: pins a real contract violation found by
++    // hegel_vec3_normalize_family_contract below.
++    //
++    // Vec3::try_normalize documents: "Returns `self` normalized to length 1.0
++    // if possible, else returns `None`. In particular, if the input is zero
++    // (or very close to zero), or non-finite, the result of this operation
++    // will be `None`."
++    //
++    // For vectors whose length_squared lands in the subnormal range,
++    // `length_recip()` is finite and positive, so try_normalize returns
++    // `Some(..)`, but the subnormal rounding of length_squared makes the
++    // result far from unit length: try_normalize(vec3(4e-23, 0.0, 0.0))
++    // returns Some(v) with v.length() ≈ 1.0685 (is_normalized() threshold is
++    // ~1e-4). Deterministic input, fails on every run.
++    #[test]
++    fn hegel_pin_vec3_try_normalize_subnormal_length_not_unit() {
++        let v = Vec3::new(4e-23, 0.0, 0.0);
++        match v.try_normalize() {
++            None => {} // also acceptable per the documentation
++            Some(n) => assert!(
++                n.is_normalized(),
++                "Vec3::try_normalize({:?}) returned Some({:?}) with length {}, \
++                 which is neither None nor unit length",
++                v,
++                n,
++                n.length()
++            ),
++        }
++    }
++
++    // Property (documented contract of try_normalize / normalize_or_zero):
++    // for *any* input, try_normalize returns None or a unit-length vector,
++    // and normalize_or_zero returns zero or a unit-length vector.
++    // "Unit-length" uses glam's own documented `is_normalized` threshold.
++    #[hegel::test]
++    fn hegel_vec3_normalize_family_contract(tc: hegel::TestCase) {
++        let a = extreme_triple(&tc);
++        let v = Vec3::from_array(a);
++        let va = Vec3A::from_array(a);
++
++        // Exclude the known-buggy region pinned by
++        // hegel_pin_vec3_try_normalize_subnormal_length_not_unit: when
++        // length_squared falls near/below the f32 subnormal range the result
++        // of try_normalize is Some(..) but not unit length. Everything else
++        // (zero, huge, non-finite, ordinary vectors) is still checked here.
++        let ls64: f64 = a.iter().map(|&x| (x as f64) * (x as f64)).sum();
++        tc.assume(!(ls64 > 0.0 && ls64 < 1e-37));
++
++        if let Some(n) = v.try_normalize() {
++            assert!(
++                n.is_normalized(),
++                "Vec3::try_normalize({:?}) returned Some({:?}) with length {}",
++                v,
++                n,
++                n.length()
++            );
++        }
++        if let Some(n) = va.try_normalize() {
++            assert!(
++                n.is_normalized(),
++                "Vec3A::try_normalize({:?}) returned Some({:?}) with length {}",
++                va,
++                n,
++                n.length()
++            );
++        }
++
++        let nz = v.normalize_or_zero();
++        assert!(
++            nz == Vec3::ZERO || nz.is_normalized(),
++            "Vec3::normalize_or_zero({:?}) returned {:?} with length {}",
++            v,
++            nz,
++            nz.length()
++        );
++    }
++}
+diff --git a/tests/vec4.rs b/tests/vec4.rs
+index ac16aef..a9f0098 100644
+--- a/tests/vec4.rs
++++ b/tests/vec4.rs
+@@ -2959,3 +2959,99 @@ mod usizevec4 {
+     impl_vec4_scalar_bit_op_tests!(USizeVec4, 0, 2);
+     impl_vec4_bit_op_tests!(USizeVec4, 0, 2);
+ }
++
++// Hegel property-based tests.
++//
++// `Vec4` is backed by the SIMD backend (NEON/SSE2/WASM) when available. There
++// is no scalar twin type in the same build, so the oracle here is a
++// hand-written scalar reference computed from the components (the
++// fast-path-vs-generic pattern), plus `DVec4` as a higher-precision oracle.
++#[cfg(not(target_family = "wasm"))]
++mod hegel_props {
++    use glam::Vec4;
++    use hegel::generators;
++
++    /// Finite f32 with |x| <= 1e18 so squares and pairwise products cannot
++    /// overflow. This bound protects the tolerance analysis of the property
++    /// (no intermediate overflow in oracle or subject), not a library
++    /// contract.
++    fn bounded_component(tc: &hegel::TestCase) -> f32 {
++        tc.draw(generators::floats::<f32>().min_value(-1e18).max_value(1e18))
++    }
++
++    fn bounded_quad(tc: &hegel::TestCase) -> [f32; 4] {
++        [
++            bounded_component(tc),
++            bounded_component(tc),
++            bounded_component(tc),
++            bounded_component(tc),
++        ]
++    }
++
++    // Property: SIMD-backed Vec4 lane-wise ops agree exactly with a
++    // hand-written scalar reference on the components (IEEE per-lane ops
++    // have no reassociation freedom).
++    #[hegel::test]
++    fn hegel_vec4_lanewise_ops_match_scalar_reference(tc: hegel::TestCase) {
++        let a = bounded_quad(&tc);
++        let b = bounded_quad(&tc);
++        let (v, w) = (Vec4::from_array(a), Vec4::from_array(b));
++
++        let zip = |f: fn(f32, f32) -> f32| {
++            [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2]), f(a[3], b[3])]
++        };
++        assert_eq!((v + w).to_array(), zip(|x, y| x + y));
++        assert_eq!((v - w).to_array(), zip(|x, y| x - y));
++        assert_eq!((v * w).to_array(), zip(|x, y| x * y));
++        assert_eq!(v.min(w).to_array(), zip(f32::min));
++        assert_eq!(v.max(w).to_array(), zip(f32::max));
++        assert_eq!(v.abs().to_array(), a.map(f32::abs));
++    }
++
++    // Property: Vec4 dot and length agree with the f64 oracle (DVec4) within
++    // a tolerance calibrated to the magnitude of the intermediate products.
++    // This catches SIMD reduction-order divergence beyond a few ULP.
++    #[hegel::test]
++    fn hegel_vec4_dot_length_match_f64_oracle(tc: hegel::TestCase) {
++        let a = bounded_quad(&tc);
++        let b = bounded_quad(&tc);
++        let (v, w) = (Vec4::from_array(a), Vec4::from_array(b));
++        let (dv, dw) = (v.as_dvec4(), w.as_dvec4());
++
++        let dot64 = dv.dot(dw);
++        let dot_scale: f64 = dv
++            .to_array()
++            .iter()
++            .zip(dw.to_array().iter())
++            .map(|(x, y)| (x * y).abs())
++            .sum();
++        let dot_tol = 8.0 * f32::EPSILON as f64 * dot_scale + f32::MIN_POSITIVE as f64;
++        assert!(
++            (v.dot(w) as f64 - dot64).abs() <= dot_tol,
++            "Vec4 dot {} vs f64 oracle {} (tol {})",
++            v.dot(w),
++            dot64,
++            dot_tol
++        );
++
++        // Absolute term 4e-23 covers the subnormal regime: when
++        // length_squared lands in the f32 subnormal range its quantization
++        // error is amplified by the square root, with absolute error bounded
++        // by ~sqrt(min_subnormal) = sqrt(1.4e-45).
++        let len64 = dv.length();
++        let len_tol = 8.0 * f32::EPSILON as f64 * len64 + 4e-23;
++        assert!(
++            (v.length() as f64 - len64).abs() <= len_tol,
++            "Vec4 length {} vs f64 oracle {} (tol {})",
++            v.length(),
++            len64,
++            len_tol
++        );
++        assert!(
++            v.length_squared() == v.dot(v),
++            "Vec4 length_squared {} != dot(self, self) {}",
++            v.length_squared(),
++            v.dot(v)
++        );
++    }
++}

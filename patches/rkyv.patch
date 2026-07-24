@@ -1,0 +1,946 @@
+diff --git a/.gitignore b/.gitignore
+index 0987e1d..7661533 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,3 +13,6 @@ Cargo.lock
+ # checkin.
+ 
+ *~
++
++# Hegel property-testing failure database
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..f535193
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,218 @@
++# Hegel property-based testing report: rkyv
++
++Target: `rkyv` 0.8.17 (workspace member `rkyv`), commit `46e143d` ("Release
++0.8.17"). Tests written with `hegeltest` 0.28.2 (library crate `hegel`), added
++with `cargo add --dev hegeltest -p rkyv --ignore-rust-version` (rkyv pins
++`rust-version = 1.81`; hegeltest's MSRV is 1.86 — dev-dependency only).
++
++All properties were added to existing test modules alongside the code they
++exercise; no separate test file was created. `.hegel/` was added to
++`.gitignore`.
++
++## Properties tested
++
++Nine live properties plus one pinned (ignored) reproducer.
++
++1. **Rich derived-type roundtrip** — `impls::hegel_tests::roundtrip_rich_derived_type`
++   (`rkyv/src/impls/mod.rs`). A generated `Rich` value — nested structs, a
++   4-variant enum, `Vec`, `String`, `Option`, `Box`, `BTreeMap`, `HashMap`,
++   tuples, `[u16; 3]` arrays, all integer widths, non-NaN floats, `NonZeroU32`
++   — is put through `to_bytes` → validated `access` → `deserialize` and the
++   archived form is compared `PartialEq` to the original. Evidence: the
++   crate's own `roundtrip`/`roundtrip_with` test helpers and the derive-macro
++   feature set exercised in the hand-written `roundtrip_*` tests.
++
++2. **Recursive-type roundtrip at drawn depth** —
++   `impls::hegel_tests::roundtrip_recursive_type_at_depth`. A `Box`-recursive
++   `Chain` enum built to an explicitly drawn depth (0..=150) round-trips.
++   Evidence: the hand-written `recursive_structures`/`recursive_self_types`
++   tests, extended to sweep depth (Generator Discipline: "probe recursion
++   depth directly"). This property directly motivated the deep-recursion
++   investigation that found the validation stack-overflow bug below.
++
++3. **`f32` bit-exact roundtrip** —
++   `impls::core::primitive::hegel_tests::roundtrip_f32_bit_exact`. Draws a raw
++   `u32` bit pattern, so every NaN payload, both zeros, and both infinities
++   are covered — cases `PartialEq`-based round-trip cannot check. Asserts the
++   archived `to_native().to_bits()` and the deserialized `to_bits()` both
++   equal the original bits.
++
++4. **`f64` bit-exact roundtrip** — `...::roundtrip_f64_bit_exact`. Same, over
++   `u64` bit patterns.
++
++5. **`char` full-domain roundtrip** — `...::roundtrip_char_full_domain`.
++   Every Unicode scalar value up to `char::MAX` round-trips. Evidence: the
++   hand-written `roundtrip_multibyte_primitives` uses only two chars.
++
++6. **Generated `HashMap` agreement** —
++   `impls::std::collections::hash_map::tests::roundtrip_generated_hash_map`.
++   Size drawn up to 192 (multiple swiss-table groups); checks length,
++   bidirectional membership, per-key lookups, and a usually-absent probe key
++   against the source map. Evidence: the crate's `assert_equal` helper and
++   `large_hash_map`.
++
++7. **Generated `BTreeMap` agreement, deep** —
++   `impls::alloc::collections::btree_map::tests::roundtrip_generated_btree_map_deep`.
++   Size drawn up to 300 (branching factor 6 → multi-level trees); checks
++   length, sorted iteration order, per-key lookups, a probe key, and full
++   `deserialize` equality. Evidence: `roundtrip_btree_map_increasing_sizes`
++   and `size_matches_iter_len`, which document the branch-factor size
++   boundaries.
++
++8. **Generated `String` roundtrip across the inline boundary** —
++   `impls::alloc::string::tests::roundtrip_generated_string`. Char count drawn
++   around 0..=72 so multi-byte characters push the *byte* length across
++   `ArchivedString`'s inline/out-of-line `INLINE_CAPACITY` boundary at varied
++   offsets. Evidence: `string/repr.rs` inline representation.
++
++9. **Generated `Vec` roundtrip** —
++   `impls::alloc::vec::tests::roundtrip_generated_vec_i64` (full-range `i64`,
++   size up to 300) and `roundtrip_generated_vec_u8` (size up to 1024, exercises
++   the `COPY_OPTIMIZATION` memcpy path). Evidence: the hand-written
++   `roundtrip_vec` tests.
++
++10. **Validation robustness (five properties, `rkyv/tests/fuzz.rs`,
++    `mod hegel_robustness`)** — rkyv's core safety promise: the checked access
++    path must return an `Err` on untrusted/corrupted input, never panic or
++    UB-read. Evidence: the existing `.bin` regression `fuzz_target!`s and the
++    validation book chapter.
++    - `from_bytes_arbitrary_bytes_never_panics` — `from_bytes` on arbitrary
++      bytes (up to 256) never panics, for `ComplexBag` and
++      `HashMap<String, Vec<u32>>` (the same target types as the crate's
++      fuzz corpus).
++    - `access_bit_flipped_archive_never_panics` — 1–8 random bit flips in a
++      valid archive: `access` never panics; if it still returns `Ok`,
++      `deserialize` is also safe. Buffer kept in `AlignedVec` so corruption,
++      not misalignment, is what validation sees.
++    - `access_truncated_archive_never_panics` — truncation to any smaller
++      length never panics; a buffer too small for the root is rejected.
++    - `checked_and_unchecked_access_agree` — on a valid archive, checked
++      `access` and `access_unchecked` return the same root pointer, and the
++      value deserialized through the unchecked path equals the original.
++    - `access_misaligned_buffer_errors` — a guaranteed-misaligned slice is
++      rejected with `Err` (this was also the liveness-check target — see
++      below).
++
++## Test results
++
++- `cargo test -p rkyv --lib`: 173 passed, 0 failed (168 pre-existing + 5 new).
++- `cargo test -p rkyv --test fuzz`: 12 passed, 1 ignored, 0 failed (7
++  pre-existing `.bin` targets + 5 new properties; 1 ignored reproducer).
++- `cargo test -p rkyv --test derive`: unchanged, passing.
++- All new live properties also passed an exploratory 10x run
++  (`test_cases = 1000`), then were reverted to the default 100.
++
++**Liveness verified.** Inverting `access_misaligned_buffer_errors` to
++`assert!(result.is_ok())` produced a shrunk counterexample
++(`ComplexBag { names: [], counters: None, payload: [], flag: false }`,
++`offset = 1`) confirming the engine generates and shrinks; then reverted and
++the `.hegel/` DB deleted.
++
++## Suspected bugs
++
++### 1. Unbounded recursion in bytecheck validation → stack overflow / process abort (primary)
++
++`rkyv::access` (and `from_bytes`) — the checked, "safe" entry point —
++validates a recursively-nested archive using unbounded native recursion, so a
++**valid** archive nested a few thousand levels deep overflows the stack and
++**aborts the process (SIGABRT)** instead of returning an `Err`.
++
++This contradicts the validation book chapter (`book_src/validation.md`), which
++states archive validation "secures against recursion attacks", and it defeats
++the whole purpose of the checked API: an attacker who can hand a byte buffer to
++a program that calls `access`/`from_bytes` on it can crash that program (a
++denial-of-service), which the safe API is specifically meant to prevent.
++
++Minimal counterexample / reproduction (pinned, `#[ignore]`d, in
++`rkyv/tests/fuzz.rs`, `mod recursion_dos`):
++
++```rust
++enum Chain { End, Link { val: u32, #[rkyv(omit_bounds)] next: Box<Chain> } }
++// build Chain nested DEPTH deep, then:
++let bytes = to_bytes::<Error>(&value).unwrap();   // rkyv serializes it fine
++let _ = access::<Archived<Chain>, Error>(&bytes); // <-- stack overflow, SIGABRT
++```
++
++Observed thresholds on this host (default features, standard 2 MiB test-thread
++stack): serialization succeeds through depth ≥ 3500, but `access` on the
++resulting valid bytes already overflows at depth ~2500 (works at 2000). Depth
++5000 reproduces reliably. Confirmed by running the ignored test with
++`--ignored`: `has overflowed its stack / fatal runtime error: stack overflow,
++aborting` → `signal: 6, SIGABRT`.
++
++Code path: `access` → `check_pos_with_context` → the derived `CheckBytes` for
++`ArchivedChain`, which recurses into the `Box<Chain>` field's `CheckBytes`
++(`rel_ptr` deref → subtree push → recurse) once per nesting level with no depth
++limit. `rkyv/src/api/checked.rs` (`access`/`check_pos_with_context`) and the
++`bytecheck` validator in `rkyv/src/validation/`.
++
++Because a process abort is not catchable, this is kept as an `#[ignore]`d
++reproducer rather than a live property (a live failing test would take the
++whole `fuzz` binary down with it), per the skill's process-abort handling. The
++serializer (`to_bytes`) is *also* recursive and overflows at higher depths, but
++that runs on the program's own trusted data; the security-relevant defect is in
++validation of untrusted input.
++
++Note: `SECURITY.md` asks that issues found primarily with automated AI tools
++skip responsible disclosure and be filed directly on the issue tracker.
++
++### 2. Silent truncation of `usize`/`isize` values wider than the archived pointer width (secondary, lower severity)
++
++With default features, `usize` archives as `FixedUsize = u32`. `Archive for
++usize` does `out.write(ArchivedUsize::from_native(*self as _))`, an unchecked
++`as` cast: serializing a `usize` value of `2^32` returns `Ok` and the value
++round-trips to **`0`** — silent data corruption with no error. Verified
++directly: `2^32` → deserialized `0`.
++
++This is arguably a documented consequence of the default pointer width (the
++crate's own `roundtrip_sizes` test deliberately compares via
++`usize::try_from(b.to_native())` with a small value, showing the maintainers
++know `usize` archives to `u32`), so it is reported as a lower-severity
++observation rather than pinned with a failing test — a full-range `usize`
++round-trip assertion would be testing outside the documented format domain. It
++is still worth flagging that `serialize` truncates silently rather than
++returning an error. No committed test asserts full-range `usize` round-trip;
++`AllScalars` in the rich-type test deliberately omits `usize`/`isize` (their
++archived forms also lack `PartialEq` against the native types).
++
++## Unsound properties abandoned
++
++- **Full-range `usize`/`isize` exact round-trip** — abandoned as a *live*
++  property because the archived form (`FixedUsize`/`FixedIsize`, u32 by
++  default) is a documented narrowing of the native type; a naive round-trip
++  assertion fails outside the documented domain. Kept only as the
++  lower-severity observation above. Also, `ArchivedUsize`/`ArchivedIsize` don't
++  implement `PartialEq` against `usize`/`isize`, so they can't participate in
++  `compare(PartialEq)` derived comparisons at all.
++- **`String`-keyed `HashMap`/`BTreeMap` inside a `compare(PartialEq)` struct** —
++  `ArchivedHashMap<AK,_>: PartialEq<HashMap<K,_>>` requires `K: Borrow<AK>`,
++  which `String`/`ArchivedString` do not satisfy. Not a bug — a `PartialEq`
++  bound limitation. The rich-type test therefore uses `u8` keys for its inline
++  `HashMap`; string-keyed maps are covered by the dedicated map properties
++  (6, 7) which compare via iteration/lookup instead of `PartialEq`.
++- **NaN floats under `compare(PartialEq)`** — NaN ≠ NaN, so a struct deriving
++  `compare(PartialEq)` cannot hold for NaN fields. Bit-exact NaN round-tripping
++  is instead covered structurally by properties 3 and 4 (`to_bits`
++  comparison), which is the correct oracle for float identity.
++
++## Skill feedback
++
++- The Rust reference's guidance was accurate and sufficient; `#[hegel::composite]`,
++  `one_of!`, `tuples!`, `arrays`, `hashmaps`, and `optional` all worked as
++  documented. The note that recursive composites don't compile was relevant —
++  the recursive `Chain` generator was built imperatively (draw a `Vec` of
++  values, fold into the structure) rather than via a self-referential
++  composite, which sidestepped it cleanly.
++- The process-abort handling guidance ("keep a minimal reproducer
++  ignored/skipped ... document the bug prominently") was exactly right for the
++  validation stack-overflow bug and mapped directly onto the deliverable. One
++  refinement worth adding to the skill: when a recursive structure is validated
++  through a *checked* deserialization API whose contract is specifically "never
++  crash on untrusted input", a stack-overflow-on-valid-input is a
++  *security-contract* violation, not merely a robustness nit — worth calling
++  out that the "probe recursion depth directly" lesson is highest-value against
++  validating/parsing entry points that make an explicit safety promise.
++- Minor: `AllScalars` deriving `compare(PartialEq)` surfaced that
++  `ArchivedUsize`/`ArchivedIsize` lack `PartialEq` against native types. The
++  reference could note that `usize`/`isize` fields don't participate in
++  `compare(PartialEq)`, saving a compile-fix cycle.
+diff --git a/rkyv/Cargo.toml b/rkyv/Cargo.toml
+index 8ec17d5..e5ba537 100644
+--- a/rkyv/Cargo.toml
++++ b/rkyv/Cargo.toml
+@@ -73,6 +73,7 @@ features = ["bytecheck"]
+ ahash = "0.8"
+ benchlib = { path = "../benchlib" }
+ divan.workspace = true
++hegeltest = "0.28.2"
+ rustversion.workspace = true
+ trybuild.workspace = true
+ 
+diff --git a/rkyv/src/impls/alloc/collections/btree_map.rs b/rkyv/src/impls/alloc/collections/btree_map.rs
+index 91f57d2..b1d4d0b 100644
+--- a/rkyv/src/impls/alloc/collections/btree_map.rs
++++ b/rkyv/src/impls/alloc/collections/btree_map.rs
+@@ -309,4 +309,59 @@ mod tests {
+             container.check(expected);
+         }
+     }
++
++    // Hegel property: an archived B-tree map built from generated contents
++    // matches the source map: same length, iteration yields the same entries
++    // in the same (sorted) order, lookups agree (including a probe key that
++    // is usually absent), and deserialization returns the original map. The
++    // size is drawn explicitly up to 300 so that multi-level trees are
++    // exercised (branching factor 6; see
++    // `roundtrip_btree_map_increasing_sizes`).
++    #[cfg(feature = "std")]
++    #[hegel::test]
++    fn roundtrip_generated_btree_map_deep(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        use crate::api::test::deserialize;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let pairs: Vec<(String, i32)> = tc.draw(
++            generators::vecs(generators::tuples!(
++                generators::text().max_size(12),
++                generators::integers::<i32>(),
++            ))
++            .min_size(n),
++        );
++        let map: BTreeMap<String, i32> = pairs.into_iter().collect();
++        let probe: String = tc.draw(generators::text().max_size(12));
++
++        to_archived(&map, |archived| {
++            assert_eq!(archived.len(), map.len());
++
++            // Iteration over the archived tree matches the sorted iteration
++            // order of the source map exactly.
++            let mut entries = map.iter();
++            for (k, v) in archived.iter() {
++                let (ek, ev) = entries.next().unwrap();
++                assert_eq!(k.as_str(), ek);
++                assert_eq!(v.to_native(), *ev);
++            }
++            assert!(entries.next().is_none());
++
++            // Lookups agree with the source map.
++            for (k, v) in map.iter() {
++                assert_eq!(
++                    archived.get(k.as_str()).map(|v| v.to_native()),
++                    Some(*v)
++                );
++            }
++            assert_eq!(
++                archived.contains_key(probe.as_str()),
++                map.contains_key(&probe)
++            );
++
++            let deserialized: BTreeMap<String, i32> = deserialize(&*archived);
++            assert_eq!(deserialized, map);
++        });
++    }
+ }
+diff --git a/rkyv/src/impls/alloc/string.rs b/rkyv/src/impls/alloc/string.rs
+index 4439dc1..6bea5ee 100644
+--- a/rkyv/src/impls/alloc/string.rs
++++ b/rkyv/src/impls/alloc/string.rs
+@@ -93,4 +93,20 @@ mod tests {
+         roundtrip(&Err::<(), _>("".to_string()));
+         roundtrip(&Err::<(), _>("hello world".to_string()));
+     }
++
++    // Hegel property: arbitrary Unicode strings round-trip. Lengths are drawn
++    // across 0..=64 characters so both `ArchivedString` representations are
++    // exercised: multi-byte characters make short *char* counts cross the
++    // inline/out-of-line *byte* boundary (`INLINE_CAPACITY`) at many
++    // different offsets.
++    #[cfg(feature = "std")]
++    #[hegel::test]
++    fn roundtrip_generated_string(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(64));
++        let s: String =
++            tc.draw(generators::text().min_size(n).max_size(n + 8));
++        roundtrip(&s);
++    }
+ }
+diff --git a/rkyv/src/impls/alloc/vec.rs b/rkyv/src/impls/alloc/vec.rs
+index 31e6f9a..6261377 100644
+--- a/rkyv/src/impls/alloc/vec.rs
++++ b/rkyv/src/impls/alloc/vec.rs
+@@ -110,4 +110,32 @@ mod tests {
+         roundtrip(&Err::<(), _>(Vec::<i32>::new()));
+         roundtrip(&Err::<(), _>(vec![1, 2, 3, 4]));
+     }
++
++    // Hegel property: vectors of full-range `i64` round-trip at sizes drawn
++    // explicitly from 0..=300, covering the empty case and lengths well past
++    // what the hand-written tests use.
++    #[cfg(feature = "std")]
++    #[hegel::test]
++    fn roundtrip_generated_vec_i64(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let v: Vec<i64> = tc.draw(
++            generators::vecs(generators::integers::<i64>()).min_size(n),
++        );
++        roundtrip(&v);
++    }
++
++    // Hegel property: `Vec<u8>` round-trips. `u8` elements take the
++    // `COPY_OPTIMIZATION` (memcpy) serialization path, which the `i64`
++    // property above does not exercise.
++    #[cfg(feature = "std")]
++    #[hegel::test]
++    fn roundtrip_generated_vec_u8(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(1024));
++        let v: Vec<u8> = tc.draw(generators::binary().min_size(n));
++        roundtrip(&v);
++    }
+ }
+diff --git a/rkyv/src/impls/core/primitive.rs b/rkyv/src/impls/core/primitive.rs
+index 39bd07d..617e534 100644
+--- a/rkyv/src/impls/core/primitive.rs
++++ b/rkyv/src/impls/core/primitive.rs
+@@ -456,3 +456,50 @@ mod tests {
+         });
+     }
+ }
++
++// Hegel property-based tests (require `std` for the hegel engine).
++#[cfg(all(test, feature = "std"))]
++mod hegel_tests {
++    use hegel::generators::{self, Generator};
++
++    use crate::api::test::{deserialize, roundtrip, to_archived};
++
++    // Property: `f32` round-trips bit-exactly through archive and
++    // deserialize. Drawing the raw bit pattern covers every value including
++    // all NaN payloads (quiet and signaling), infinities, and both zeros,
++    // which `PartialEq`-based round-trip tests cannot check.
++    #[hegel::test]
++    fn roundtrip_f32_bit_exact(tc: hegel::TestCase) {
++        let bits = tc.draw(generators::integers::<u32>());
++        let value = f32::from_bits(bits);
++        to_archived(&value, |archived| {
++            assert_eq!(archived.to_native().to_bits(), bits);
++            let deserialized: f32 = deserialize(&*archived);
++            assert_eq!(deserialized.to_bits(), bits);
++        });
++    }
++
++    // Property: `f64` round-trips bit-exactly (see `roundtrip_f32_bit_exact`).
++    #[hegel::test]
++    fn roundtrip_f64_bit_exact(tc: hegel::TestCase) {
++        let bits = tc.draw(generators::integers::<u64>());
++        let value = f64::from_bits(bits);
++        to_archived(&value, |archived| {
++            assert_eq!(archived.to_native().to_bits(), bits);
++            let deserialized: f64 = deserialize(&*archived);
++            assert_eq!(deserialized.to_bits(), bits);
++        });
++    }
++
++    // Property: every `char` (the full Unicode scalar value domain, including
++    // surrogates-adjacent boundaries and the maximum code point) round-trips.
++    #[hegel::test]
++    fn roundtrip_char_full_domain(tc: hegel::TestCase) {
++        let c = tc.draw(
++            generators::integers::<u32>()
++                .max_value(char::MAX as u32)
++                .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++        );
++        roundtrip(&c);
++    }
++}
+diff --git a/rkyv/src/impls/mod.rs b/rkyv/src/impls/mod.rs
+index 0e14364..eaf3fb7 100644
+--- a/rkyv/src/impls/mod.rs
++++ b/rkyv/src/impls/mod.rs
+@@ -805,3 +805,234 @@ mod alloc_tests {
+         });
+     }
+ }
++
++// Hegel property-based tests. These generate random values and check the
++// serialize -> access (validated) -> deserialize pipeline against the
++// original value. They require `std` because the hegel engine does.
++#[cfg(all(test, feature = "std"))]
++mod hegel_tests {
++    use core::num::NonZeroU32;
++    use std::collections::{BTreeMap, HashMap};
++
++    use hegel::generators::{self, Generator};
++    use rancor::Source;
++
++    use crate::{
++        api::test::roundtrip, ser::Writer, Archive, Deserialize, Serialize,
++    };
++
++    #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
++    #[rkyv(crate, compare(PartialEq), derive(Debug))]
++    struct AllScalars {
++        b: bool,
++        c: char,
++        i1: i8,
++        i2: i16,
++        i3: i32,
++        i4: i64,
++        i5: i128,
++        u1: u8,
++        u2: u16,
++        u3: u32,
++        u4: u64,
++        u5: u128,
++        // Non-NaN floats: `compare(PartialEq)` can't hold for NaN. Bit-exact
++        // float round-tripping (including NaN payloads) is covered by
++        // `roundtrip_f32_bit_exact`/`roundtrip_f64_bit_exact` in
++        // `impls::core::primitive`.
++        f1: f32,
++        f2: f64,
++        // Note: no `usize`/`isize` fields here. Their archived forms
++        // (`FixedUsize`/`FixedIsize`) don't implement `PartialEq` against the
++        // native types, so `compare(PartialEq)` can't be derived with them.
++        nz: Option<NonZeroU32>,
++    }
++
++    #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
++    #[rkyv(crate, compare(PartialEq), derive(Debug))]
++    enum Kind {
++        Unit,
++        Int(i64),
++        Text { s: String, n: u32 },
++        Many(Vec<AllScalars>),
++    }
++
++    #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
++    #[rkyv(crate, compare(PartialEq), derive(Debug))]
++    struct Inner {
++        scalars: AllScalars,
++        items: Vec<String>,
++        opt: Option<u64>,
++        tup: (u8, i32, String),
++        arr: [u16; 3],
++    }
++
++    #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
++    #[rkyv(crate, compare(PartialEq), derive(Debug))]
++    struct Rich {
++        kind: Kind,
++        kinds: Vec<Kind>,
++        boxed: Box<Inner>,
++        maybe: Option<Box<Kind>>,
++        bytes: Vec<u8>,
++        btree: BTreeMap<String, Inner>,
++        // `u8` keys: `ArchivedHashMap<AK, _>: PartialEq<HashMap<K, _>>`
++        // requires `K: Borrow<AK>`, which `String`/`ArchivedString` don't
++        // satisfy. String-keyed maps are covered by the hegel test in
++        // `impls::std::collections::hash_map`.
++        hmap: HashMap<u8, i64>,
++        pairs: Vec<(String, Option<i32>)>,
++    }
++
++    #[hegel::composite]
++    fn chars(tc: hegel::TestCase) -> char {
++        tc.draw(
++            hegel::one_of!(
++                generators::integers::<u32>().max_value(0x7F),
++                generators::integers::<u32>().max_value(0x10_FFFF),
++            )
++            .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++        )
++    }
++
++    #[hegel::composite]
++    fn all_scalars(tc: hegel::TestCase) -> AllScalars {
++        AllScalars {
++            b: tc.draw(generators::booleans()),
++            c: tc.draw(chars()),
++            i1: tc.draw(generators::integers::<i8>()),
++            i2: tc.draw(generators::integers::<i16>()),
++            i3: tc.draw(generators::integers::<i32>()),
++            i4: tc.draw(generators::integers::<i64>()),
++            i5: tc.draw(generators::integers::<i128>()),
++            u1: tc.draw(generators::integers::<u8>()),
++            u2: tc.draw(generators::integers::<u16>()),
++            u3: tc.draw(generators::integers::<u32>()),
++            u4: tc.draw(generators::integers::<u64>()),
++            u5: tc.draw(generators::integers::<u128>()),
++            f1: tc.draw(generators::floats::<f32>().allow_nan(false)),
++            f2: tc.draw(generators::floats::<f64>().allow_nan(false)),
++            nz: tc
++                .draw(generators::optional(
++                    generators::integers::<u32>().min_value(1),
++                ))
++                .map(|n| NonZeroU32::new(n).unwrap()),
++        }
++    }
++
++    #[hegel::composite]
++    fn kinds(tc: hegel::TestCase) -> Kind {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => Kind::Unit,
++            1 => Kind::Int(tc.draw(generators::integers::<i64>())),
++            2 => Kind::Text {
++                s: tc.draw(generators::text().max_size(24)),
++                n: tc.draw(generators::integers::<u32>()),
++            },
++            _ => Kind::Many(tc.draw(generators::vecs(all_scalars()).max_size(4))),
++        }
++    }
++
++    #[hegel::composite]
++    fn inners(tc: hegel::TestCase) -> Inner {
++        Inner {
++            scalars: tc.draw(all_scalars()),
++            items: tc.draw(
++                generators::vecs(generators::text().max_size(16)).max_size(4),
++            ),
++            opt: tc.draw(generators::optional(generators::integers::<u64>())),
++            tup: tc.draw(generators::tuples!(
++                generators::integers::<u8>(),
++                generators::integers::<i32>(),
++                generators::text().max_size(12),
++            )),
++            arr: tc.draw(generators::arrays(generators::integers::<u16>())),
++        }
++    }
++
++    #[hegel::composite]
++    fn riches(tc: hegel::TestCase) -> Rich {
++        Rich {
++            kind: tc.draw(kinds()),
++            kinds: tc.draw(generators::vecs(kinds()).max_size(4)),
++            boxed: Box::new(tc.draw(inners())),
++            maybe: tc
++                .draw(generators::optional(kinds()))
++                .map(Box::new),
++            bytes: tc.draw(generators::binary().max_size(64)),
++            btree: tc
++                .draw(
++                    generators::vecs(generators::tuples!(
++                        generators::text().max_size(12),
++                        inners(),
++                    ))
++                    .max_size(4),
++                )
++                .into_iter()
++                .collect(),
++            hmap: tc.draw(
++                generators::hashmaps(
++                    generators::integers::<u8>(),
++                    generators::integers::<i64>(),
++                )
++                .max_size(8),
++            ),
++            pairs: tc.draw(
++                generators::vecs(generators::tuples!(
++                    generators::text().max_size(12),
++                    generators::optional(generators::integers::<i32>()),
++                ))
++                .max_size(6),
++            ),
++        }
++    }
++
++    // Property: a rich derived type (nested structs/enums, containers,
++    // tuples, arrays, all scalar types) survives
++    // serialize -> validated access -> deserialize, and the archived value
++    // compares equal to the original (`compare(PartialEq)`).
++    #[hegel::test]
++    fn roundtrip_rich_derived_type(tc: hegel::TestCase) {
++        let value = tc.draw(riches());
++        roundtrip(&value);
++    }
++
++    #[derive(Archive, Serialize, Deserialize, Debug, PartialEq)]
++    #[rkyv(
++        crate,
++        bytecheck(bounds(__C: crate::validation::ArchiveContext)),
++        serialize_bounds(__S: Writer),
++        deserialize_bounds(__D::Error: Source),
++        compare(PartialEq),
++        derive(Debug),
++    )]
++    enum Chain {
++        End,
++        Link {
++            val: u32,
++            #[rkyv(omit_bounds)]
++            next: Box<Chain>,
++        },
++    }
++
++    // Property: recursive types round-trip at nesting depths well past what
++    // the hand-written `recursive_structures` test covers. Depth is drawn
++    // explicitly so deep structure paths are actually exercised.
++    #[hegel::test]
++    fn roundtrip_recursive_type_at_depth(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().max_value(150));
++        let vals: Vec<u32> = tc.draw(
++            generators::vecs(generators::integers::<u32>())
++                .min_size(depth)
++                .max_size(depth),
++        );
++        let mut chain = Chain::End;
++        for val in vals {
++            chain = Chain::Link {
++                val,
++                next: Box::new(chain),
++            };
++        }
++        roundtrip(&chain);
++    }
++}
+diff --git a/rkyv/src/impls/std/collections/hash_map.rs b/rkyv/src/impls/std/collections/hash_map.rs
+index a5f0742..8651530 100644
+--- a/rkyv/src/impls/std/collections/hash_map.rs
++++ b/rkyv/src/impls/std/collections/hash_map.rs
+@@ -296,4 +296,30 @@ mod tests {
+         // This .unwrap() fails!
+         let _decoded = access::<Archived<MyHashMap>, Panic>(&encoded).unwrap();
+     }
++
++    // Hegel property: an archived hash map built from generated contents
++    // agrees with the source map on length, membership, and lookups in both
++    // directions (every source key is found in the archive and every archived
++    // entry exists in the source), including a probe key that is usually
++    // absent. Sizes are drawn explicitly so large maps (multiple swiss-table
++    // groups) are exercised.
++    #[hegel::test]
++    fn roundtrip_generated_hash_map(tc: hegel::TestCase) {
++        use hegel::generators;
++
++        let n = tc.draw(generators::integers::<usize>().max_value(192));
++        let map: HashMap<String, i64> = tc.draw(
++            generators::hashmaps(
++                generators::text().max_size(16),
++                generators::integers::<i64>(),
++            )
++            .min_size(n),
++        );
++        let probe: String = tc.draw(generators::text().max_size(16));
++
++        roundtrip_with(&map, |a, b| {
++            assert_equal(a, b);
++            assert_eq!(a.contains_key(&probe), b.contains_key(probe.as_str()));
++        });
++    }
+ }
+diff --git a/rkyv/tests/fuzz.rs b/rkyv/tests/fuzz.rs
+index b1d07a3..541e76c 100644
+--- a/rkyv/tests/fuzz.rs
++++ b/rkyv/tests/fuzz.rs
+@@ -26,7 +26,7 @@ fuzz_target!(hashmap_string_oob_read as HashMap<String, Vec<u32>>);
+ fuzz_target!(hashmap_simd_oob_read as HashMap<String, Vec<u32>>);
+ fuzz_target!(hashmap_u64_bytes_oob as HashMap<u64, Vec<u8>>);
+ 
+-#[derive(Archive, Deserialize, Serialize)]
++#[derive(Archive, Deserialize, Serialize, Debug)]
+ struct ComplexBag {
+     names: Vec<String>,
+     counters: Option<HashMap<String, u32>>,
+@@ -45,3 +45,230 @@ fuzz_target!(
+     hashmap_archivedstring_deserialize_segv_alt_vec_wrapper
+         as Vec<HashMap<String, String>>
+ );
++
++// Hegel property-based robustness tests. These check rkyv's core safety
++// promise: the checked access path (`access`/`from_bytes`) must return an
++// error on untrusted or corrupted input -- it must never panic or read out
++// of bounds. The `.bin` regression tests above pin inputs that violated this
++// in the past; these properties search for new ones.
++mod hegel_robustness {
++    use std::collections::HashMap;
++
++    use hegel::generators;
++    use rkyv::{
++        access, access_unchecked, deserialize, from_bytes, rancor::Error,
++        to_bytes, util::AlignedVec, Archived,
++    };
++
++    use super::ComplexBag;
++
++    #[hegel::composite]
++    fn complex_bags(tc: hegel::TestCase) -> ComplexBag {
++        let counters = if tc.draw(generators::booleans()) {
++            Some(tc.draw(
++                generators::hashmaps(
++                    generators::text().max_size(12),
++                    generators::integers::<u32>(),
++                )
++                .max_size(6),
++            ))
++        } else {
++            None
++        };
++        ComplexBag {
++            names: tc.draw(
++                generators::vecs(generators::text().max_size(12)).max_size(6),
++            ),
++            counters,
++            payload: Box::new(
++                tc.draw(
++                    generators::vecs(generators::integers::<u64>())
++                        .max_size(8),
++                ),
++            ),
++            flag: tc.draw(generators::booleans()),
++        }
++    }
++
++    // Property: `from_bytes` (validated access + deserialize) on completely
++    // arbitrary bytes returns without panicking. This is the same property
++    // the crate's own fuzz targets check, with the same target types.
++    #[hegel::test]
++    fn from_bytes_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(256));
++        let data: Vec<u8> = tc.draw(generators::binary().min_size(n));
++        let _ = from_bytes::<ComplexBag, Error>(&data);
++        let _ = from_bytes::<HashMap<String, Vec<u32>>, Error>(&data);
++    }
++
++    // Property: flipping arbitrary bits in a valid archive must not cause
++    // `access` to panic; it may either detect the corruption (Err) or accept
++    // a still-valid archive (Ok), in which case deserialization must also be
++    // safe. The buffer stays in an `AlignedVec` so corruption -- not
++    // misalignment -- is what validation sees.
++    #[hegel::test]
++    fn access_bit_flipped_archive_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw(complex_bags());
++        let mut bytes = to_bytes::<Error>(&value).unwrap();
++        assert!(!bytes.is_empty());
++
++        let flips =
++            tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..flips {
++            let bit = tc.draw(
++                generators::integers::<usize>()
++                    .max_value(bytes.len() * 8 - 1),
++            );
++            bytes[bit / 8] ^= 1 << (bit % 8);
++        }
++
++        if let Ok(archived) = access::<Archived<ComplexBag>, Error>(&bytes) {
++            // Validation accepted the mutated buffer, so it must also be
++            // safe to deserialize.
++            let _ = deserialize::<ComplexBag, Error>(archived);
++        }
++    }
++
++    // Property: truncating a valid archive must not cause `access` to panic,
++    // and any buffer too small to hold the root must be rejected.
++    #[hegel::test]
++    fn access_truncated_archive_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw(complex_bags());
++        let bytes = to_bytes::<Error>(&value).unwrap();
++
++        let new_len = tc.draw(
++            generators::integers::<usize>().max_value(bytes.len() - 1),
++        );
++        let truncated = &bytes[..new_len];
++
++        let result = access::<Archived<ComplexBag>, Error>(truncated);
++        if new_len < size_of::<Archived<ComplexBag>>() {
++            assert!(result.is_err());
++        }
++        if let Ok(archived) = result {
++            let _ = deserialize::<ComplexBag, Error>(archived);
++        }
++    }
++
++    // Property: checked and unchecked access agree on a valid archive: they
++    // return the same root reference, and the value deserialized through the
++    // unchecked path equals the original.
++    #[hegel::test]
++    fn checked_and_unchecked_access_agree(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(48));
++        let value: HashMap<String, String> = tc.draw(
++            generators::hashmaps(
++                generators::text().max_size(12),
++                generators::text().max_size(12),
++            )
++            .min_size(n),
++        );
++        let bytes = to_bytes::<Error>(&value).unwrap();
++
++        let checked =
++            access::<Archived<HashMap<String, String>>, Error>(&bytes)
++                .unwrap();
++        let unchecked = unsafe {
++            access_unchecked::<Archived<HashMap<String, String>>>(&bytes)
++        };
++        assert!(std::ptr::eq(checked, unchecked));
++
++        let roundtripped: HashMap<String, String> =
++            deserialize::<_, Error>(unchecked).unwrap();
++        assert_eq!(roundtripped, value);
++    }
++
++    // Property: the checked access path rejects under-aligned buffers with
++    // an error instead of performing a misaligned read.
++    #[hegel::test]
++    fn access_misaligned_buffer_errors(tc: hegel::TestCase) {
++        let value = tc.draw(complex_bags());
++        let bytes = to_bytes::<Error>(&value).unwrap();
++
++        let align = align_of::<Archived<ComplexBag>>();
++        assert!(align > 1);
++        // Copy the valid archive to an offset that breaks its alignment
++        // while keeping the underlying allocation over-aligned, so the slice
++        // start is *guaranteed* misaligned.
++        let offset = tc.draw(
++            generators::integers::<usize>()
++                .min_value(1)
++                .max_value(align - 1),
++        );
++        let mut buf = AlignedVec::<16>::new();
++        buf.resize(offset, 0);
++        buf.extend_from_slice(&bytes);
++
++        let result =
++            access::<Archived<ComplexBag>, Error>(&buf[offset..]);
++        assert!(result.is_err());
++    }
++}
++
++// KNOWN FAILURE (aborts the process -- kept `#[ignore]`d so it does not take
++// the whole test binary down; see HEGEL_REPORT.md "Suspected bugs").
++//
++// The validation book chapter claims archive validation "secures against
++// recursion attacks", but `access` (the checked/safe entry point) validates
++// a recursively-nested archive with unbounded native recursion. A valid
++// archive nested a few thousand levels deep -- well within what rkyv's own
++// serializer produces without error -- overflows the stack and aborts the
++// process (SIGABRT) instead of returning an `Err`. Because a process abort
++// is not catchable, this cannot be a live property test; it is pinned here
++// as an ignored reproducer.
++//
++// Observed thresholds on this host (default features, standard 2 MiB test
++// thread stack): serialization succeeds through depth >= 3500, but `access`
++// on the resulting valid bytes already overflows the stack at depth ~2500.
++// Depth 5000 reproduces reliably.
++mod recursion_dos {
++    use rkyv::{
++        access, rancor::Error, ser::Writer, to_bytes, validation,
++        Archive, Archived, Deserialize, Serialize,
++    };
++
++    #[derive(Archive, Serialize, Deserialize)]
++    #[rkyv(
++        bytecheck(bounds(__C: validation::ArchiveContext)),
++        serialize_bounds(__S: Writer),
++        deserialize_bounds(__D::Error: rkyv::rancor::Source),
++    )]
++    enum Chain {
++        End,
++        Link {
++            val: u32,
++            #[rkyv(omit_bounds)]
++            next: Box<Chain>,
++        },
++    }
++
++    // Iterative teardown so dropping the value does not itself recurse.
++    fn dismantle(mut c: Chain) {
++        while let Chain::Link { next, .. } = c {
++            c = *next;
++        }
++    }
++
++    #[ignore = "aborts the process via stack overflow: unbounded recursion in \
++                bytecheck validation of a valid deeply-nested archive"]
++    #[test]
++    fn access_deeply_nested_archive_overflows_stack() {
++        const DEPTH: usize = 5000;
++
++        let mut value = Chain::End;
++        for i in 0..DEPTH {
++            value = Chain::Link {
++                val: i as u32,
++                next: Box::new(value),
++            };
++        }
++
++        // rkyv's own serializer accepts this value without error.
++        let bytes = to_bytes::<Error>(&value).unwrap();
++        dismantle(value);
++
++        // The checked entry point should return an Err for input it cannot
++        // safely validate. Instead this call overflows the stack and aborts.
++        let _ = access::<Archived<Chain>, Error>(&bytes);
++    }
++}

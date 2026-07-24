@@ -1,0 +1,771 @@
+diff --git a/.gitignore b/.gitignore
+index 5cb9f6a..6dda583 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,5 @@
+ /target
+ **/*.rs.bk
+ Cargo.lock
+-.vscode
+\ No newline at end of file
++.vscode
++.hegel/
+\ No newline at end of file
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..16e0a59
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,163 @@
++# Hegel Property-Based Testing Report: `postcard`
++
++Property-based tests were added to the `postcard` crate (`source/postcard`)
++using [hegel](https://hegel.dev) (`hegeltest` dev-dependency). Tests live in
++the existing integration test files:
++
++- `source/postcard/tests/loopback.rs` (module `hegel_props`, 24 tests)
++- `source/postcard/tests/accumulator.rs` (module `hegel_props`, 1 test)
++
++All properties are grounded in the postcard wire-format specification
++(`spec/src/wire-format.md`) and the documented contracts of the public API.
++
++## Properties tested
++
++1. **Rich derived-type round-trip** (`prop_rich_message_roundtrip`):
++   `from_bytes(to_slice(x)) == x` for a `RichMessage` struct exercising
++   nested enums (unit / newtype / tuple / struct variants), `Option`,
++   `heapless::Vec`/`String` collections, full-unicode strings and chars,
++   floats, byte arrays, and full-range integers (`u64`, `u128`, `i128`,
++   `i32`, `i8`, `usize`, ...).
++
++2. **Varint round-trip + spec maximum encoded length** (12 tests via
++   `varint_roundtrip_props!`, one per type `u8`–`u128`, `usize`, `i8`–`i128`,
++   `isize`): every value over the type's full range round-trips through
++   `to_slice`/`take_from_bytes`, decoding consumes exactly the encoding
++   (empty remainder), and the encoded length never exceeds the spec's
++   "Maximum Encoded Length" table (1/3/5/10/19 bytes; `usize`/`isize`
++   maxima assume the 64-bit test platform, per the spec's `usize` mapping).
++
++3. **Spec-conformant unsigned varint encoding**
++   (`prop_unsigned_varint_encoding_matches_leb128_reference`): encoded bytes
++   for `u16`/`u32`/`u64`/`u128`/`usize` equal an independent canonical
++   LEB128 reference implementation written from the spec.
++
++4. **Spec-conformant signed varint encoding**
++   (`prop_signed_varint_encoding_matches_zigzag_leb128_reference`): encoded
++   bytes for `i16`/`i32`/`i64`/`i128`/`isize` equal
++   `leb128(zigzag(n))` per the spec's "Signed Integer Encoding" section
++   (zigzag is numerically width-independent, so the i128-width reference is
++   valid for all narrower types).
++
++5. **Non-canonical varint acceptance/rejection**
++   (`prop_varint_noncanonical_padding_accepted_within_max_len`): per the
++   spec's "Canonicalization" table, an encoding padded with excess `0x80`
++   continuation bytes is accepted (decoding to the same `u32`) while total
++   length stays within 5 bytes, and rejected with
++   `Error::DeserializeBadVarint` once it exceeds it.
++
++6. **`serialized_size` consistency** (`prop_serialized_size_matches_to_slice`):
++   `experimental::serialized_size(&x)` equals the length `to_slice` actually
++   writes.
++
++7. **Buffer sizing behavior** (`prop_to_slice_exact_buffer_ok_undersized_errors`):
++   `to_slice` succeeds into an exactly-sized buffer and returns
++   `Err(Error::SerializeBufferFull)` — never panics or overruns — for every
++   undersized buffer length (0..n drawn).
++
++8. **Exact remainder** (`prop_take_from_bytes_returns_exact_remainder`):
++   `take_from_bytes` on `encoding ++ arbitrary_suffix` returns the original
++   value and exactly `arbitrary_suffix` as the unconsumed remainder.
++
++9. **Truncation rejection** (`prop_from_bytes_rejects_truncated_input`):
++   every strict prefix of a valid encoding fails to decode (the parser is
++   deterministic, so it must hit unexpected end-of-input).
++
++10. **Decode robustness** (`prop_decoders_never_panic_on_arbitrary_input`):
++    `from_bytes`, `take_from_bytes`, and `from_bytes_cobs` never panic on
++    arbitrary byte input (up to 512 bytes) for the rich message type.
++
++11. **COBS flavor round-trip + framing guarantee**
++    (`prop_cobs_roundtrip_and_zero_free_framing`): `to_slice_cobs` output
++    ends with the documented `0x00` sentinel, contains no interior zero
++    bytes, and `from_bytes_cobs` round-trips the value.
++
++12. **Float bit-pattern round-trip** (`prop_float_bitpattern_roundtrip`):
++    per spec sections 12/13, `f32`/`f64` encode as exactly their
++    little-endian bit patterns and round-trip bit-exactly for *arbitrary*
++    bit patterns, including NaN payloads and infinities.
++
++13. **Fixint layout + round-trip** (`prop_fixint_layout_and_roundtrip`):
++    fields using `#[serde(with = "postcard::fixint::le/be")]` are laid out
++    as fixed-size little/big-endian byte arrays (oracle:
++    `to_le_bytes`/`to_be_bytes`) and round-trip.
++
++14. **Accumulator reassembly under arbitrary chunking**
++    (`prop_accumulator_reassembles_arbitrarily_chunked_stream`): feeding a
++    well-formed COBS stream of arbitrary messages to `CobsAccumulator` in
++    arbitrarily-sized chunks (mid-frame splits, multi-frame chunks)
++    reproduces exactly the original message sequence, with no `OverFull` or
++    `DeserError` results.
++
++## Test results
++
++- Run command (matches CI's feature set for this crate):
++  `cargo test -p postcard --features=alloc,experimental-derive,use-std,use-crc,nalgebra-v0_33,heapless-v0_8,heapless-v0_9`
++- **All 25 property tests pass**, alongside all pre-existing tests
++  (52 lib unit tests, 22 fixint/max_size/crc-style tests, etc.).
++- The integration-test subset also passes under default features
++  (`cargo test -p postcard --test loopback --test accumulator`).
++- Liveness was verified by temporarily inverting the rich round-trip
++  assertion: hegel reported and shrank a minimal counterexample
++  (`RichMessage { seq: 0, variant: Unit, maybe_more: None, text: "" }`),
++  then the change was reverted and the failure database removed.
++- An exploratory 10x run (`test_cases = 1000` on every property) passed with
++  no failures; committed tests use the default case count.
++- `cargo fmt --check` and
++  `cargo clippy -p postcard --tests <CI features> -- --deny=warnings` are
++  clean.
++
++## Suspected bugs
++
++No wire-format or API-contract bugs were found in `postcard` itself.
++
++One **pre-existing build failure** (not introduced by this work, present at
++HEAD) was confirmed while running the suite: `cargo test -p postcard` with
++*default* features fails to compile the crate's own unit tests with
++
++```
++error[E0432]: unresolved import `crate::max_size`
++   --> source/postcard/src/ser/mod.rs:501:16
++```
++
++The unit-test module at `source/postcard/src/ser/mod.rs:497` is gated only
++on `#[cfg(feature = "heapless")]` but imports `crate::max_size::MaxSize`,
++which exists only under the `experimental-derive` feature
++(`source/postcard/src/lib.rs:21-22`). CI never hits this because `ci.sh`
++always tests with `experimental-derive` enabled. It was left unfixed per the
++"do not fix bugs" ground rule.
++
++## Unsound properties abandoned
++
++- **`PartialEq` round-trip for NaN floats**: `deserialize(serialize(NaN)) ==
++  NaN` is false under IEEE `==` even when the library is bit-exact. Instead
++  of weakening the rich-type property, NaN is excluded from the rich type's
++  float generator (with a comment), and a separate bit-pattern property
++  (`prop_float_bitpattern_roundtrip`) covers NaN payloads via
++  `to_bits`/`from_bits` comparison — strictly stronger than `==`.
++- **`leb128` reference for `u8`/`i8`**: initially considered including
++  `u8`/`i8` in the LEB128-oracle tests; abandoned as unsound because the
++  spec explicitly stores 8-bit types as raw bytes, not varints (a `u8 >=
++  128` would be a 2-byte LEB128 but a 1-byte postcard encoding). They remain
++  in the round-trip/max-length family with max length 1.
++
++No property failed during development for reasons other than the deliberate
++liveness check.
++
++## Skill feedback
++
++- The Rust reference was accurate throughout: `cargo add --dev hegeltest`
++  with the `hegel` crate name, `#[hegel::composite]`, plain
++  `&TestCase`-taking helper functions (needed here for const-generic
++  `heapless::String<N>` drawing, which composites can't express), and the
++  `one_of!` char idiom all worked first try.
++- The "verify the tests are live" and "10x exploratory run" steps were cheap
++  and valuable; the shrunk counterexample from the liveness check confirmed
++  draws were being recorded correctly.
++- One friction point: this workspace's CI enforces `clippy
++  --deny=warnings` on tests, and generated payload types tripped
++  `clippy::large_enum_variant` / test code tripped `clippy::same_item_push`.
++  A note in the reference about lint-strict projects (beyond the existing
++  `let_underscore_drop` mention) would save an iteration.
++- A documented way to draw a full-range `char` directly (rather than the
++  codepoint `one_of!` idiom) would slightly shorten unicode-heavy tests.
+diff --git a/source/postcard/Cargo.toml b/source/postcard/Cargo.toml
+index e923c74..3ca2429 100644
+--- a/source/postcard/Cargo.toml
++++ b/source/postcard/Cargo.toml
+@@ -86,6 +86,9 @@ version = "3.0.0"
+ default-features = false
+ optional = true
+ 
++[dev-dependencies]
++hegeltest = "0.28.2"
++
+ [dev-dependencies.serde]
+ version = "1.0.100"
+ default-features = false
+diff --git a/source/postcard/tests/accumulator.rs b/source/postcard/tests/accumulator.rs
+index 611e510..8991436 100644
+--- a/source/postcard/tests/accumulator.rs
++++ b/source/postcard/tests/accumulator.rs
+@@ -57,3 +57,77 @@ fn reader() {
+ 
+     assert_eq!(output.unwrap(), expected);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++mod hegel_props {
++    use postcard::accumulator::{CobsAccumulator, FeedResult};
++    use serde::{Deserialize, Serialize};
++
++    use hegel::generators;
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct SmallMsg {
++        a: u32,
++        b: i16,
++        c: Option<u8>,
++    }
++
++    #[hegel::composite]
++    fn small_msgs(tc: hegel::TestCase) -> SmallMsg {
++        SmallMsg {
++            a: tc.draw(generators::integers::<u32>()),
++            b: tc.draw(generators::integers::<i16>()),
++            c: tc.draw(generators::optional(generators::integers::<u8>())),
++        }
++    }
++
++    /// Feeding a well-formed COBS stream to `CobsAccumulator` in arbitrary
++    /// chunks reassembles exactly the original sequence of messages,
++    /// regardless of where the chunk boundaries fall (mid-frame, on frame
++    /// boundaries, multiple frames per chunk, ...).
++    #[hegel::test]
++    fn prop_accumulator_reassembles_arbitrarily_chunked_stream(tc: hegel::TestCase) {
++        let msgs: Vec<SmallMsg> = tc.draw(generators::vecs(small_msgs()));
++
++        // Build the contiguous COBS stream.
++        let mut stream: Vec<u8> = Vec::new();
++        for m in &msgs {
++            let mut buf = [0u8; 64];
++            stream.extend_from_slice(postcard::to_slice_cobs(m, &mut buf).unwrap());
++        }
++
++        let mut acc: CobsAccumulator<64> = CobsAccumulator::new();
++        let mut got: Vec<SmallMsg> = Vec::new();
++
++        // Feed the stream in arbitrarily-sized chunks.
++        let mut pos = 0;
++        while pos < stream.len() {
++            let chunk_len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(stream.len() - pos),
++            );
++            let mut window = &stream[pos..pos + chunk_len];
++            'cobs: while !window.is_empty() {
++                window = match acc.feed::<SmallMsg>(window) {
++                    FeedResult::Consumed => break 'cobs,
++                    FeedResult::OverFull(_) => {
++                        panic!("accumulator reported OverFull on a well-formed stream")
++                    }
++                    FeedResult::DeserError(_) => {
++                        panic!("accumulator reported DeserError on a well-formed stream")
++                    }
++                    FeedResult::Success { data, remaining } => {
++                        got.push(data);
++                        remaining
++                    }
++                };
++            }
++            pos += chunk_len;
++        }
++
++        assert_eq!(got, msgs);
++    }
++}
+diff --git a/source/postcard/tests/loopback.rs b/source/postcard/tests/loopback.rs
+index ece8ca7..2f3e50c 100644
+--- a/source/postcard/tests/loopback.rs
++++ b/source/postcard/tests/loopback.rs
+@@ -204,6 +204,488 @@ fn std_io_loopback() {
+     );
+ }
+ 
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// Properties are grounded in the postcard wire specification
++// (spec/src/wire-format.md) and the documented contracts of the public API.
++// ---------------------------------------------------------------------------
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use postcard::{from_bytes, take_from_bytes, to_slice, Error};
++    use serde::{Deserialize, Serialize};
++
++    #[cfg(feature = "heapless")]
++    use heapless::{String as HString, Vec as HVec};
++    #[cfg(feature = "heapless")]
++    use postcard::{experimental::serialized_size, from_bytes_cobs, to_slice_cobs};
++
++    // ---- generators -------------------------------------------------------
++
++    /// Arbitrary `char`, weighted across ASCII / BMP / supplementary planes.
++    #[cfg(feature = "heapless")]
++    #[hegel::composite]
++    fn chars(tc: hegel::TestCase) -> char {
++        tc.draw(
++            hegel::one_of!(
++                generators::integers::<u32>().max_value(0x7F),
++                generators::integers::<u32>()
++                    .min_value(0x80)
++                    .max_value(0xFFFF),
++                generators::integers::<u32>()
++                    .min_value(0x1_0000)
++                    .max_value(0x10_FFFF),
++            )
++            // Surrogate codepoints map to the replacement character.
++            .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++        )
++    }
++
++    /// Arbitrary full-unicode heapless string, filled up to its capacity.
++    #[cfg(feature = "heapless")]
++    fn draw_hstring<const N: usize>(tc: &hegel::TestCase) -> HString<N> {
++        let cs: std::vec::Vec<char> = tc.draw(generators::vecs(chars()));
++        let mut s = HString::new();
++        for c in cs {
++            if s.push(c).is_err() {
++                break;
++            }
++        }
++        s
++    }
++
++    #[cfg(feature = "heapless")]
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct Inner {
++        id: u64,
++        label: HString<16>,
++        coords: (i32, i8, u128),
++    }
++
++    #[cfg(feature = "heapless")]
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    // A deliberately large inline variant: this is a test payload type and
++    // boxing would require alloc (postcard targets no_std).
++    #[allow(clippy::large_enum_variant)]
++    enum Rich {
++        Unit,
++        Num(i128),
++        Pair(u16, char),
++        Rec {
++            inner: Inner,
++            opt: Option<i16>,
++            flag: bool,
++        },
++        Many(HVec<Inner, 8>),
++        // NaN is excluded from this variant's generator so the derived
++        // PartialEq can be used for round-trip comparison. Bit-exact float
++        // round-tripping (including NaN payloads) is covered separately by
++        // `prop_float_bitpattern_roundtrip`.
++        Floats(f32, f64),
++        Bytes([u8; 4]),
++    }
++
++    /// A "rich" message exercising nested enums, options, collections,
++    /// strings, chars, floats, and the full integer ranges.
++    #[cfg(feature = "heapless")]
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct RichMessage {
++        seq: usize,
++        variant: Rich,
++        maybe_more: Option<HVec<u8, 16>>,
++        text: HString<32>,
++    }
++
++    #[cfg(feature = "heapless")]
++    fn draw_inner(tc: &hegel::TestCase) -> Inner {
++        Inner {
++            id: tc.draw(generators::integers::<u64>()),
++            label: draw_hstring(tc),
++            coords: (
++                tc.draw(generators::integers::<i32>()),
++                tc.draw(generators::integers::<i8>()),
++                tc.draw(generators::integers::<u128>()),
++            ),
++        }
++    }
++
++    #[cfg(feature = "heapless")]
++    fn draw_rich(tc: &hegel::TestCase) -> Rich {
++        match tc.draw(generators::integers::<u8>().max_value(6)) {
++            0 => Rich::Unit,
++            1 => Rich::Num(tc.draw(generators::integers::<i128>())),
++            2 => Rich::Pair(tc.draw(generators::integers::<u16>()), tc.draw(chars())),
++            3 => Rich::Rec {
++                inner: draw_inner(tc),
++                opt: tc.draw(generators::optional(generators::integers::<i16>())),
++                flag: tc.draw(generators::booleans()),
++            },
++            4 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(8));
++                let mut v = HVec::new();
++                for _ in 0..n {
++                    v.push(draw_inner(tc)).unwrap();
++                }
++                Rich::Many(v)
++            }
++            5 => Rich::Floats(
++                tc.draw(generators::floats::<f32>().allow_nan(false)),
++                tc.draw(generators::floats::<f64>().allow_nan(false)),
++            ),
++            _ => {
++                let bytes: [u8; 4] = tc.draw(generators::arrays(generators::integers::<u8>()));
++                Rich::Bytes(bytes)
++            }
++        }
++    }
++
++    #[cfg(feature = "heapless")]
++    fn draw_rich_message(tc: &hegel::TestCase) -> RichMessage {
++        let maybe_more = if tc.draw(generators::booleans()) {
++            let bytes: std::vec::Vec<u8> = tc.draw(generators::binary().max_size(16));
++            Some(HVec::from_slice(&bytes).unwrap())
++        } else {
++            None
++        };
++        RichMessage {
++            seq: tc.draw(generators::integers::<usize>()),
++            variant: draw_rich(tc),
++            maybe_more,
++            text: draw_hstring(tc),
++        }
++    }
++
++    // ---- spec reference implementations ------------------------------------
++
++    /// Canonical LEB128 varint encoding, as described in
++    /// spec/src/wire-format.md ("varint encoded integers").
++    fn leb128_reference(mut v: u128) -> std::vec::Vec<u8> {
++        let mut out = std::vec::Vec::new();
++        loop {
++            let byte = (v & 0x7F) as u8;
++            v >>= 7;
++            if v == 0 {
++                out.push(byte);
++                return out;
++            }
++            out.push(byte | 0x80);
++        }
++    }
++
++    /// Zigzag encoding, as described in spec/src/wire-format.md
++    /// ("Signed Integer Encoding"). Numerically width-independent, so
++    /// computing it at i128 width is valid for all narrower types.
++    fn zigzag_reference(n: i128) -> u128 {
++        ((n << 1) ^ (n >> 127)) as u128
++    }
++
++    // ---- properties ---------------------------------------------------------
++
++    /// Round-trip: `from_bytes(to_slice(x)) == x` for a rich derived type.
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_rich_message_roundtrip(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let mut buf = [0u8; 4096];
++        let used = to_slice(&msg, &mut buf).unwrap();
++        let back: RichMessage = from_bytes(used).unwrap();
++        assert_eq!(back, msg);
++    }
++
++    /// Round-trip for every integer type over its full range, plus the
++    /// spec's "Maximum Encoded Length" table, plus "decoding consumes
++    /// exactly the encoding" (empty remainder from take_from_bytes).
++    /// The `usize`/`isize` maximums assume a 64-bit test platform
++    /// (spec: they encode as u64/i64 there).
++    macro_rules! varint_roundtrip_props {
++        ($($name:ident: $ty:ty => $max:expr;)*) => {$(
++            #[hegel::test]
++            fn $name(tc: hegel::TestCase) {
++                let n: $ty = tc.draw(generators::integers::<$ty>());
++                let mut buf = [0u8; 24];
++                let used = to_slice(&n, &mut buf).unwrap();
++                assert!(
++                    used.len() <= $max,
++                    "encoding of {n} used {} bytes, spec max is {}",
++                    used.len(),
++                    $max
++                );
++                let (back, rest): ($ty, &[u8]) = take_from_bytes(used).unwrap();
++                assert_eq!(back, n);
++                assert!(rest.is_empty());
++            }
++        )*};
++    }
++
++    varint_roundtrip_props! {
++        prop_varint_roundtrip_u8: u8 => 1;
++        prop_varint_roundtrip_u16: u16 => 3;
++        prop_varint_roundtrip_u32: u32 => 5;
++        prop_varint_roundtrip_u64: u64 => 10;
++        prop_varint_roundtrip_u128: u128 => 19;
++        prop_varint_roundtrip_usize: usize => 10;
++        prop_varint_roundtrip_i8: i8 => 1;
++        prop_varint_roundtrip_i16: i16 => 3;
++        prop_varint_roundtrip_i32: i32 => 5;
++        prop_varint_roundtrip_i64: i64 => 10;
++        prop_varint_roundtrip_i128: i128 => 19;
++        prop_varint_roundtrip_isize: isize => 10;
++    }
++
++    /// Spec conformance: unsigned integers encode as canonical LEB128
++    /// (independent reference implementation as the oracle).
++    #[hegel::test]
++    fn prop_unsigned_varint_encoding_matches_leb128_reference(tc: hegel::TestCase) {
++        let mut buf = [0u8; 24];
++
++        let a = tc.draw(generators::integers::<u16>());
++        assert_eq!(
++            &to_slice(&a, &mut buf).unwrap()[..],
++            leb128_reference(a as u128)
++        );
++
++        let b = tc.draw(generators::integers::<u32>());
++        assert_eq!(
++            &to_slice(&b, &mut buf).unwrap()[..],
++            leb128_reference(b as u128)
++        );
++
++        let c = tc.draw(generators::integers::<u64>());
++        assert_eq!(
++            &to_slice(&c, &mut buf).unwrap()[..],
++            leb128_reference(c as u128)
++        );
++
++        let d = tc.draw(generators::integers::<u128>());
++        assert_eq!(&to_slice(&d, &mut buf).unwrap()[..], leb128_reference(d));
++
++        let e = tc.draw(generators::integers::<usize>());
++        assert_eq!(
++            &to_slice(&e, &mut buf).unwrap()[..],
++            leb128_reference(e as u128)
++        );
++    }
++
++    /// Spec conformance: signed integers are zigzag-encoded, then encoded
++    /// as canonical LEB128 (independent reference implementation).
++    #[hegel::test]
++    fn prop_signed_varint_encoding_matches_zigzag_leb128_reference(tc: hegel::TestCase) {
++        let mut buf = [0u8; 24];
++
++        let a = tc.draw(generators::integers::<i16>());
++        assert_eq!(
++            &to_slice(&a, &mut buf).unwrap()[..],
++            leb128_reference(zigzag_reference(a as i128))
++        );
++
++        let b = tc.draw(generators::integers::<i32>());
++        assert_eq!(
++            &to_slice(&b, &mut buf).unwrap()[..],
++            leb128_reference(zigzag_reference(b as i128))
++        );
++
++        let c = tc.draw(generators::integers::<i64>());
++        assert_eq!(
++            &to_slice(&c, &mut buf).unwrap()[..],
++            leb128_reference(zigzag_reference(c as i128))
++        );
++
++        let d = tc.draw(generators::integers::<i128>());
++        assert_eq!(
++            &to_slice(&d, &mut buf).unwrap()[..],
++            leb128_reference(zigzag_reference(d))
++        );
++
++        let e = tc.draw(generators::integers::<isize>());
++        assert_eq!(
++            &to_slice(&e, &mut buf).unwrap()[..],
++            leb128_reference(zigzag_reference(e as i128))
++        );
++    }
++
++    /// Spec "Canonicalization" table: non-canonical encodings (excess
++    /// `0x80` continuation bytes) are accepted while the total length stays
++    /// within the type's maximum encoded length (5 for u32), and rejected
++    /// once it exceeds it.
++    #[hegel::test]
++    fn prop_varint_noncanonical_padding_accepted_within_max_len(tc: hegel::TestCase) {
++        const U32_MAX_ENC: usize = 5;
++        let v = tc.draw(generators::integers::<u32>());
++        let mut buf = [0u8; 8];
++        let canonical = to_slice(&v, &mut buf).unwrap().to_vec();
++        let len = canonical.len();
++
++        let extra = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut padded = canonical;
++        *padded.last_mut().unwrap() |= 0x80;
++        padded.extend(std::iter::repeat_n(0x80, extra - 1));
++        padded.push(0x00);
++
++        let res: Result<u32, Error> = from_bytes(&padded);
++        if len + extra <= U32_MAX_ENC {
++            assert_eq!(res, Ok(v));
++        } else {
++            assert_eq!(res, Err(Error::DeserializeBadVarint));
++        }
++    }
++
++    /// `experimental::serialized_size` agrees with what `to_slice` writes.
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_serialized_size_matches_to_slice(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let n = serialized_size(&msg).unwrap();
++        let mut buf = [0u8; 4096];
++        let used = to_slice(&msg, &mut buf).unwrap();
++        assert_eq!(used.len(), n);
++    }
++
++    /// `to_slice` succeeds with an exact-size buffer and fails cleanly
++    /// (Err(SerializeBufferFull), no panic, no overrun) with any undersized
++    /// buffer.
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_to_slice_exact_buffer_ok_undersized_errors(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let n = serialized_size(&msg).unwrap();
++
++        let mut exact = vec![0u8; n];
++        let used = to_slice(&msg, &mut exact).unwrap();
++        assert_eq!(used.len(), n);
++
++        if n > 0 {
++            let k = tc.draw(generators::integers::<usize>().max_value(n - 1));
++            let mut small = vec![0u8; k];
++            let res = to_slice(&msg, &mut small);
++            assert_eq!(res.err(), Some(Error::SerializeBufferFull));
++        }
++    }
++
++    /// `take_from_bytes` returns exactly the unconsumed suffix.
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_take_from_bytes_returns_exact_remainder(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let suffix: std::vec::Vec<u8> = tc.draw(generators::binary());
++        let mut buf = [0u8; 4096];
++        let mut stream = to_slice(&msg, &mut buf).unwrap().to_vec();
++        stream.extend_from_slice(&suffix);
++
++        let (back, rest): (RichMessage, &[u8]) = take_from_bytes(&stream).unwrap();
++        assert_eq!(back, msg);
++        assert_eq!(rest, suffix.as_slice());
++    }
++
++    /// Any strict prefix of a valid encoding fails to decode (the parser is
++    /// deterministic, so it must hit an unexpected end of input).
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_from_bytes_rejects_truncated_input(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let mut buf = [0u8; 4096];
++        let used = to_slice(&msg, &mut buf).unwrap();
++        assert!(!used.is_empty());
++        let cut = tc.draw(generators::integers::<usize>().max_value(used.len() - 1));
++        let res: Result<RichMessage, Error> = from_bytes(&used[..cut]);
++        assert!(res.is_err(), "decoded a strict prefix of length {cut}");
++    }
++
++    /// Decoders never panic on arbitrary input bytes; they return an error
++    /// (or a value) instead.
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_decoders_never_panic_on_arbitrary_input(tc: hegel::TestCase) {
++        let bytes: std::vec::Vec<u8> = tc.draw(generators::binary().max_size(512));
++        drop(from_bytes::<RichMessage>(&bytes));
++        drop(take_from_bytes::<RichMessage>(&bytes));
++        let mut copy = bytes.clone();
++        drop(from_bytes_cobs::<RichMessage>(&mut copy));
++    }
++
++    /// COBS flavor: round-trips, ends with the documented 0x00 sentinel, and
++    /// contains no interior zero bytes (the framing guarantee COBS exists
++    /// to provide).
++    #[cfg(feature = "heapless")]
++    #[hegel::test]
++    fn prop_cobs_roundtrip_and_zero_free_framing(tc: hegel::TestCase) {
++        let msg = draw_rich_message(&tc);
++        let mut buf = [0u8; 8192];
++        let out = to_slice_cobs(&msg, &mut buf).unwrap();
++
++        assert_eq!(out.last(), Some(&0u8));
++        let body = &out[..out.len() - 1];
++        assert!(
++            body.iter().all(|b| *b != 0),
++            "interior zero byte in COBS output"
++        );
++
++        let back: RichMessage = from_bytes_cobs(out).unwrap();
++        assert_eq!(back, msg);
++    }
++
++    /// Spec: f32/f64 are encoded as their little-endian bit patterns, and
++    /// round-trip bit-exactly (including NaN payloads and infinities).
++    #[hegel::test]
++    fn prop_float_bitpattern_roundtrip(tc: hegel::TestCase) {
++        let bits32 = tc.draw(generators::integers::<u32>());
++        let f = f32::from_bits(bits32);
++        let mut buf = [0u8; 8];
++        let used = to_slice(&f, &mut buf).unwrap();
++        assert_eq!(&used[..], &bits32.to_le_bytes()[..]);
++        let back: f32 = from_bytes(used).unwrap();
++        assert_eq!(back.to_bits(), bits32);
++
++        let bits64 = tc.draw(generators::integers::<u64>());
++        let g = f64::from_bits(bits64);
++        let mut buf = [0u8; 16];
++        let used = to_slice(&g, &mut buf).unwrap();
++        assert_eq!(&used[..], &bits64.to_le_bytes()[..]);
++        let back: f64 = from_bytes(used).unwrap();
++        assert_eq!(back.to_bits(), bits64);
++    }
++
++    /// `fixint` opt-out: fields are laid out as fixed-size LE/BE byte
++    /// arrays (documented in src/fixint.rs) and round-trip.
++    #[hegel::test]
++    fn prop_fixint_layout_and_roundtrip(tc: hegel::TestCase) {
++        #[derive(Serialize, Deserialize, Debug, PartialEq)]
++        struct FixintMessage {
++            #[serde(with = "postcard::fixint::le")]
++            a: u16,
++            #[serde(with = "postcard::fixint::be")]
++            b: u32,
++            #[serde(with = "postcard::fixint::le")]
++            c: u64,
++            #[serde(with = "postcard::fixint::be")]
++            d: i16,
++            #[serde(with = "postcard::fixint::le")]
++            e: i128,
++        }
++
++        let msg = FixintMessage {
++            a: tc.draw(generators::integers::<u16>()),
++            b: tc.draw(generators::integers::<u32>()),
++            c: tc.draw(generators::integers::<u64>()),
++            d: tc.draw(generators::integers::<i16>()),
++            e: tc.draw(generators::integers::<i128>()),
++        };
++
++        let mut buf = [0u8; 64];
++        let used = to_slice(&msg, &mut buf).unwrap();
++
++        let mut expected = std::vec::Vec::new();
++        expected.extend_from_slice(&msg.a.to_le_bytes());
++        expected.extend_from_slice(&msg.b.to_be_bytes());
++        expected.extend_from_slice(&msg.c.to_le_bytes());
++        expected.extend_from_slice(&msg.d.to_be_bytes());
++        expected.extend_from_slice(&msg.e.to_le_bytes());
++        assert_eq!(&used[..], expected.as_slice());
++
++        let back: FixintMessage = from_bytes(used).unwrap();
++        assert_eq!(back, msg);
++    }
++}
++
+ #[cfg(all(
+     any(feature = "embedded-io-04", feature = "embedded-io-06"),
+     feature = "alloc"

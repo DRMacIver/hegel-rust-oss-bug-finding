@@ -1,0 +1,1111 @@
+diff --git a/.gitignore b/.gitignore
+index 9385808..7d3a2c0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
+ Cargo.lock
+ target
+ .idea
++.hegel/
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..789c442
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,197 @@
++# Hegel Property-Based Testing Report: msgpack-rust (`rmpv` + `rmp-serde`)
++
++`hegeltest` 0.28.2 was added as a dev-dependency to `rmpv` and `rmp-serde`
++(via `cargo add --dev hegeltest --ignore-rust-version`; hegeltest's MSRV is
++1.86, the crates pin `rust-version = "1.85"` — see Skill feedback).
++15 hegel property tests plus one deterministic `#[ignore]`d bug reproducer
++were added to the existing test files.
++
++## Properties tested
++
++### rmpv — `rmpv/tests/mirror.rs`
++
++All draw from a recursive `Value` generator covering integers at every
++MessagePack width boundary (`u64`/`i64` full range plus explicit boundary
++sampling), f32/f64 built from raw bit patterns (NaN payloads, infinities,
++subnormals), full-Unicode strings, binary, ext (all FixExt sizes reachable),
++and nested arrays/maps up to 3 container levels.
++
++1. **`mirror_arbitrary_value`** — round-trip: `read_value` inverts
++   `write_value` for every `Value`, floats compared bitwise so NaN
++   round-trips are asserted too. Evidence: this is the crate's core promise;
++   it generalizes the existing quickcheck `mirror_*` tests (which excused NaN
++   mismatches instead of checking bits and only covered scalars).
++2. **`mirror_value_ref_agrees_with_value`** — consistency: the zero-copy
++   decoder (`read_value_ref(..).to_owned()`) agrees with the owned decoder on
++   every valid encoding. Evidence: `ValueRef::to_owned` docs state the two
++   representations are equivalent; both decoders implement the same format.
++3. **`integer_encoding_uses_smallest_width`** — spec conformance with an
++   independent oracle: the expected (marker byte, encoded length) is
++   recomputed in the test from the MessagePack spec's smallest-width rule and
++   compared against `write_value` output. Evidence: `rmp::encode::write_sint`
++   docs: "the serializer SHOULD use the format which represents the data in
++   the smallest number of bytes".
++4. **`length_markers_use_smallest_width`** — same spec oracle for
++   str/bin/array/map length headers (fixstr/str8/str16/str32, bin8/16/32,
++   fixarray/array16/array32, fixmap/map16/map32), with lengths targeted at
++   the 15/16, 31/32, 255/256, 65535/65536 boundaries.
++5. **`truncated_encoding_fails_to_decode`** — validation/rejection: every
++   strict prefix of a valid encoding is incomplete, so both decoders must
++   return an error. Evidence: MessagePack is self-delimiting; decoding
++   consumes exactly the bytes written.
++6. **`mutated_encoding_never_panics_and_decoders_agree`** — robustness:
++   corrupting one byte of a valid encoding never panics either decoder, and
++   both decoders still agree on Ok/Err and the decoded value.
++
++### rmpv — `rmpv/tests/decode.rs`
++
++7. **`arbitrary_bytes_never_panic_and_decoders_agree`** — parse robustness on
++   completely arbitrary bytes; also asserts `read_value` and `read_value_ref`
++   agree. Evidence: decoders return `Result` and are documented to error, not
++   panic, on bad input; `PREALLOC_MAX` in `decode/value.rs` shows the crate
++   explicitly hardens against malicious length claims (issue #151).
++8. **`nesting_depth_limit_is_enforced_without_crashing`** — the recursion
++   budget of `read_value_with_max_depth` / `read_value_ref_with_max_depth` is
++   enforced exactly (each array level costs two budget units), exceeding it
++   yields `Error::DepthLimitExceeded`, and both decoders agree. Evidence:
++   `rmpv::decode::MAX_DEPTH` docs ("The maximum recursion depth before
++   Error::DepthLimitExceeded is returned"). The generated nesting depth is
++   capped at 250 to protect the test process from the real bug below.
++   - **`known_bug_stack_overflow_within_max_depth`** (`#[test] #[ignore]`) —
++     deterministic pinned reproducer for the stack overflow described under
++     Suspected bugs. Ignored because the failure aborts the whole test
++     process (SIGABRT), which would take the suite down with it.
++
++### rmp-serde — `rmp-serde/tests/round.rs`
++
++9. **`struct_roundtrip_under_any_config`** — generate-the-configuration
++   round-trip: a rich struct/enum tree (all four enum variant shapes, nested
++   struct, tuple, map, `Option`, `serde_bytes::ByteBuf`, `char`, `IpAddr`
++   whose serde impl is human-readable-sensitive) round-trips under every
++   serializer configuration: default (struct-as-tuple) vs `with_struct_map()`
++   crossed with `with_human_readable()` (deserializer flag matched, as serde
++   requires). Evidence: `config.rs` documents these wrappers; existing unit
++   tests cover single fixed configs only.
++10. **`integer_roundtrip_all_widths`** — `to_vec`/`from_slice` round-trip for
++    i8–i128 and u8–u128 at full range with 64-bit boundary boosting; i128/u128
++    exercise the dedicated 16-byte-bin encoding path (`read_i128_marker`).
++11. **`float_roundtrip_preserves_bits`** — f32/f64 from raw bit patterns
++    round-trip bitwise (NaN payloads, infinities, subnormals).
++12. **`std_types_roundtrip`** — String (full Unicode), char (all planes),
++    `Option`, `Vec<u64>`, `BTreeMap<i64, String>`, tuples,
++    `serde_bytes::ByteBuf`.
++13. **`encoding_matches_rmpv_value_encoding`** — cross-crate consistency:
++    for data with a direct `rmpv::Value` equivalent (ints, floats, bool,
++    str, bytes, sequences, maps, `Option`), `rmp_serde::to_vec` produces
++    byte-for-byte the same encoding as `rmpv::encode::write_value`.
++    Evidence: both crates encode via `rmp`'s `write_sint`/`write_uint`/
++    `write_str`/... smallest-width functions.
++14. **`truncated_struct_encoding_fails`** — every strict prefix of a valid
++    `to_vec` encoding fails `from_slice`.
++
++### rmp-serde — `rmp-serde/tests/decode.rs`
++
++15. **`from_slice_never_panics_on_arbitrary_bytes`** — parse robustness of
++    `from_slice` across ten target types (ints, floats, String, Vec, map,
++    Option, ByteBuf, tuple, derived struct/enum).
++
++## Test results
++
++- Full workspace `cargo test`: **all green** (21 test binaries/doc-test runs,
++  0 failures). The only ignored tests are three pre-existing `#[ignore]`s and
++  the new process-aborting bug reproducer.
++- **Liveness check**: temporarily inverted assertions in
++  `mirror_arbitrary_value` (hegel shrank the counterexample to `Nil`) and in
++  `struct_roundtrip_under_any_config` (shrank to the all-zero/empty `Outer`
++  with `named = false, human = false`), then reverted. Both suites really
++  execute and shrink.
++- **Exploratory 10x run**: all 15 hegel tests were temporarily raised to
++  `test_cases = 1000` and passed; committed tests use the default (100).
++- The depth property failed with a process abort on its first run (stack
++  overflow, SIGABRT) — investigated below; after pinning the bug the
++  committed suite is deterministic and green.
++
++## Suspected bugs
++
++### `rmpv`: stack overflow in debug builds well within its own `MAX_DEPTH` guard
++
++`rmpv::decode::MAX_DEPTH = 1024` exists precisely to stop unbounded-recursion
++crashes on malicious input, and in release builds it works as designed:
++probing nested single-element arrays gives `Ok` up to 512 levels (each level
++costs 2 budget units), `Err(DepthLimitExceeded)` from 513, and no crash even
++at 4000 levels.
++
++In **debug builds**, however, `read_value` overflows the test thread's stack
++at roughly **370–380 nesting levels** — less than half the depth the guard
++permits (bisected: depth 360 decodes, depth 380 aborts with
++`thread ... has overflowed its stack` / SIGABRT). `read_value_ref` is
++similarly affected. So any application that decodes untrusted MessagePack
++with rmpv and runs a debug binary (or any thread with a comparable stack
++budget) can be crash-DoSed by a ~200-byte input despite the guard.
++
++- Reproducer: `rmpv/tests/decode.rs::known_bug_stack_overflow_within_max_depth`
++  (`cargo test -p rmpv --test decode -- --ignored`, debug profile).
++- Found by: `nesting_depth_limit_is_enforced_without_crashing` before its
++  generator was capped (the cap comment references the reproducer).
++- Likely fix direction: `MAX_DEPTH` is calibrated too high for real frame
++  sizes (debug-build `read_value_inner` + `read_array_data` frames are ~5–10
++  KiB per level); compare serde_json's default recursion limit of 128.
++
++No other property failed: integer/length markers match the spec oracle
++exactly, the two rmpv decoders never disagreed on ~100k arbitrary/mutated
++inputs, and all rmp-serde round-trips (including 128-bit integers, NaN bit
++patterns, and all four serializer configs) held.
++
++## Unsound properties abandoned
++
++- **`Value::String` with invalid UTF-8 round-trips** — unsound by design:
++  `rmpv/src/encode/value.rs` deliberately encodes invalid-UTF-8 strings with
++  the *bin* marker, so they decode as `Value::Binary`. The `Value::String`
++  docs explicitly allow deserializers latitude here. The round-trip generator
++  therefore only produces valid-UTF-8 strings (documented in a comment);
++  invalid-UTF-8 payloads still reach the decoders via the mutation and
++  arbitrary-bytes properties.
++- **Direct deep-input assertion against `MAX_DEPTH`** — the first version of
++  the depth property fed up to 4000 real nesting levels through `read_value`
++  and asserted Ok/Err against `MAX_DEPTH`. That is exactly what crashed: the
++  property was sound but untestable in-process in debug builds. Replaced by
++  the `read_value_with_max_depth`-based property (budget ≤ 600, nesting ≤
++  250) plus the ignored reproducer.
++- **Round-trip under mismatched human-readable flags** — never asserted:
++  serde's contract requires serializer and deserializer to agree on
++  `is_human_readable`; types like `IpAddr` legitimately use different wire
++  shapes per flag. Configurations are generated as matched pairs.
++- **Round-trip under `with_bytes(BytesMode::ForceIterables/ForceAll)`** —
++  never asserted: `config.rs` documents these modes "may break some
++  implementations of `Deserialize`", i.e. round-tripping is explicitly not
++  promised.
++- **NaN equality via `PartialEq`** — the pre-existing quickcheck mirror tests
++  excuse NaN mismatches (`eq || xs.is_nan()`); rather than inheriting that
++  weakened property, the hegel tests compare floats bitwise. (Kept the
++  quickcheck tests in place per the skill's supplement-don't-delete default.)
++
++## Skill feedback
++
++- The Rust reference's Setup section was spot-on twice: the MSRV conflict
++  (`cargo add` failed against `rust-version = "1.85"`, fixed with
++  `--ignore-rust-version` exactly as documented — worth flagging to
++  maintainers if these tests are upstreamed) and the `.hegel/` failure-DB
++  cleanup after deliberate liveness failures.
++- The `compose!`-returning-`BoxedGenerator` pattern for recursive generators
++  worked first try, including the documented `'static` lifetime spelling and
++  no-`move` rule. Without that reference note, the `E0283` from a recursive
++  `#[hegel::composite]` would have cost real time.
++- The main skill's "process-aborting bugs" guidance was directly load-bearing
++  here: the depth property's first failure was a SIGABRT with no hegel
++  report, and the keep-an-`#[ignore]`d-reproducer + cap-the-sibling-generator
++  recipe is exactly what the final suite does.
++- Friction: there is no global case-count override, so the exploratory 10x
++  run meant sed-editing 15 attributes and reverting; an env var like
++  `HEGEL_TEST_CASES` would make that one command.
++- Friction (minor): `one_of!` over branches of different generator types did
++  require `.boxed()` on every branch (the reference's "only if the compiler
++  demands unification" — it always demanded it for
++  `integers` + `sampled_from` mixes).
++- Counterexample output that prints draws as `let val = ...;` statements made
++  the liveness checks and the shrink quality (`Nil`, all-zero `Outer`) easy
++  to verify at a glance.
+diff --git a/rmp-serde/Cargo.toml b/rmp-serde/Cargo.toml
+index adcdcd4..0e7d087 100644
+--- a/rmp-serde/Cargo.toml
++++ b/rmp-serde/Cargo.toml
+@@ -23,6 +23,7 @@ rmp = { version = "0.8.14", path = "../rmp" }
+ rmpv = { path = "../rmpv" }
+ serde_bytes = "0.11.19"
+ serde = { version = "1.0.228", features = ["derive"] }
++hegeltest = "0.28.2"
+ 
+ [badges]
+ maintenance = { status = "looking-for-maintainer" }
+diff --git a/rmp-serde/tests/decode.rs b/rmp-serde/tests/decode.rs
+index 4763eb9..8c45708 100644
+--- a/rmp-serde/tests/decode.rs
++++ b/rmp-serde/tests/decode.rs
+@@ -567,3 +567,50 @@ fn fail_depth_limit() {
+         other => panic!("unexpected result: {other:?}"),
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Hegel property-based tests: deserializer robustness.
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use hegel::generators;
++    use serde::Deserialize;
++    use std::collections::BTreeMap;
++
++    #[derive(Deserialize, Debug)]
++    #[allow(dead_code)]
++    enum AnyEnum {
++        Unit,
++        NewType(i64),
++        Tuple(u8, String),
++        Struct { a: Option<u32>, b: Vec<i16> },
++    }
++
++    #[derive(Deserialize, Debug)]
++    #[allow(dead_code)]
++    struct AnyStruct {
++        i: i64,
++        s: String,
++        v: Vec<u8>,
++        e: AnyEnum,
++    }
++
++    /// Robustness: `from_slice` must return an error (never panic) for any
++    /// arbitrary byte input, whatever the target type.
++    #[hegel::test]
++    fn from_slice_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(300));
++        match tc.draw(generators::integers::<u8>().max_value(9)) {
++            0 => drop(rmp_serde::from_slice::<i64>(&bytes)),
++            1 => drop(rmp_serde::from_slice::<u128>(&bytes)),
++            2 => drop(rmp_serde::from_slice::<f64>(&bytes)),
++            3 => drop(rmp_serde::from_slice::<String>(&bytes)),
++            4 => drop(rmp_serde::from_slice::<Vec<u64>>(&bytes)),
++            5 => drop(rmp_serde::from_slice::<BTreeMap<String, String>>(&bytes)),
++            6 => drop(rmp_serde::from_slice::<Option<Vec<u8>>>(&bytes)),
++            7 => drop(rmp_serde::from_slice::<serde_bytes::ByteBuf>(&bytes)),
++            8 => drop(rmp_serde::from_slice::<(u8, String)>(&bytes)),
++            _ => drop(rmp_serde::from_slice::<AnyStruct>(&bytes)),
++        }
++    }
++}
+diff --git a/rmp-serde/tests/round.rs b/rmp-serde/tests/round.rs
+index 6a73f09..090cdb3 100644
+--- a/rmp-serde/tests/round.rs
++++ b/rmp-serde/tests/round.rs
+@@ -758,3 +758,383 @@ fn assert_roundtrips_config<T, CSF, SC, CDF, DC>(
+ 
+     assert_eq!(val, &val2, "Config: {desc}");
+ }
++
++// ---------------------------------------------------------------------------
++// Hegel property-based tests.
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use rmp_serde::{from_slice, to_vec, Deserializer, Serializer};
++    use serde::{Deserialize, Serialize};
++    use std::collections::BTreeMap;
++    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
++
++    const U64_BOUNDARIES: [u64; 14] = [
++        0,
++        1,
++        127,
++        128,
++        255,
++        256,
++        65535,
++        65536,
++        4294967295,
++        4294967296,
++        i64::MAX as u64,
++        i64::MAX as u64 + 1,
++        u64::MAX - 1,
++        u64::MAX,
++    ];
++
++    const I64_BOUNDARIES: [i64; 16] = [
++        i64::MIN,
++        i64::MIN + 1,
++        -2147483649,
++        -2147483648,
++        -32769,
++        -32768,
++        -129,
++        -128,
++        -33,
++        -32,
++        -1,
++        0,
++        1,
++        127,
++        128,
++        i64::MAX,
++    ];
++
++    fn u64_values() -> generators::BoxedGenerator<'static, u64> {
++        hegel::one_of!(
++            generators::integers::<u64>().boxed(),
++            generators::sampled_from(U64_BOUNDARIES.to_vec()).boxed(),
++        )
++        .boxed()
++    }
++
++    fn i64_values() -> generators::BoxedGenerator<'static, i64> {
++        hegel::one_of!(
++            generators::integers::<i64>().boxed(),
++            generators::sampled_from(I64_BOUNDARIES.to_vec()).boxed(),
++        )
++        .boxed()
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    enum AnyEnum {
++        Unit,
++        NewType(i64),
++        Tuple(u8, String),
++        Struct { a: Option<u32>, b: Vec<i16> },
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct Inner {
++        s: String,
++        bytes: serde_bytes::ByteBuf,
++        opt: Option<i64>,
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct Outer {
++        i: i64,
++        u: u64,
++        f: f64,
++        b: bool,
++        c: char,
++        t: (u8, i32, String),
++        inner: Inner,
++        e: AnyEnum,
++        m: BTreeMap<String, i32>,
++        ip: IpAddr,
++    }
++
++    #[hegel::composite]
++    fn any_enums(tc: hegel::TestCase) -> AnyEnum {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => AnyEnum::Unit,
++            1 => AnyEnum::NewType(tc.draw(i64_values())),
++            2 => AnyEnum::Tuple(
++                tc.draw(generators::integers::<u8>()),
++                tc.draw(generators::text().max_size(20)),
++            ),
++            _ => AnyEnum::Struct {
++                a: tc.draw(generators::optional(generators::integers::<u32>())),
++                b: tc.draw(generators::vecs(generators::integers::<i16>()).max_size(8)),
++            },
++        }
++    }
++
++    #[hegel::composite]
++    fn outers(tc: hegel::TestCase) -> Outer {
++        Outer {
++            i: tc.draw(i64_values()),
++            u: tc.draw(u64_values()),
++            // Non-NaN because `Outer` is compared with `PartialEq`; NaN bit
++            // patterns are covered by `float_roundtrip_preserves_bits`.
++            f: tc.draw(generators::floats::<f64>().allow_nan(false)),
++            b: tc.draw(generators::booleans()),
++            c: char::from_u32(tc.draw(generators::integers::<u32>().max_value(0x10FFFF)))
++                .unwrap_or('\u{FFFD}'),
++            t: (
++                tc.draw(generators::integers::<u8>()),
++                tc.draw(generators::integers::<i32>()),
++                tc.draw(generators::text().max_size(20)),
++            ),
++            inner: Inner {
++                s: tc.draw(generators::text().max_size(20)),
++                bytes: serde_bytes::ByteBuf::from(tc.draw(generators::binary().max_size(20))),
++                opt: tc.draw(generators::optional(generators::integers::<i64>())),
++            },
++            e: tc.draw(any_enums()),
++            m: tc.draw(generators::hashmaps(
++                generators::text().max_size(10),
++                generators::integers::<i32>(),
++            ).max_size(5))
++                .into_iter()
++                .collect(),
++            ip: if tc.draw(generators::booleans()) {
++                IpAddr::V4(Ipv4Addr::from(tc.draw(generators::integers::<u32>())))
++            } else {
++                IpAddr::V6(Ipv6Addr::from(tc.draw(generators::integers::<u128>())))
++            },
++        }
++    }
++
++    /// Round-trip of a struct/enum tree under every serializer configuration:
++    /// struct-as-tuple vs struct-as-map crossed with the human-readable flag
++    /// (the deserializer's human-readable flag must match the serializer's).
++    #[hegel::test]
++    fn struct_roundtrip_under_any_config(tc: hegel::TestCase) {
++        let val = tc.draw(outers());
++        let named = tc.draw(generators::booleans());
++        let human = tc.draw(generators::booleans());
++
++        let mut buf = Vec::new();
++        match (named, human) {
++            (false, false) => val.serialize(&mut Serializer::new(&mut buf)).unwrap(),
++            (true, false) => val
++                .serialize(&mut Serializer::new(&mut buf).with_struct_map())
++                .unwrap(),
++            (false, true) => val
++                .serialize(&mut Serializer::new(&mut buf).with_human_readable())
++                .unwrap(),
++            (true, true) => val
++                .serialize(&mut Serializer::new(&mut buf).with_struct_map().with_human_readable())
++                .unwrap(),
++        }
++
++        let back: Outer = if human {
++            let mut de = Deserializer::new(&buf[..]).with_human_readable();
++            Deserialize::deserialize(&mut de).unwrap()
++        } else {
++            from_slice(&buf).unwrap()
++        };
++        assert_eq!(val, back, "config: named={named}, human={human}");
++    }
++
++    /// Round-trip for every integer width, including 128-bit integers (which
++    /// take a dedicated bin-16 encoding path).
++    #[hegel::test]
++    fn integer_roundtrip_all_widths(tc: hegel::TestCase) {
++        match tc.draw(generators::integers::<u8>().max_value(9)) {
++            0 => {
++                let v = tc.draw(generators::integers::<i8>());
++                assert_eq!(v, from_slice::<i8>(&to_vec(&v).unwrap()).unwrap());
++            }
++            1 => {
++                let v = tc.draw(generators::integers::<i16>());
++                assert_eq!(v, from_slice::<i16>(&to_vec(&v).unwrap()).unwrap());
++            }
++            2 => {
++                let v = tc.draw(generators::integers::<i32>());
++                assert_eq!(v, from_slice::<i32>(&to_vec(&v).unwrap()).unwrap());
++            }
++            3 => {
++                let v = tc.draw(i64_values());
++                assert_eq!(v, from_slice::<i64>(&to_vec(&v).unwrap()).unwrap());
++            }
++            4 => {
++                let v = tc.draw(generators::integers::<i128>());
++                assert_eq!(v, from_slice::<i128>(&to_vec(&v).unwrap()).unwrap());
++            }
++            5 => {
++                let v = tc.draw(generators::integers::<u8>());
++                assert_eq!(v, from_slice::<u8>(&to_vec(&v).unwrap()).unwrap());
++            }
++            6 => {
++                let v = tc.draw(generators::integers::<u16>());
++                assert_eq!(v, from_slice::<u16>(&to_vec(&v).unwrap()).unwrap());
++            }
++            7 => {
++                let v = tc.draw(generators::integers::<u32>());
++                assert_eq!(v, from_slice::<u32>(&to_vec(&v).unwrap()).unwrap());
++            }
++            8 => {
++                let v = tc.draw(u64_values());
++                assert_eq!(v, from_slice::<u64>(&to_vec(&v).unwrap()).unwrap());
++            }
++            _ => {
++                let v = tc.draw(generators::integers::<u128>());
++                assert_eq!(v, from_slice::<u128>(&to_vec(&v).unwrap()).unwrap());
++            }
++        }
++    }
++
++    /// Round-trip for floats generated from raw bit patterns (NaN payloads,
++    /// infinities, subnormals), compared bitwise.
++    #[hegel::test]
++    fn float_roundtrip_preserves_bits(tc: hegel::TestCase) {
++        if tc.draw(generators::booleans()) {
++            let v = f32::from_bits(tc.draw(generators::integers::<u32>()));
++            let back: f32 = from_slice(&to_vec(&v).unwrap()).unwrap();
++            assert_eq!(v.to_bits(), back.to_bits(), "f32 {v:?} came back as {back:?}");
++        } else {
++            let v = f64::from_bits(tc.draw(generators::integers::<u64>()));
++            let back: f64 = from_slice(&to_vec(&v).unwrap()).unwrap();
++            assert_eq!(v.to_bits(), back.to_bits(), "f64 {v:?} came back as {back:?}");
++        }
++    }
++
++    /// Round-trip for common std types: strings (full Unicode), chars,
++    /// options, sequences, maps, tuples and byte buffers.
++    #[hegel::test]
++    fn std_types_roundtrip(tc: hegel::TestCase) {
++        match tc.draw(generators::integers::<u8>().max_value(6)) {
++            0 => {
++                let v: String = tc.draw(generators::text());
++                assert_eq!(v, from_slice::<String>(&to_vec(&v).unwrap()).unwrap());
++            }
++            1 => {
++                let v = char::from_u32(tc.draw(generators::integers::<u32>().max_value(0x10FFFF)))
++                    .unwrap_or('\u{FFFD}');
++                assert_eq!(v, from_slice::<char>(&to_vec(&v).unwrap()).unwrap());
++            }
++            2 => {
++                let v: Option<String> = tc.draw(generators::optional(generators::text().max_size(20)));
++                assert_eq!(v, from_slice::<Option<String>>(&to_vec(&v).unwrap()).unwrap());
++            }
++            3 => {
++                let v: Vec<u64> = tc.draw(generators::vecs(u64_values()));
++                assert_eq!(v, from_slice::<Vec<u64>>(&to_vec(&v).unwrap()).unwrap());
++            }
++            4 => {
++                let v: BTreeMap<i64, String> = tc
++                    .draw(generators::hashmaps(
++                        i64_values(),
++                        generators::text().max_size(10),
++                    ))
++                    .into_iter()
++                    .collect();
++                assert_eq!(v, from_slice::<BTreeMap<i64, String>>(&to_vec(&v).unwrap()).unwrap());
++            }
++            5 => {
++                let v: (u8, String, Option<bool>) = (
++                    tc.draw(generators::integers::<u8>()),
++                    tc.draw(generators::text().max_size(20)),
++                    tc.draw(generators::optional(generators::booleans())),
++                );
++                assert_eq!(
++                    v,
++                    from_slice::<(u8, String, Option<bool>)>(&to_vec(&v).unwrap()).unwrap()
++                );
++            }
++            _ => {
++                let v = serde_bytes::ByteBuf::from(tc.draw(generators::binary()));
++                assert_eq!(v, from_slice::<serde_bytes::ByteBuf>(&to_vec(&v).unwrap()).unwrap());
++            }
++        }
++    }
++
++    /// Cross-crate consistency: for data with a direct `rmpv::Value`
++    /// equivalent, `rmp_serde::to_vec` must produce byte-for-byte the same
++    /// encoding as `rmpv::encode::write_value`.
++    #[hegel::test]
++    fn encoding_matches_rmpv_value_encoding(tc: hegel::TestCase) {
++        use rmpv::Value;
++
++        let (serde_encoded, value): (Vec<u8>, Value) =
++            match tc.draw(generators::integers::<u8>().max_value(9)) {
++                0 => {
++                    let n = tc.draw(u64_values());
++                    (to_vec(&n).unwrap(), Value::from(n))
++                }
++                1 => {
++                    let n = tc.draw(i64_values());
++                    (to_vec(&n).unwrap(), Value::from(n))
++                }
++                2 => {
++                    let f = f32::from_bits(tc.draw(generators::integers::<u32>()));
++                    (to_vec(&f).unwrap(), Value::F32(f))
++                }
++                3 => {
++                    let f = f64::from_bits(tc.draw(generators::integers::<u64>()));
++                    (to_vec(&f).unwrap(), Value::F64(f))
++                }
++                4 => {
++                    let b = tc.draw(generators::booleans());
++                    (to_vec(&b).unwrap(), Value::Boolean(b))
++                }
++                5 => {
++                    let s: String = tc.draw(generators::text().max_size(40));
++                    (to_vec(&s).unwrap(), Value::from(s))
++                }
++                6 => {
++                    let bytes: Vec<u8> = tc.draw(generators::binary().max_size(40));
++                    (
++                        to_vec(&serde_bytes::ByteBuf::from(bytes.clone())).unwrap(),
++                        Value::Binary(bytes),
++                    )
++                }
++                7 => {
++                    let v: Vec<i64> = tc.draw(generators::vecs(i64_values()).max_size(8));
++                    (
++                        to_vec(&v).unwrap(),
++                        Value::Array(v.into_iter().map(Value::from).collect()),
++                    )
++                }
++                8 => {
++                    let m: BTreeMap<String, i64> = tc
++                        .draw(generators::hashmaps(
++                            generators::text().max_size(10),
++                            i64_values(),
++                        ).max_size(5))
++                        .into_iter()
++                        .collect();
++                    let pairs = m
++                        .iter()
++                        .map(|(k, v)| (Value::from(k.clone()), Value::from(*v)))
++                        .collect();
++                    (to_vec(&m).unwrap(), Value::Map(pairs))
++                }
++                _ => {
++                    let o: Option<u32> = tc.draw(generators::optional(generators::integers::<u32>()));
++                    let value = o.map_or(Value::Nil, Value::from);
++                    (to_vec(&o).unwrap(), value)
++                }
++            };
++
++        let mut value_encoded = Vec::new();
++        rmpv::encode::write_value(&mut value_encoded, &value).unwrap();
++        assert_eq!(
++            serde_encoded, value_encoded,
++            "rmp-serde and rmpv disagree on the encoding of {value:?}"
++        );
++    }
++
++    /// Every strict prefix of a valid encoding must fail to deserialize
++    /// (MessagePack is self-delimiting, so a truncated value is incomplete).
++    #[hegel::test]
++    fn truncated_struct_encoding_fails(tc: hegel::TestCase) {
++        let val = tc.draw(outers());
++        let buf = to_vec(&val).unwrap();
++        let cut = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++        assert!(
++            from_slice::<Outer>(&buf[..cut]).is_err(),
++            "decoded a strict prefix ({cut}/{} bytes) of {val:?}",
++            buf.len()
++        );
++    }
++}
+diff --git a/rmpv/Cargo.toml b/rmpv/Cargo.toml
+index 2f64a7a..c07e616 100644
+--- a/rmpv/Cargo.toml
++++ b/rmpv/Cargo.toml
+@@ -21,6 +21,7 @@ rmp = { version = "0.8.14", path = "../rmp" }
+ serde = { version = "1.0.228", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.28.2"
+ quickcheck = "1.0.3"
+ 
+ [package.metadata.release]
+diff --git a/rmpv/tests/decode.rs b/rmpv/tests/decode.rs
+index 5430d9b..4c6407c 100644
+--- a/rmpv/tests/decode.rs
++++ b/rmpv/tests/decode.rs
+@@ -401,3 +401,105 @@ fn invalid_buf_size_arr() {
+         Err(e) => panic!("Unexpected error: {e}"),
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Hegel property-based tests: decoder robustness on arbitrary input.
++// ---------------------------------------------------------------------------
++
++use hegel::generators;
++use rmpv::decode::read_value_ref;
++
++/// Structural equality comparing floats by bit pattern (NaN-safe).
++fn values_eq(a: &Value, b: &Value) -> bool {
++    match (a, b) {
++        (Value::F32(x), Value::F32(y)) => x.to_bits() == y.to_bits(),
++        (Value::F64(x), Value::F64(y)) => x.to_bits() == y.to_bits(),
++        (Value::Array(x), Value::Array(y)) => {
++            x.len() == y.len() && x.iter().zip(y).all(|(u, v)| values_eq(u, v))
++        }
++        (Value::Map(x), Value::Map(y)) => {
++            x.len() == y.len()
++                && x.iter()
++                    .zip(y)
++                    .all(|((ka, va), (kb, vb))| values_eq(ka, kb) && values_eq(va, vb))
++        }
++        _ => a == b,
++    }
++}
++
++/// Robustness: feeding completely arbitrary bytes to either decoder must
++/// never panic, and both decoders must agree on success/failure and on the
++/// decoded value.
++#[hegel::test]
++fn arbitrary_bytes_never_panic_and_decoders_agree(tc: hegel::TestCase) {
++    let bytes: Vec<u8> = tc.draw(generators::binary().max_size(300));
++
++    let owned = read_value(&mut &bytes[..]);
++    let by_ref = read_value_ref(&mut &bytes[..]);
++    match (owned, by_ref) {
++        (Ok(a), Ok(b)) => {
++            let b = b.to_owned();
++            assert!(values_eq(&a, &b), "read_value gave {a:?}, read_value_ref gave {b:?}");
++        }
++        (Err(_), Err(_)) => {}
++        (a, b) => panic!("decoders disagree on arbitrary input {bytes:02x?}: {a:?} vs {b:?}"),
++    }
++}
++
++/// Depth limiting: the recursion budget passed to
++/// `read_value_with_max_depth` is enforced exactly (each array level costs
++/// two units of budget: one for the value, one for the array payload),
++/// exceeding it yields `Error::DepthLimitExceeded`, and both decoders agree.
++///
++/// The nesting depth is capped at 250 levels to protect this test from the
++/// known debug-build stack overflow pinned by
++/// `known_bug_stack_overflow_within_max_depth` below; the cap protects the
++/// test process, not the library's contract.
++#[hegel::test]
++fn nesting_depth_limit_is_enforced_without_crashing(tc: hegel::TestCase) {
++    let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(250));
++    let max_depth = tc.draw(generators::integers::<usize>().max_value(600));
++    let mut bytes = vec![0x91; depth - 1]; // single-element arrays ...
++    bytes.push(0x90); // ... terminated by an empty array
++
++    let owned = rmpv::decode::read_value_with_max_depth(&mut &bytes[..], max_depth);
++    let by_ref = rmpv::decode::read_value_ref_with_max_depth(&mut &bytes[..], max_depth);
++    assert_eq!(
++        owned.is_ok(),
++        by_ref.is_ok(),
++        "decoders disagree at nesting depth {depth} (max_depth {max_depth}): {owned:?} vs {by_ref:?}"
++    );
++
++    if 2 * depth <= max_depth {
++        assert!(
++            owned.is_ok(),
++            "depth {depth} within budget {max_depth} failed: {owned:?}"
++        );
++    } else {
++        assert!(
++            matches!(owned, Err(Error::DepthLimitExceeded)),
++            "depth {depth} over budget {max_depth} gave {owned:?}"
++        );
++    }
++}
++
++/// KNOWN BUG (kept `#[ignore]`d because it aborts the process): in debug
++/// builds, `read_value` overflows the thread stack at roughly 380 levels of
++/// array nesting -- far below its own `MAX_DEPTH` guard of 1024, whose
++/// documented purpose is to bound recursion. In release builds the same
++/// input decodes fine (recursion is only limited at ~512 levels, where
++/// `DepthLimitExceeded` is returned as intended), so the guard constant is
++/// simply too large for debug-build stack frames. Discovered by the hegel
++/// property `nesting_depth_limit_is_enforced_without_crashing` before its
++/// depth cap was added.
++///
++/// Run with: cargo test -p rmpv --test decode -- --ignored
++/// (expect SIGABRT "has overflowed its stack" in debug profile)
++#[test]
++#[ignore = "aborts the process in debug builds: stack overflow within MAX_DEPTH"]
++fn known_bug_stack_overflow_within_max_depth() {
++    let depth = 380; // < MAX_DEPTH = 1024, yet overflows a debug-build stack
++    let mut bytes = vec![0x91; depth - 1];
++    bytes.push(0x90);
++    let _ = read_value(&mut &bytes[..]);
++}
+diff --git a/rmpv/tests/mirror.rs b/rmpv/tests/mirror.rs
+index f3b4165..cf507ec 100644
+--- a/rmpv/tests/mirror.rs
++++ b/rmpv/tests/mirror.rs
+@@ -43,3 +43,317 @@ quickcheck! {
+         mirror_test(xs)
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Hegel property-based tests.
++//
++// These extend the quickcheck mirror tests above to the full `Value` domain:
++// recursive values, integers at every marker-width boundary, float NaN bit
++// patterns, ext values and nested containers.
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self, Generator};
++use rmpv::decode::read_value_ref;
++
++/// All width boundaries of the MessagePack unsigned integer formats.
++const U64_BOUNDARIES: [u64; 14] = [
++    0,
++    1,
++    127,
++    128,
++    255,
++    256,
++    65535,
++    65536,
++    4294967295,
++    4294967296,
++    i64::MAX as u64,
++    i64::MAX as u64 + 1,
++    u64::MAX - 1,
++    u64::MAX,
++];
++
++/// All width boundaries of the MessagePack signed integer formats.
++const I64_BOUNDARIES: [i64; 16] = [
++    i64::MIN,
++    i64::MIN + 1,
++    -2147483649,
++    -2147483648,
++    -32769,
++    -32768,
++    -129,
++    -128,
++    -33,
++    -32,
++    -1,
++    0,
++    1,
++    127,
++    128,
++    i64::MAX,
++];
++
++fn u64_values() -> generators::BoxedGenerator<'static, u64> {
++    hegel::one_of!(
++        generators::integers::<u64>().boxed(),
++        generators::sampled_from(U64_BOUNDARIES.to_vec()).boxed(),
++    )
++    .boxed()
++}
++
++fn i64_values() -> generators::BoxedGenerator<'static, i64> {
++    hegel::one_of!(
++        generators::integers::<i64>().boxed(),
++        generators::sampled_from(I64_BOUNDARIES.to_vec()).boxed(),
++    )
++    .boxed()
++}
++
++/// Generates an arbitrary `Value`, recursing up to `depth` container levels.
++///
++/// Strings are always valid UTF-8: `write_value` deliberately encodes
++/// invalid-UTF-8 `Value::String`s with the *bin* marker (see
++/// `rmpv/src/encode/value.rs`), so they decode as `Value::Binary` and do not
++/// round-trip by design.
++fn arbitrary_values(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++    hegel::compose!(|tc| {
++        let max_kind = if depth == 0 { 8 } else { 10 };
++        match tc.draw(generators::integers::<u8>().max_value(max_kind)) {
++            0 => Value::Nil,
++            1 => Value::Boolean(tc.draw(generators::booleans())),
++            2 => Value::from(tc.draw(u64_values())),
++            3 => Value::from(tc.draw(i64_values())),
++            // Floats from raw bits so NaN payloads and infinities are covered.
++            4 => Value::F32(f32::from_bits(tc.draw(generators::integers::<u32>()))),
++            5 => Value::F64(f64::from_bits(tc.draw(generators::integers::<u64>()))),
++            6 => Value::from(tc.draw(generators::text().max_size(40))),
++            7 => Value::Binary(tc.draw(generators::binary().max_size(40))),
++            8 => {
++                let ty = tc.draw(generators::integers::<i8>());
++                let data = tc.draw(generators::binary().max_size(40));
++                Value::Ext(ty, data)
++            }
++            9 => Value::Array(tc.draw(generators::vecs(arbitrary_values(depth - 1)).max_size(6))),
++            _ => Value::Map(tc.draw(
++                generators::vecs(generators::tuples!(
++                    arbitrary_values(depth - 1),
++                    arbitrary_values(depth - 1),
++                ))
++                .max_size(4),
++            )),
++        }
++    })
++    .boxed()
++}
++
++/// Structural equality that compares floats by bit pattern, so NaN values
++/// (which `PartialEq` reports unequal) still count as round-tripped.
++fn values_eq(a: &Value, b: &Value) -> bool {
++    match (a, b) {
++        (Value::F32(x), Value::F32(y)) => x.to_bits() == y.to_bits(),
++        (Value::F64(x), Value::F64(y)) => x.to_bits() == y.to_bits(),
++        (Value::Array(x), Value::Array(y)) => {
++            x.len() == y.len() && x.iter().zip(y).all(|(u, v)| values_eq(u, v))
++        }
++        (Value::Map(x), Value::Map(y)) => {
++            x.len() == y.len()
++                && x.iter()
++                    .zip(y)
++                    .all(|((ka, va), (kb, vb))| values_eq(ka, kb) && values_eq(va, vb))
++        }
++        _ => a == b,
++    }
++}
++
++/// Round-trip: `read_value` inverts `write_value` for every `Value`,
++/// including NaN bit patterns (compared bitwise).
++#[hegel::test]
++fn mirror_arbitrary_value(tc: hegel::TestCase) {
++    let val = tc.draw(arbitrary_values(3));
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    let out = read_value(&mut &buf[..]).unwrap();
++    assert!(values_eq(&val, &out), "wrote {val:?}, read back {out:?}");
++}
++
++/// Consistency: the zero-copy decoder agrees with the owned decoder on every
++/// valid encoding.
++#[hegel::test]
++fn mirror_value_ref_agrees_with_value(tc: hegel::TestCase) {
++    let val = tc.draw(arbitrary_values(3));
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    let owned = read_value(&mut &buf[..]).unwrap();
++    let by_ref = read_value_ref(&mut &buf[..]).unwrap().to_owned();
++    assert!(
++        values_eq(&owned, &by_ref),
++        "read_value gave {owned:?}, read_value_ref gave {by_ref:?}"
++    );
++}
++
++/// Expected (first byte, total encoded length) for an unsigned integer,
++/// derived independently from the MessagePack spec's smallest-width rule.
++fn expected_uint_encoding(n: u64) -> (u8, usize) {
++    if n < 128 {
++        (n as u8, 1) // positive fixint
++    } else if n < 256 {
++        (0xcc, 2) // uint 8
++    } else if n < 65536 {
++        (0xcd, 3) // uint 16
++    } else if n < 4294967296 {
++        (0xce, 5) // uint 32
++    } else {
++        (0xcf, 9) // uint 64
++    }
++}
++
++/// Expected (first byte, total encoded length) for a negative integer.
++fn expected_sint_encoding(n: i64) -> (u8, usize) {
++    assert!(n < 0);
++    if n >= -32 {
++        (n as u8, 1) // negative fixint, 0xe0..=0xff
++    } else if n >= -128 {
++        (0xd0, 2) // int 8
++    } else if n >= -32768 {
++        (0xd1, 3) // int 16
++    } else if n >= -2147483648 {
++        (0xd2, 5) // int 32
++    } else {
++        (0xd3, 9) // int 64
++    }
++}
++
++/// Spec conformance: `write_value` encodes every integer with the
++/// smallest-width marker ("a serializer SHOULD use the format which
++/// represents the data in the smallest number of bytes").
++#[hegel::test]
++fn integer_encoding_uses_smallest_width(tc: hegel::TestCase) {
++    let (val, (first, total)) = if tc.draw(generators::booleans()) {
++        let n = tc.draw(u64_values());
++        (Value::from(n), expected_uint_encoding(n))
++    } else {
++        let n = tc.draw(i64_values());
++        let expected = if n >= 0 {
++            expected_uint_encoding(n as u64)
++        } else {
++            expected_sint_encoding(n)
++        };
++        (Value::from(n), expected)
++    };
++
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    assert_eq!(buf[0], first, "wrong marker for {val:?}: {buf:02x?}");
++    assert_eq!(buf.len(), total, "wrong width for {val:?}: {buf:02x?}");
++}
++
++/// Spec conformance: str/bin/array/map length headers use the smallest-width
++/// format for the payload length.
++#[hegel::test]
++fn length_markers_use_smallest_width(tc: hegel::TestCase) {
++    let len: usize = tc.draw(hegel::one_of!(
++        generators::integers::<usize>().max_value(40).boxed(),
++        generators::sampled_from(vec![15, 16, 31, 32, 255, 256, 65535, 65536, 66000]).boxed(),
++    ));
++
++    // (value, expected first byte, header length, payload length)
++    let (val, first, header, payload) = match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => {
++            let first_header = if len < 32 {
++                (0xa0 | len as u8, 1) // fixstr
++            } else if len < 256 {
++                (0xd9, 2) // str 8
++            } else if len < 65536 {
++                (0xda, 3) // str 16
++            } else {
++                (0xdb, 5) // str 32
++            };
++            (Value::from("a".repeat(len)), first_header.0, first_header.1, len)
++        }
++        1 => {
++            let first_header = if len < 256 {
++                (0xc4, 2) // bin 8
++            } else if len < 65536 {
++                (0xc5, 3) // bin 16
++            } else {
++                (0xc6, 5) // bin 32
++            };
++            (Value::Binary(vec![0u8; len]), first_header.0, first_header.1, len)
++        }
++        2 => {
++            let first_header = if len < 16 {
++                (0x90 | len as u8, 1) // fixarray
++            } else if len < 65536 {
++                (0xdc, 3) // array 16
++            } else {
++                (0xdd, 5) // array 32
++            };
++            // Nil elements: 1 byte each.
++            (Value::Array(vec![Value::Nil; len]), first_header.0, first_header.1, len)
++        }
++        _ => {
++            let first_header = if len < 16 {
++                (0x80 | len as u8, 1) // fixmap
++            } else if len < 65536 {
++                (0xde, 3) // map 16
++            } else {
++                (0xdf, 5) // map 32
++            };
++            // Nil key + Nil value: 2 bytes per entry.
++            (
++                Value::Map(vec![(Value::Nil, Value::Nil); len]),
++                first_header.0,
++                first_header.1,
++                2 * len,
++            )
++        }
++    };
++
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    assert_eq!(buf[0], first, "wrong marker for len {len}: {:02x?}", &buf[..buf.len().min(8)]);
++    assert_eq!(buf.len(), header + payload, "wrong total size for len {len}");
++}
++
++/// Every strict prefix of a valid encoding is an incomplete value: both
++/// decoders must return an error (and must not panic).
++#[hegel::test]
++fn truncated_encoding_fails_to_decode(tc: hegel::TestCase) {
++    let val = tc.draw(arbitrary_values(3));
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    let cut = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++
++    assert!(
++        read_value(&mut &buf[..cut]).is_err(),
++        "read_value decoded a strict prefix ({cut}/{} bytes) of {val:?}",
++        buf.len()
++    );
++    assert!(
++        read_value_ref(&mut &buf[..cut]).is_err(),
++        "read_value_ref decoded a strict prefix ({cut}/{} bytes) of {val:?}",
++        buf.len()
++    );
++}
++
++/// Robustness/consistency: corrupting one byte of a valid encoding must never
++/// panic either decoder, and both decoders must still agree on the result.
++#[hegel::test]
++fn mutated_encoding_never_panics_and_decoders_agree(tc: hegel::TestCase) {
++    let val = tc.draw(arbitrary_values(3));
++    let mut buf = Vec::new();
++    write_value(&mut buf, &val).unwrap();
++    let idx = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++    buf[idx] = tc.draw(generators::integers::<u8>());
++
++    let owned = read_value(&mut &buf[..]);
++    let by_ref = read_value_ref(&mut &buf[..]);
++    match (owned, by_ref) {
++        (Ok(a), Ok(b)) => {
++            let b = b.to_owned();
++            assert!(values_eq(&a, &b), "read_value gave {a:?}, read_value_ref gave {b:?}");
++        }
++        (Err(_), Err(_)) => {}
++        (a, b) => panic!("decoders disagree on corrupted input: {a:?} vs {b:?}"),
++    }
++}
