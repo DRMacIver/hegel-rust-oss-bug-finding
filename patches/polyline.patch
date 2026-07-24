@@ -1,0 +1,452 @@
+diff --git a/.gitignore b/.gitignore
+index a9d37c5..16f6b9f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,3 @@
+ target
+ Cargo.lock
++.hegel/
+diff --git a/Cargo.toml b/Cargo.toml
+index 523c6a2..37a1d3c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,7 @@ geo-types = "0.7.8"
+ rand = "0.8.5"
+ criterion = "0.5.1"
+ flexpolyline = "0.1.0"
++hegeltest = "0.28.2"
+ 
+ [lib]
+ bench = false
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..600b40d
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,96 @@
++# Hegel property-based testing report: `polyline` 0.11.0
++
++Target: georust/polyline (Google Encoded Polyline encoder/decoder), commit `7fc654d`.
++Tests added to the existing `tests` module in `src/lib.rs` (10 properties, `hegeltest` 0.28.2).
++Note: the run prompt mentioned existing quickcheck tests, but this checkout has none —
++existing coverage is example-based unit tests in `src/lib.rs` plus a seeded-rand criterion
++bench. The unit tests were kept unchanged and supplemented.
++
++## Properties tested
++
++| Test | Property | Evidence |
++|---|---|---|
++| `prop_encode_decode_roundtrip_within_tolerance` | Crown roundtrip: for any line of in-range coords (incl. empty, single-point, up to 200 points), `decode(encode(line, p), p)` recovers every coordinate within `0.5 * 10^-p + 1e-10`, per coordinate (not cumulative — delta encoding drift would fail this), at p = 5 and 6. Also `encoded.is_empty() == line.is_empty()` and length preservation. | Crate docs: "lossy compression algorithm"; `scale()` rounds to the 10^-p grid; existing `precision5`/`precision6`/`rounding_error` unit tests. |
++| `prop_higher_precision_loses_less` | Precision monotonicity: per coordinate, the p=6 roundtrip error is ≤ the p=5 error (+1e-9 for f64 tie noise). Grounded in the 1e-5 grid being a subset of the 1e-6 grid. | Algorithm definition (grid rounding at 10^-p). |
++| `prop_decode_encode_fixpoint` | Canonical roundtrip: `encode(decode(s, p), p) == s` for any `s` produced by the encoder, and decoding again is a value fixpoint. Precision drawn 0..=9. | Decoded values sit exactly on the grid (integer deltas accumulated in i64, divided once); existing unit tests assert exact string equality both ways. |
++| `prop_rounding_boundary_roundtrip` | Boundary hunting: coordinates constructed exactly on grid points `k*10^-p` and at round-half tie offsets (±0.49/±0.5/±0.51 grid steps), clamped to ±90/±180, still encode Ok and decode within tolerance. | `scale()` uses `.round()` (half-away-from-zero); existing `limits` and `rounding_error` tests. |
++| `prop_out_of_range_coordinates_rejected` | Validation: inserting one out-of-range coordinate (beyond ±90/±180, ±inf, or NaN) at any position in an otherwise-valid line makes `encode_coordinates` return the matching error variant with the correct `idx` and offending `coord` value. | `MIN/MAX_LATITUDE/LONGITUDE` range checks in `encode_coordinates`; `PolylineError::{Latitude,Longitude}CoordError` fields; existing `bad_coords` test. |
++| `prop_decode_never_panics_on_arbitrary_strings` | Parse robustness: `decode_polyline` on arbitrary full-Unicode strings (precision 0..=9) returns Ok/Err, never panics. | Doc: "Returns an error if the polyline is invalid"; existing `broken_string`/`invalid_string` tests. |
++| `prop_decode_polyline_alphabet_no_panic_and_in_range` | Parse robustness on polyline-shaped input: strings of bytes 63..=126 (the polyline alphabet, up to ~300 bytes to force long varint chains) never panic, and any `Ok` result contains only in-range coordinates. | Doc: "Returns an error … if the decoded coordinates are out of bounds"; the `shift > 64 - 5` overflow guard in `decode_next`; existing `should_not_trigger_overflow` test. |
++| `prop_decode_corrupted_polyline_never_panics` | Corruption robustness: truncating a valid polyline at any byte, overwriting any byte with arbitrary ASCII, or inserting an ASCII byte is handled gracefully (no panic; Ok results in range). | Existing `truncated` test (one hardcoded case) generalized. |
++| `prop_empty_and_single_point_roundtrip` | Degenerate shapes: empty line ↔ `""` exactly; single-point line roundtrips within tolerance. | `encode_coordinates` loop structure (empty iterator → empty string); decode `while peek` loop. |
++| `prop_any_precision_no_panic` | The `precision: u32` parameter is unrestricted and undocumented-unbounded; encode/decode should return Ok/Err for any value, never panic. **FAILS — real bug, see below.** | Public signatures `encode_coordinates(_, precision: u32)` / `decode_polyline(_, precision: u32)`; no documented bound. |
++
++## Test results
++
++`cargo test`: **19 passed, 1 failed** — the failure is `prop_any_precision_no_panic`,
++kept failing deliberately to pin a real bug (see below). All 10 pre-existing unit
++tests still pass.
++
++Run-and-reflect checks performed:
++- **Liveness**: temporarily set the crown-roundtrip tolerance to 0 — hegel failed with
++  a shrunk counterexample (`lat 1.015625 -> 1.01563, precision 5`); reverted, `.hegel/` cleared.
++- **Guarded branches fire**: with temporary counters at 10x cases, the `if let Ok(...)`
++  branch fired 91/1000 cases in the alphabet test and 197/1000 in the corruption test —
++  neither property is vacuous.
++- **Exploratory 10x run**: all properties run at `test_cases = 1000` (verified via a case
++  counter printing 1003 `RT_CASE` lines, not wall clock). No additional failures found;
++  instrumentation reverted (final file diff-identical to the reviewed version plus nothing).
++
++## Suspected bugs
++
++**Panic (debug) / silent wrap (release) on `precision >= 10` in both `encode_coordinates`
++and `decode_polyline`.**
++
++- Minimal counterexample (hegel-shrunk, reproduces every run): `precision = 10` with any
++  non-empty input, e.g. `encode_coordinates(vec![Coord { x: -120.2, y: 38.5 }], 10)`.
++- Failure: `attempt to multiply with overflow` in `i32::pow` (thread panic, debug profile).
++- Code path: `src/lib.rs:75` (`let factor: i32 = base.pow(precision);` in
++  `encode_coordinates`) and `src/lib.rs:131` (`i64::from(base.pow(precision))` in
++  `decode_polyline`). `10^10 = 10_000_000_000 > i32::MAX`; in release builds `pow`
++  wraps instead, producing a garbage factor and silently wrong coordinates rather than
++  an `Err`.
++- Why a library bug, not a test bug: oracle-independent (a panic), on a public API whose
++  `precision: u32` parameter documents no upper bound, in a crate whose decode API
++  explicitly promises `Err` on invalid input. Either the overflow should return
++  `Err`, or the valid precision range should be documented/enforced.
++- Pinned by `prop_any_precision_no_panic` (KNOWN FAILURE comment in the test); the
++  generator includes a `sampled_from([10, 11, 31, u32::MAX])` branch so the failure is
++  deterministic, and it shrinks to `precision = 10`.
++
++## Unsound properties abandoned
++
++None abandoned outright. Two properties were designed around subtleties rather than
++discovered by failure:
++- Precision monotonicity is asserted per-coordinate with a `+1e-9` epsilon because
++  `.round()` half-away-from-zero ties plus f64 product rounding in `scale()` can make
++  the p=6 error equal (not strictly less than) the p=5 error.
++- The canonical decode→encode fixpoint is only claimed for encoder-produced strings
++  (encode∘decode∘encode == encode), not for arbitrary valid-alphabet strings — a
++  hand-crafted polyline may use non-canonical chunk encodings the encoder never emits,
++  and the crate makes no canonicalization promise.
++
++## Skill feedback
++
++Mostly everything just worked; hegeltest 0.28.2 compiled and ran first try on this
++edition-2021 crate.
++
++- The rust reference's gotcha list was accurate and useful: the `Generator` trait
++  import warning (gotcha in reference.md line ~183) hit exactly as described — I
++  imported `Generator` preemptively, used only builder/config methods and `one_of!`,
++  and got `unused_imports`; the reference told me in advance this would happen but it
++  would be worth stating explicitly that `one_of!` does *not* require the trait import.
++- The "helper functions taking `&TestCase`" pattern was the right tool for
++  `draw_lat`/`draw_lng`/`draw_line`; clearer than composites for this crate. Reference
++  section was clear.
++- The SKILL.md guidance "confirm the guarded branch is reached" (Run and Reflect) was
++  directly load-bearing here: two properties have `if let Ok(...)` guards, and the
++  counter check proved they fire (9%/20% of cases). Without that instruction the
++  alphabet property could plausibly have been vacuous.
++- The "no global case-count override" gotcha (no `PROPTEST_CASES` equivalent) cost a
++  sed round-trip to run the 10x pass and revert. A `HEGEL_TEST_CASES` env var would
++  remove the most error-prone manual step in the workflow.
++- SKILL.md's "Generate Configurations, Not Just Payloads" is what prompted drawing
++  `precision` as an input rather than hardcoding 5 — that is what found the only real
++  bug. Worth cross-linking that section from the roundtrip pattern, since codecs'
++  precision/level parameters are exactly this shape.
+diff --git a/src/lib.rs b/src/lib.rs
+index 506a582..64a35ab 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -349,4 +349,325 @@ mod tests {
+             _ => panic!("Got wrong error"),
+         }
+     }
++
++    // -----------------------------------------------------------------
++    // Property-based tests (hegel)
++    // -----------------------------------------------------------------
++
++    use crate::errors::PolylineError;
++    use geo_types::Coord;
++    use hegel::generators::{self};
++
++    /// Longitude in [-180, 180], with the exact boundary values boosted.
++    fn draw_lng(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>().min_value(-180.0).max_value(180.0),
++            generators::sampled_from(vec![-180.0, 180.0, 0.0, -0.0]),
++        ))
++    }
++
++    /// Latitude in [-90, 90], with the exact boundary values boosted.
++    fn draw_lat(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>().min_value(-90.0).max_value(90.0),
++            generators::sampled_from(vec![-90.0, 90.0, 0.0, -0.0]),
++        ))
++    }
++
++    /// A line of `min_len..=200` in-range coordinates. Long lines matter:
++    /// the format delta-encodes, so a per-coordinate error that accumulated
++    /// across deltas would only show up on many-point lines.
++    fn draw_line(tc: &hegel::TestCase, min_len: usize) -> Vec<Coord<f64>> {
++        let n = tc.draw(
++            generators::integers::<usize>()
++                .min_value(min_len)
++                .max_value(200),
++        );
++        (0..n)
++            .map(|_| Coord {
++                x: draw_lng(tc),
++                y: draw_lat(tc),
++            })
++            .collect()
++    }
++
++    /// Worst-case rounding error when snapping to the 10^-precision grid,
++    /// plus a small epsilon for f64 scaling noise in `scale()`/decode division.
++    fn tolerance(precision: u32) -> f64 {
++        0.5 / 10f64.powi(precision as i32) + 1e-10
++    }
++
++    /// Crown roundtrip: encoding is lossy (grid rounding), but every decoded
++    /// coordinate must be within half a grid step of the original — checked
++    /// per coordinate, so delta-encoding drift on long lines would fail it.
++    #[hegel::test]
++    fn prop_encode_decode_roundtrip_within_tolerance(tc: hegel::TestCase) {
++        let precision = tc.draw(generators::sampled_from(vec![5u32, 6]));
++        let coords = draw_line(&tc, 0);
++        let encoded = encode_coordinates(coords.iter().copied(), precision).unwrap();
++        assert_eq!(encoded.is_empty(), coords.is_empty());
++        let decoded = decode_polyline(&encoded, precision).unwrap();
++        assert_eq!(decoded.0.len(), coords.len());
++        let tol = tolerance(precision);
++        for (i, (orig, dec)) in coords.iter().zip(decoded.0.iter()).enumerate() {
++            assert!(
++                (orig.x - dec.x).abs() <= tol,
++                "lng drift at index {i}: {} -> {} (tol {tol}, precision {precision})",
++                orig.x,
++                dec.x
++            );
++            assert!(
++                (orig.y - dec.y).abs() <= tol,
++                "lat drift at index {i}: {} -> {} (tol {tol}, precision {precision})",
++                orig.y,
++                dec.y
++            );
++        }
++    }
++
++    /// Precision monotonicity: for the same input, precision 6 must recover
++    /// each coordinate at least as accurately as precision 5 (the 1e-5 grid
++    /// is a subset of the 1e-6 grid; epsilon covers f64 tie-rounding noise).
++    #[hegel::test]
++    fn prop_higher_precision_loses_less(tc: hegel::TestCase) {
++        let coords = draw_line(&tc, 0);
++        let d5 =
++            decode_polyline(&encode_coordinates(coords.iter().copied(), 5).unwrap(), 5).unwrap();
++        let d6 =
++            decode_polyline(&encode_coordinates(coords.iter().copied(), 6).unwrap(), 6).unwrap();
++        for ((orig, c5), c6) in coords.iter().zip(d5.0.iter()).zip(d6.0.iter()) {
++            assert!(
++                (orig.x - c6.x).abs() <= (orig.x - c5.x).abs() + 1e-9,
++                "lng: precision 6 lost more than precision 5 for {}",
++                orig.x
++            );
++            assert!(
++                (orig.y - c6.y).abs() <= (orig.y - c5.y).abs() + 1e-9,
++                "lat: precision 6 lost more than precision 5 for {}",
++                orig.y
++            );
++        }
++    }
++
++    /// Canonical roundtrip: decode(encode(line)) is on the grid, so
++    /// re-encoding must reproduce the exact same string, and decoding that
++    /// string must be a fixpoint (no further value drift).
++    #[hegel::test]
++    fn prop_decode_encode_fixpoint(tc: hegel::TestCase) {
++        let precision = tc.draw(generators::integers::<u32>().max_value(9));
++        let coords = draw_line(&tc, 0);
++        let encoded = encode_coordinates(coords.iter().copied(), precision).unwrap();
++        let decoded = decode_polyline(&encoded, precision).unwrap();
++        let reencoded = encode_coordinates(decoded.coords().copied(), precision).unwrap();
++        assert_eq!(encoded, reencoded, "re-encoding a decoded polyline changed the string");
++        let decoded_again = decode_polyline(&reencoded, precision).unwrap();
++        assert_eq!(decoded, decoded_again, "decode∘encode is not a fixpoint");
++    }
++
++    /// A coordinate value on or near the rounding grid: k*10^-p plus an
++    /// offset right at the round-half boundary (clamped into range).
++    fn draw_near_grid(tc: &hegel::TestCase, max_abs: f64, factor: f64) -> f64 {
++        let max_scaled = (max_abs * factor) as i64;
++        let k = tc.draw(
++            generators::integers::<i64>()
++                .min_value(-max_scaled)
++                .max_value(max_scaled),
++        );
++        let off = tc.draw(generators::sampled_from(vec![
++            0.0,
++            0.49 / factor,
++            -0.49 / factor,
++            0.5 / factor,
++            -0.5 / factor,
++            0.51 / factor,
++            -0.51 / factor,
++        ]));
++        (k as f64 / factor + off).clamp(-max_abs, max_abs)
++    }
++
++    /// Boundary hunting: coordinates sitting exactly on grid points and at
++    /// the round-half tie boundaries (including clamped ±90/±180) must still
++    /// encode successfully and decode within tolerance.
++    #[hegel::test]
++    fn prop_rounding_boundary_roundtrip(tc: hegel::TestCase) {
++        let precision = tc.draw(generators::sampled_from(vec![5u32, 6]));
++        let factor = 10f64.powi(precision as i32);
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(20));
++        let coords: Vec<Coord<f64>> = (0..n)
++            .map(|_| Coord {
++                x: draw_near_grid(&tc, 180.0, factor),
++                y: draw_near_grid(&tc, 90.0, factor),
++            })
++            .collect();
++        let encoded = encode_coordinates(coords.iter().copied(), precision).unwrap();
++        let decoded = decode_polyline(&encoded, precision).unwrap();
++        assert_eq!(decoded.0.len(), coords.len());
++        let tol = tolerance(precision);
++        for (orig, dec) in coords.iter().zip(decoded.0.iter()) {
++            assert!((orig.x - dec.x).abs() <= tol, "lng {} -> {}", orig.x, dec.x);
++            assert!((orig.y - dec.y).abs() <= tol, "lat {} -> {}", orig.y, dec.y);
++        }
++    }
++
++    /// An out-of-range value for an axis whose valid range is [-limit, limit]:
++    /// beyond either end (up to infinity) or NaN.
++    fn draw_out_of_range(tc: &hegel::TestCase, limit: f64) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>().min_value(limit).exclude_min(true),
++            generators::floats::<f64>().max_value(-limit).exclude_max(true),
++            generators::sampled_from(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]),
++        ))
++    }
++
++    /// Validation: a line with one out-of-range coordinate anywhere in it is
++    /// rejected with the right error variant, index, and offending value.
++    #[hegel::test]
++    fn prop_out_of_range_coordinates_rejected(tc: hegel::TestCase) {
++        let mut coords = draw_line(&tc, 0);
++        let idx = tc.draw(generators::integers::<usize>().max_value(coords.len()));
++        let corrupt_lat = tc.draw(generators::booleans());
++        let bad = if corrupt_lat {
++            Coord {
++                x: draw_lng(&tc),
++                y: draw_out_of_range(&tc, 90.0),
++            }
++        } else {
++            Coord {
++                x: draw_out_of_range(&tc, 180.0),
++                y: draw_lat(&tc),
++            }
++        };
++        coords.insert(idx, bad);
++        let precision = tc.draw(generators::sampled_from(vec![5u32, 6]));
++        let err = encode_coordinates(coords.iter().copied(), precision).unwrap_err();
++        match err {
++            PolylineError::LatitudeCoordError { coord, idx: err_idx } => {
++                assert!(corrupt_lat, "got latitude error for a bad longitude");
++                assert_eq!(err_idx, idx);
++                assert!(coord == bad.y || (coord.is_nan() && bad.y.is_nan()));
++            }
++            PolylineError::LongitudeCoordError { coord, idx: err_idx } => {
++                assert!(!corrupt_lat, "got longitude error for a bad latitude");
++                assert_eq!(err_idx, idx);
++                assert!(coord == bad.x || (coord.is_nan() && bad.x.is_nan()));
++            }
++            other => panic!("unexpected error variant: {:?}", other),
++        }
++    }
++
++    /// Parse robustness: decoding arbitrary (full Unicode) strings must
++    /// return Ok/Err, never panic.
++    #[hegel::test]
++    fn prop_decode_never_panics_on_arbitrary_strings(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text());
++        let precision = tc.draw(generators::integers::<u32>().max_value(9));
++        drop(decode_polyline(&s, precision));
++    }
++
++    /// Parse robustness on polyline-shaped input: strings drawn from the
++    /// polyline alphabet (bytes 63..=126) exercise the varint-chunk decoder
++    /// deeply. Must never panic, and (per the docs) any Ok result contains
++    /// only in-range coordinates.
++    #[hegel::test]
++    fn prop_decode_polyline_alphabet_no_panic_and_in_range(tc: hegel::TestCase) {
++        let len = tc.draw(generators::integers::<usize>().max_value(300));
++        let bytes: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().min_value(63).max_value(126))
++                .min_size(len),
++        );
++        let s = String::from_utf8(bytes).unwrap();
++        let precision = tc.draw(generators::integers::<u32>().max_value(9));
++        if let Ok(line) = decode_polyline(&s, precision) {
++            for c in line.coords() {
++                assert!(
++                    (-90.0..=90.0).contains(&c.y) && (-180.0..=180.0).contains(&c.x),
++                    "decode returned Ok with out-of-range coordinate {:?}",
++                    c
++                );
++            }
++        }
++    }
++
++    /// Robustness against corruption of a *valid* polyline: truncating it at
++    /// any byte, overwriting any byte with arbitrary ASCII, or inserting an
++    /// ASCII byte must be handled gracefully (no panic; Ok results in range).
++    #[hegel::test]
++    fn prop_decode_corrupted_polyline_never_panics(tc: hegel::TestCase) {
++        let precision = tc.draw(generators::sampled_from(vec![5u32, 6]));
++        let coords = draw_line(&tc, 1);
++        let mut bytes = encode_coordinates(coords.iter().copied(), precision)
++            .unwrap()
++            .into_bytes();
++        let kind = tc.draw(generators::integers::<u8>().max_value(2));
++        let pos = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++        // ASCII-only mutations keep the buffer valid UTF-8.
++        match kind {
++            0 => bytes.truncate(pos),
++            1 => {
++                let pos = pos.min(bytes.len() - 1);
++                bytes[pos] = tc.draw(generators::integers::<u8>().max_value(127));
++            }
++            _ => bytes.insert(pos, tc.draw(generators::integers::<u8>().max_value(127))),
++        }
++        let s = String::from_utf8(bytes).unwrap();
++        if let Ok(line) = decode_polyline(&s, precision) {
++            for c in line.coords() {
++                assert!(
++                    (-90.0..=90.0).contains(&c.y) && (-180.0..=180.0).contains(&c.x),
++                    "decode returned Ok with out-of-range coordinate {:?}",
++                    c
++                );
++            }
++        }
++    }
++
++    /// Degenerate line shapes: the empty line encodes to the empty string
++    /// (and back), and a single-point line roundtrips within tolerance.
++    #[hegel::test]
++    fn prop_empty_and_single_point_roundtrip(tc: hegel::TestCase) {
++        let precision = tc.draw(generators::sampled_from(vec![5u32, 6]));
++
++        // Empty line.
++        assert_eq!(
++            encode_coordinates(std::iter::empty::<Coord<f64>>(), precision).unwrap(),
++            ""
++        );
++        assert_eq!(decode_polyline("", precision).unwrap().0.len(), 0);
++
++        // Single point.
++        let point = Coord {
++            x: draw_lng(&tc),
++            y: draw_lat(&tc),
++        };
++        let encoded = encode_coordinates(std::iter::once(point), precision).unwrap();
++        let decoded = decode_polyline(&encoded, precision).unwrap();
++        assert_eq!(decoded.0.len(), 1);
++        let tol = tolerance(precision);
++        assert!((decoded.0[0].x - point.x).abs() <= tol);
++        assert!((decoded.0[0].y - point.y).abs() <= tol);
++    }
++
++    /// The precision parameter is an unrestricted `u32` with no documented
++    /// upper bound; encode/decode should return Ok/Err for any value, not
++    /// panic.
++    ///
++    /// KNOWN FAILURE: any `precision >= 10` panics with "attempt to multiply
++    /// with overflow" — both `encode_coordinates` and `decode_polyline`
++    /// compute `10_i32.pow(precision)`, which overflows `i32` for
++    /// precision >= 10 (debug builds panic; release builds would silently
++    /// wrap). The `sampled_from` branch below pins the failure so it
++    /// reproduces deterministically on every run (shrinks to precision = 10).
++    #[hegel::test]
++    fn prop_any_precision_no_panic(tc: hegel::TestCase) {
++        let precision = tc.draw(hegel::one_of!(
++            generators::integers::<u32>(),
++            generators::sampled_from(vec![10u32, 11, 31, u32::MAX]),
++        ));
++        let coords = vec![
++            Coord { x: -120.2, y: 38.5 },
++            Coord { x: -120.95, y: 40.7 },
++        ];
++        drop(encode_coordinates(coords, precision));
++        drop(decode_polyline("_p~iF~ps|U", precision));
++    }
+ }

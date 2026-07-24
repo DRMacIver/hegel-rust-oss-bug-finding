@@ -1,21 +1,19 @@
 # Patches: hegel-rust property-based tests per crate
 
-Each `patches/<crate>.patch` is the diff that adds the hegel property-based tests (and the `hegeltest` dev-dependency) to that crate, generated from the crate's pristine upstream checkout at the **base commit** recorded below (i.e. the parent of the "Add hegel property-based tests" commit). `Cargo.lock` changes are excluded.
+Each `patches/<crate>.patch` is the diff that adds the hegel property-based tests (and the `hegeltest` dev-dependency) to that crate, generated from the crate's pristine upstream checkout at the **base commit** recorded below (the parent of the "Add hegel property-based tests" commit). `Cargo.lock` changes are excluded. Generated with `git diff --binary`; every patch was validated to `git apply` against its base.
 
 ## Applying a patch
 
 ```sh
 git clone <upstream repo> && cd <crate>
 git checkout <base commit>
-git apply /path/to/patches/<crate>.patch   # or: patch -p1 < ...
+git apply /path/to/patches/<crate>.patch
 cargo test
 ```
 
-The base commit is the exact upstream revision each patch was written and verified against; the crate's `Cargo.toml` in the patch adds `hegeltest` as a dev-dependency (some crates need `--ignore-rust-version` due to hegeltest's MSRV).
+Some crates need `--ignore-rust-version` on `cargo add` (hegeltest MSRV 1.86). Crates whose maintainers opted out of AI contributions are omitted (bincode, minijinja, kdl, comrak, hound, regress).
 
-Crates whose maintainers have opted out of AI contributions are intentionally omitted, as are crates still under active testing at the time of this snapshot.
-
-## Index
+## Index (162 crates)
 
 | Crate | Upstream repo | Base commit | Base date | Base commit subject |
 |---|---|---|---|---|
@@ -44,6 +42,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `diamond-types` | https://github.com/josephg/diamond-types | `ad48b9cced1d` | 2026-05-29 | More cleanups |
 | `dyon` | https://github.com/pistondevelopers/dyon.git | `3fb34a313a37` | 2025-12-23 | Merge pull request #797 from bvssvni/master |
 | `earcutr` | https://github.com/frewsxcv/earcutr/ | `a201db6b6ec1` | 2026-05-04 | Update README with deprecation and new repository link |
+| `edn-rs` | https://github.com/edn-rs/edn-rs | `557ac2732fb2` | 2026-06-18 | Merge pull request #174 from naomijub/renovate/actions-checkout-7.x |
 | `etherparse` | https://github.com/JulianSchmid/etherparse | `70f72bee542a` | 2026-07-21 | Merge pull request #162 from JulianSchmid/migrate-coverage-to-gist-... |
 | `euclid` | https://github.com/servo/euclid | `60f2bd96deec` | 2026-03-17 | Avoid NaNs in Rotation::get_angle (#552) |
 | `evalexpr` | https://github.com/ISibboI/evalexpr.git | `45e9634dab34` | 2025-11-26 | Release (#195) |
@@ -55,6 +54,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `geo` | https://github.com/georust/geo | `6b2127d9ad99` | 2026-07-22 | Use total_cmp in sweep line interval ordering (#1554) |
 | `geographiclib-rs` | https://github.com/georust/geographiclib-rs | `c5e906d94a46` | 2026-02-17 | return result rather than panic |
 | `geohash` | https://github.com/georust/geohash.rs | `50a4b2a35ee0` | 2026-06-14 | Add encode_iter variant of encode to enable avoiding allocations (#62) |
+| `gif` | https://github.com/image-rs/image-gif | `a5f89ddc2b29` | 2026-05-31 | Merge pull request #236 from lilith/bump-weezl-0.2 |
 | `gimli` | https://github.com/gimli-rs/gimli | `843c38e886f5` | 2026-07-06 | read/cfi: validate eh_frame_hdr fde_count against table length (#897) |
 | `gitoxide` | https://github.com/GitoxideLabs/gitoxide | `2315ede714da` | 2026-07-22 | Merge pull request #2737 from GitoxideLabs/encoding-fallback-pony |
 | `glam` | https://github.com/bitshifter/glam-rs | `6feed7d50ee7` | 2026-07-23 | Consolodate some common test code into macros where possible (#756) |
@@ -69,6 +69,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `heapless` | https://github.com/rust-embedded/heapless | `fbe9aeb4db17` | 2026-07-19 | Merge pull request #652 from sgued/rem-perf |
 | `hickory` | https://github.com/hickory-dns/hickory-dns | `1b78772fcad0` | 2026-07-22 | Include CNAME records when calculating minimum TTL for caching purp... |
 | `hifitime` | https://github.com/nyx-space/hifitime | `b2ccd8f1163f` | 2026-07-21 | Merge pull request #493 from nyx-space/derive-partial-eq-duration-1... |
+| `hjson` | https://github.com/hjson/hjson-rust | `8b3b85cd7eee` | 2024-09-25 | Release 1.1.0 (#37) |
 | `httparse` | https://github.com/seanmonstar/httparse | `a0fa552e4e0f` | 2026-06-30 | refactor: share invalid header handling (#221) |
 | `humantime` | https://github.com/chronotope/humantime | `76c8929b4cc2` | 2026-07-13 | Apply suggestions from Clippy 1.97 |
 | `i_overlay` | https://github.com/iShape-Rust/iOverlay | `eeb4a9acfd1a` | 2026-07-05 | update contribution rules |
@@ -81,6 +82,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `jj` | https://github.com/jj-vcs/jj | `f296bc36b18d` | 2026-07-21 | cli: show workspace roots in workspace list |
 | `jotdown` | https://github.com/hellux/jotdown | `56d6d1b3d707` | 2026-07-06 | .gitignore: add afl output dir |
 | `json5` | https://github.com/callum-oakley/json5-rs | `6905ad2ea7b0` | 2026-02-07 | expose char |
+| `jsonc-parser` | https://github.com/dprint/jsonc-parser | `20d89e23b873` | 2026-07-07 | 0.33.0 |
 | `ketos` | https://github.com/murarth/ketos | `011287590ebe` | 2020-01-17 | Merge pull request #66 from murarth/github-ci |
 | `kiddo` | https://github.com/sdd/kiddo | `39cbbaf99876` | 2026-07-22 | ci: cap benchmark trees at 2^25 |
 | `koto` | https://github.com/koto-lang/koto | `4b433e7a7ce1` | 2026-07-05 | Merge pull request #552 from koto-lang/koto-derive-improvements |
@@ -97,15 +99,19 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `ndarray` | https://github.com/rust-ndarray/ndarray | `bd3ade99c1f6` | 2026-06-19 | Make ArrayViewMut::into_view public to allow lifetime preservation ... |
 | `nucleo` | https://github.com/helix-editor/nucleo | `8c16d47cdfa9` | 2026-06-23 | doc: Fix a typo |
 | `num-bigint` | https://github.com/rust-num/num-bigint | `9ec740f8c162` | 2026-07-07 | Merge pull request #351 from cuviper/rename-head |
+| `num-complex` | https://github.com/rust-num/num-complex | `fb5dca6f915c` | 2026-07-07 | Merge pull request #161 from cuviper/rename-head |
 | `num-rational` | https://github.com/rust-num/num-rational | `cf95d6719c58` | 2026-07-07 | Merge pull request #154 from cuviper/modules |
 | `openraft` | https://github.com/databendlabs/openraft | `0d15d99844e8` | 2026-07-23 | feat: add heartbeat_min_interval to suppress redundant heartbeats |
 | `palette` | https://github.com/Ogeon/palette | `9aa1ac21a7da` | 2026-05-15 | Merge pull request #469 from Ogeon/phf_0.13 |
 | `parry` | https://github.com/dimforge/parry | `8436f7c21875` | 2026-07-04 | Release v0.29.0 (#427) |
 | `pathfinding` | https://github.com/evenfurther/pathfinding | `16ce0bc5d60b` | 2026-07-21 | chore(deps): update actions/checkout action to v7 |
 | `percent` | https://github.com/servo/rust-url | `25137be1fc1d` | 2026-07-08 | fix percent-encode of caret in path (#1140) (#1141) |
+| `pest` | https://github.com/pest-parser/pest | `81eeedbae691` | 2026-07-22 | ci toolchain in release update + bump version (#1181) |
 | `petgraph` | https://github.com/petgraph/petgraph | `ed714652ab45` | 2026-03-08 | chore: Bump hashbrown to ^0.16 (#967) |
+| `piccolo` | https://github.com/kyren/piccolo | `ce709eb1dae5` | 2025-07-10 | Revert #[error(transparent)] in CompilerError to fix downcasting (#... |
 | `plist` | https://github.com/ebarnard/rust-plist/ | `2881e175b61f` | 2026-07-04 | Release v1.10.0 |
 | `polars` | https://github.com/pola-rs/polars | `1f6362635a59` | 2026-07-23 | fix: Do not CSE non-column height expr on streaming engine (#28480) |
+| `polyline` | https://github.com/georust/polyline | `7fc654d463a0` | 2025-07-26 | make PolylineError clonable (#54) |
 | `postcard` | https://github.com/jamesmunns/postcard | `118d274cf46e` | 2026-07-20 | Merge pull request #300 from sugar700/enum-map-v2_0 |
 | `priority-queue` | https://github.com/garro95/priority-queue | `95499ebb38f2` | 2025-10-15 | Prepare version |
 | `prost` | https://github.com/tokio-rs/prost | `aed74ad0e844` | 2026-07-05 | fix: Prevent panic for service generator in empty module (#1442) |
@@ -139,6 +145,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `similar` | https://github.com/mitsuhiko/similar | `0210f53830cc` | 2026-05-24 | chore(release): prepare 3.1.1 |
 | `sled` | https://github.com/spacejam/sled | `e449d17111f4` | 2026-04-04 | Add benchmark for memory and throughput of a fanout=3 data set for ... |
 | `slotmap` | https://github.com/orlp/slotmap | `0d130ed5bbd6` | 2026-05-09 | Add MSRV-compatible lockfiles (#151) |
+| `smallvec` | https://github.com/servo/rust-smallvec | `bc8a854926a8` | 2026-02-16 | Improved const evaluation for ZST checks. (#401) |
 | `snap` | https://github.com/BurntSushi/rust-snappy | `29fcab53647b` | 2026-07-15 | 1.1.2 |
 | `spade` | https://github.com/Stoeoef/spade | `c8befc96bbbc` | 2026-03-24 | chore: Release |
 | `speedate` | https://github.com/pydantic/speedate/ | `6fafc2c60b5c` | 2026-04-15 | Bump codecov/codecov-action from 5 to 6 in the actions group (#99) |
@@ -150,6 +157,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `swash` | https://github.com/dfrg/swash | `7773843df0d6` | 2026-07-17 | Bump version number to 0.2.10 (#132) |
 | `symphonia` | https://github.com/pdeljanov/Symphonia | `5f26f020b3a1` | 2026-07-23 | core (io): Clamp scan_bytes_aligned_ref to scan_len to prevent over... |
 | `taffy` | https://github.com/DioxusLabs/taffy | `bb351fcc056c` | 2026-07-15 | Prepare for v0.12.2 release (#979) |
+| `tar` | https://github.com/composefs/tar-rs | `2c19ee2fbd01` | 2026-07-08 | Sync common files from infra repository |
 | `tera` | https://github.com/Keats/tera | `15e0c6e6f1ab` | 2026-07-23 | Fix typo |
 | `textwrap` | https://github.com/mgeisler/textwrap | `e29daecac529` | 2026-06-28 | Merge pull request #619 from mgeisler/rename-master-to-main |
 | `tiff` | https://github.com/image-rs/image-tiff | `f3f9ff1244e5` | 2026-07-20 | Merge pull request #398 from Shnatsel/safe-rust-zstd-2 |
@@ -166,6 +174,7 @@ Crates whose maintainers have opted out of AI contributions are intentionally om
 | `weezl` | https://github.com/image-rs/weezl | `606f9c79b054` | 2026-05-15 | Merge pull request #82 from image-rs/release-0.2.1 |
 | `wkt` | https://github.com/georust/wkt | `85088d9279e5` | 2026-01-01 | Fix doc build (#151) |
 | `x509-parser` | https://github.com/rusticata/x509-parser.git | `303b80f44685` | 2026-07-23 | fix(validate): reject unsupported critical extensions per RFC 5280 |
+| `xml-rs` | https://github.com/kornelski/xml-rs | `6def29fd97a1` | 2026-07-11 | Perform end-of-line normalization |
 | `xxhash-rust` | https://github.com/DoumanAsh/xxhash-rust | `f93abc7ce036` | 2026-07-21 | 0.8.18 |
 | `yaml-rust2` | https://github.com/Ethiraric/yaml-rust2 | `9f39918876eb` | 2025-12-16 | tests: fix clippy warnings |
 | `ycrdt` | https://github.com/y-crdt/y-crdt/ | `67b0513fe6cf` | 2026-07-13 | Merge pull request #638 from Horusiath/release-v0.27.3 |

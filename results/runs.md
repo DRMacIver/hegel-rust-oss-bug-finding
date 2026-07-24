@@ -235,13 +235,19 @@ Batch 21 notes: at 169. Profiles: format-preserving parser (toml_edit roundtrip-
 
 Batch 22 notes: at 179. regress EXCLUDED (6th consent, "No AI slop"). 7 tested: template (handlebars), untrusted decoders (quick-protobuf, capnp, x509-parser DER), numeric (ndarray), data structure (heapless), geo roundtrip (wkt).
 
-| 23 | 2026-07-23 | piccolo (kyren) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | tar (alexcrichton) | ext | fable | v1 | running (AGENTS.md = AI-ALLOWED-with-disclosure, not an opt-out) |
-| 23 | 2026-07-23 | gif (image-rs) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | hjson (hjson) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | smallvec (servo) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | num-complex (rust-num) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | polyline (georust) | ext | fable | v1 | running |
-| 23 | 2026-07-23 | edn-rs (naomijub) | ext | fable | v1 | running |
+| 23 | 2026-07-23 | piccolo (kyren) | ext | fable | v1 | complete — trophies 198-199 (+5 fidelity obs) |
+| 23 | 2026-07-23 | tar (alexcrichton→composefs) | ext | fable | v1 | complete — trophy 188 (AI-allowed-with-disclosure) |
+| 23 | 2026-07-23 | gif (image-rs) | ext | fable | v1 | complete — trophy 190 |
+| 23 | 2026-07-23 | hjson (hjson) | ext | fable | v1 | complete — trophies 191-193 |
+| 23 | 2026-07-23 | smallvec (servo) | ext | fable | v1 | complete — CLEAN |
+| 23 | 2026-07-23 | num-complex (rust-num) | ext | fable | v1 | complete — trophy 189 |
+| 23 | 2026-07-23 | polyline (georust) | ext | fable | v1 | complete — trophy 187 |
+| 23 | 2026-07-23 | edn-rs (naomijub) | ext | fable | v1 | complete — trophies 194-197 (deprecated upstream) |
 
 Batch 23 notes: at 186. tar AGENTS.md ALLOWS AI with disclosure (Assisted-by/Generated-by, no Signed-off-by, no tool names) — NOT a consent-exclusion; note disclosure rules if ever filing to tar. Profiles: interpreter (piccolo Lua VM), untrusted archive (tar), image decoder (gif LZW), JSON-superset parser (hjson), data structures (smallvec inline/spill), numeric (num-complex), geo roundtrip (polyline), EDN parser (edn-rs).
+
+| 24 | 2026-07-24 | jsonc-parser (dprint) | ext | fable | v1 | complete — trophy 202 |
+| 24 | 2026-07-24 | xml-rs (kornelski) | ext | fable | v1 | complete — trophies 200-201 |
+| 24 | 2026-07-24 | pest (pest-parser) | ext | fable | v1 | complete — trophies 203-205 |
+
+Batch 24 notes: small final batch to clear ~200 (at 199). sevenz-rust repo moved (skipped). Profiles: JSONC parser (jsonc-parser), XML parser (xml-rs), PEG parser generator (pest).

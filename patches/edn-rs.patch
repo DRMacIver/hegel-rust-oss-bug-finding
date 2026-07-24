@@ -1,0 +1,960 @@
+diff --git a/.gitignore b/.gitignore
+index 54ca8bb..fb21434 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,4 +10,6 @@ Cargo.lock
+ **/*.rs.bk
+ .vscode/
+ /.lsp/
+-/.clj-kondo/
+\ No newline at end of file
++/.clj-kondo/
++.hegel/
++
+diff --git a/Cargo.toml b/Cargo.toml
+index ccbd4bf..2ed585b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,7 @@ criterion = "0.8"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ edn-derive = { git = "https://github.com/edn-rs/edn-derive.git" } # TODO pin to release
++hegeltest = "0.28.2"
+ 
+ [dev-dependencies.cargo-husky]
+ version = "1"
+diff --git a/HEGEL_REPORT.md b/HEGEL_REPORT.md
+new file mode 100644
+index 0000000..731ad4d
+--- /dev/null
++++ b/HEGEL_REPORT.md
+@@ -0,0 +1,175 @@
++# Hegel property-based testing report: `edn-rs`
++
++## 1. Summary
++
++Added 10 property-based tests plus 5 deterministically-failing known-bug pin
++tests and 1 `#[ignore]`d process-aborting reproducer to
++`tests/parse.rs` (module `hegel_properties`), using the hegel PBT library
++(`hegeltest` 0.28.2 dev-dependency; `cargo add --dev hegeltest` worked
++directly on this edition-2024, rust-version-1.92 crate). The centerpiece is a
++recursive generator over parser-canonical `Edn` values (all 15 variants:
++nil/bool/Int/UInt/Double/Rational/Str/Char/Key/Symbol/Vector/List/Map/Set/
++Tagged) driving a serialize→parse→re-serialize fixpoint property, plus a
++noise-injecting emitter that re-serializes any generated value with random
++whitespace, commas, `;` comments and `#_` discard forms between tokens.
++
++**Six real bugs were found** (five pinned by always-failing hegel tests, one
++process-aborting stack overflow kept as an `#[ignore]`d reproducer). Sibling
++properties exclude the known-bug regions with comments referencing the pins
++and stay green.
++
++Full run: `cargo test --test parse` — 20 passed, 5 failed (the intentional
++pins), 1 ignored. The same numbers hold under `--no-default-features` (the
++`sets`-feature code paths are cfg-gated in the tests). Code passes the
++repo's pre-commit gate (`cargo fmt --check` + clippy pedantic/nursery
++`--deny warnings` on `--all-targets --all-features`).
++
++## 2. Properties added (10)
++
++All in `tests/parse.rs::hegel_properties`. The shared generator
++`edn_values(depth)` produces parser-canonical values: non-negative integers
++as `UInt` (the parser tries `u64` first), negative as `Int`, doubles
++non-integral and finite, strings/chars/symbols avoiding the five pinned bug
++regions (each exclusion commented at the generator with a pointer to its
++pin).
++
++1. `prop_serialize_parse_fixpoint` — for arbitrary nested `Edn`,
++   `Edn::from_str(v.to_string()) == v` and re-serialization is a string
++   fixpoint (set/map ordering is canonical via `BTreeSet`/`BTreeMap`).
++2. `prop_parse_never_panics` — `from_str` returns `Ok`/`Err`, never panics,
++   on arbitrary Unicode text and on EDN-shaped token soup (delimiters,
++   `#_`, radix/hex fragments, `İ`/`٣` multibyte lowercase-shifting chars,
++   unterminated strings...).
++3. `prop_deeply_nested_collections_parse` — balanced `[[[...]]]`,
++   `((...))`, `{:k {:k ...}}`, `#{#{...}}` mixes parse Ok, sweeping drawn
++   depth 1..=300 (cap protects the test process from the pinned stack
++   overflow at ~depth 1000, not a library contract).
++4. `prop_integer_decimal_roundtrip` — decimal integers across the full
++   i64/u64 ranges (MIN/MAX/0/±1 boosted) parse to the exact expected
++   variant/value, including the EDN-spec redundant `+` prefix.
++5. `prop_radix_integer_parse` — `NrDIGITS` (radix 2–36, upper/lowercase
++   digits, negative forms) and `0x` hex literals parse to the value computed
++   by an independent base-conversion oracle in the test.
++6. `prop_string_escape_roundtrip` — strings generated at the escape-set
++   boundary (quotes, backslashes, `\n \r \t`, delimiters, `;`, `#`, full
++   Unicode) round-trip.
++7. `prop_char_roundtrip` — char literals round-trip, including named ones
++   (`\newline \return \tab \space`) and delimiter/lookalike chars
++   (`\]`, `\n` the letter, `\,`...).
++8. `prop_keyword_roundtrip` — keywords incl. namespaced (`:foo/bar`) parse
++   to `Edn::Key` and serialize back to the same text.
++9. `prop_symbol_roundtrip` — symbols incl. namespaced (`foo/bar`) parse to
++   `Edn::Symbol` and serialize back identically.
++10. `prop_whitespace_comment_discard_insensitivity` — a custom emitter
++    re-serializes any generated value inserting random whitespace variants,
++    commas, `; comments` (containing delimiters) and `#_ <elem>` discard
++    forms at legal token boundaries; the parse result must equal the
++    original value.
++
++## 3. Real bugs found (pinned, deliberately failing)
++
++### Bug 1: whole-number doubles serialize without `.0` and reparse as integers
++`known_bug_whole_double_reparses_as_integer` —
++`Edn::Double(3.0).to_string() == "3"`, which reparses as `Edn::UInt(3)`.
++EDN distinguishes `3` from `3.0`; every integral double silently changes
++type through a serialize/parse cycle. Related (same `Display` impl):
++`Double(f64::NAN)`/`Double(INFINITY)` serialize as `NaN`/`inf`, which are
++not valid EDN (spec: `##NaN`/`##Inf`) and reparse as symbols.
++Shrunk counterexample: `Double(0.0)` → `"0"` → `UInt(0)`.
++
++### Bug 2: strings with control characters serialize to unparseable EDN
++`known_bug_control_char_in_string_does_not_reparse` — `Edn::Str` serializes
++via Rust's `{:?}` formatting, which escapes control characters as
++`\u{7f}`-style escapes; the parser only understands `\t \r \n \\ \"` and
++returns `Err("Invalid escape sequence \\u")`. Any string containing a
++control character cannot round-trip. Counterexample:
++`Str("a\u{7f}b")` → `"\"a\\u{7f}b\""` → parse error.
++
++### Bug 3: char literals for non-ASCII whitespace are emitted but rejected
++`known_bug_unicode_whitespace_char_does_not_reparse` — `Edn::Char('\u{a0}')`
++(NBSP; likewise NEL, LINE/PARAGRAPH SEPARATOR, em-spaces...) serializes as
++`\<char>`, but `read_char` collects the literal with
++`take_while(!is_whitespace)`, sees an empty element and errors
++(`"\"\" could not be parsed as a symbol"`).
++
++### Bug 4: hex/radix digit strings that look like float notation misparse as doubles
++`known_bug_radix_digits_with_e_misparse_as_double` — after stripping the
++`0x`/`NNr` prefix, `read_number` checks the remaining digits against float
++notation *first*, so `0x5e5` parses as `Double(500000.0)` instead of
++`UInt(1509)`; `0x0e0` → `Double(0.0)` instead of `UInt(224)`. Affects any
++radix ≥ 15 whose digit string matches `<digits>e<digits>`.
++
++### Bug 5: a single-character symbol at end of input fails to parse
++`known_bug_single_char_symbol_at_eof_fails` — `Edn::from_str("a")` returns
++`Err(ParseEdn("Could not identify symbol index"))`: `read_symbol` (and
++`read_bool_or_nil`) unconditionally demand a lookahead character to compute
++an error-message index. `"a "` parses fine. Found by the properties at the
++default case count (`Symbol("A")`), and the 10x exploratory run found the
++nested form `"#A A"` (tagged element whose value is a 1-char symbol —
++tagged values have no closing delimiter, so the symbol ends at EOF).
++
++### Bug 6 (process-aborting): unbounded parser recursion — stack overflow
++`known_bug_deep_nesting_stack_overflow` (`#[ignore]`d) — the parser recurses
++once per nesting level with no depth limit; `"[".repeat(1000) + "]".repeat(1000)`
++(likewise `{:a {:a ...}}` and `#{#{...}}` nesting) overflows the 2 MiB
++test-thread stack and **aborts the whole process** (SIGABRT), a classic
++untrusted-input DoS for a parser. Depth 800 still parses. Verified by an
++external sweep (1000/2000/5000/10000/50000 all abort for all three
++collection kinds). Kept ignored because a stack overflow cannot be caught
++and would take down the suite; the live property sweeps depth ≤ 300.
++
++Not pinned as a bug, but a roundtrip caveat worth knowing: the parser
++canonicalizes every non-negative integer to `Edn::UInt` (it tries `u64`
++before `i64`), so `Edn::Int(5)` serializes to `"5"` and reparses as
++`UInt(5)`. The generator produces parser-canonical values (negative `Int`
++only), treating this as intended normalization rather than a defect.
++
++## 4. Verification (Run and Reflect)
++
++- **Liveness**: temporarily inverted assertions in three properties
++  (fixpoint equality, the *guarded* negative-radix branch, and noise
++  insensitivity); all three failed with fully shrunk minimal
++  counterexamples (`Nil`, and `v=1, radix=2` inside the `iv > 0` guard —
++  proving the guarded branch fires), then reverted and `.hegel/` cleared.
++- **10x exploratory run**: all `prop_` tests temporarily raised to
++  `test_cases = 1000`, with a per-case atomic counter on the fixpoint
++  property proving >1000 cases actually executed. This run discovered the
++  nested `"#A A"` variant of Bug 5, after which the exclusion helper was
++  generalized (`ends_with_single_char_symbol`) and the 10x run went green.
++  Committed tests are back at the default count.
++- Pins are deterministic: each pinned generator produces a failing input on
++  every case (e.g. every integral double fails Bug 1), so the tests fail on
++  every run, not probabilistically.
++- `.hegel/` added to `.gitignore`.
++
++## 5. Exclusions, limitations, and notes
++
++- **Known-bug exclusions in green tests** (each commented in code with a
++  pointer to its pin): doubles are forced non-integral and finite (Bug 1);
++  string chars are restricted to Debug-verbatim chars plus the five
++  supported escapes (Bug 2); chars exclude non-ASCII whitespace (Bug 3);
++  radix digit strings matching float notation are `assume`d away (Bug 4);
++  documents ending in a single-char symbol are `assume`d away (Bug 5); the
++  nesting property caps depth at 300 (Bug 6 — protects the test process,
++  not a contract).
++- Symbols/keywords are generated from a conservative EDN-name alphabet
++  (letter-first, `[A-Za-z0-9_.*+!?$%&=<>-]`, optional single `/`
++  namespace). The parser accepts far laxer names (anything up to
++  whitespace/delimiter); the lax fringe is exercised by the no-panic soup
++  test rather than roundtrip properties.
++- `Edn::Map` keys are stored as `String` in serialized form; the generator
++  draws keyword-, integer- and quoted-string-shaped keys. Discard (`#_`)
++  noise is injected in vector/list/top-level positions only — in map
++  key/value slots a trailing discard can produce `Edn::Empty` values
++  (arguably a further parser quirk, not investigated to a pin).
++- Pre-existing breakage (unrelated to this work, confirmed on the pristine
++  tree): `cargo test --no-default-features` — a Makefile target — fails to
++  compile `tests/deserialize.rs`, `tests/ser.rs` and `examples/serialize`
++  (`hmap!`/`hset!` and `HashMap` serialization require the `std` feature).
++  My test module cfg-gates its `sets` usage and compiles cleanly in that
++  configuration (`cargo test --no-default-features --test parse` runs with
++  the same 20/5/1 results).
++- The crate is deprecated upstream (maintenance halted; README points to
++  `Grinkers/clojure-reader`), which may bound the value of filing these
++  bugs; the parser bugs (2, 4, 5, 6) likely have analogues worth checking
++  in the successor crate.
+diff --git a/tests/parse.rs b/tests/parse.rs
+index d4ab737..f2f411c 100644
+--- a/tests/parse.rs
++++ b/tests/parse.rs
+@@ -153,3 +153,749 @@ mod tests {
+         assert_eq!(edn[3][2], Edn::Str("banana".to_string()));
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel).
++//
++// See HEGEL_REPORT.md at the repository root for a summary of the properties
++// and of the real bugs pinned by the `known_bug_*` tests below.
++// ---------------------------------------------------------------------------
++#[cfg(test)]
++mod hegel_properties {
++    use std::collections::BTreeMap;
++    #[cfg(feature = "sets")]
++    use std::collections::BTreeSet;
++    use std::str::FromStr;
++
++    #[cfg(feature = "sets")]
++    use edn_rs::Set;
++    use edn_rs::{Edn, List, Map, Vector};
++    use hegel::generators::{self, Generator};
++
++    // ------------------------------------------------------------------
++    // Generators
++    // ------------------------------------------------------------------
++
++    const RESERVED: [&str; 3] = ["true", "false", "nil"];
++
++    /// Any Unicode scalar value, weighted across ASCII / BMP / supplementary planes.
++    fn any_char() -> impl Generator<char> {
++        hegel::one_of!(
++            generators::integers::<u32>().max_value(0x7F),
++            generators::integers::<u32>()
++                .min_value(0x80)
++                .max_value(0xFFFF),
++            generators::integers::<u32>()
++                .min_value(0x1_0000)
++                .max_value(0x10_FFFF),
++        )
++        .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}'))
++    }
++
++    /// Characters that survive `Edn::Str`'s `{:?}` (Rust `Debug`) serialization:
++    /// the escapes the EDN parser understands (\t \r \n \\ \") plus any char
++    /// that `Debug` prints verbatim. Everything else is Debug-escaped as
++    /// `\u{..}`, which the parser rejects — see
++    /// `known_bug_control_char_in_string_does_not_reparse`.
++    fn str_safe(c: char) -> bool {
++        matches!(c, '\t' | '\n' | '\r' | '\\' | '"' | '\'') || c.escape_debug().count() == 1
++    }
++
++    fn draw_string(tc: &hegel::TestCase) -> String {
++        let chars: Vec<char> = tc.draw(generators::vecs(any_char()).max_size(12));
++        chars
++            .into_iter()
++            .map(|c| if str_safe(c) { c } else { '\u{FFFD}' })
++            .collect()
++    }
++
++    fn draw_char(tc: &hegel::TestCase) -> char {
++        let c = tc.draw(hegel::one_of!(
++            any_char().boxed(),
++            generators::sampled_from(vec![
++                '\n', '\r', '\t', ' ', '\\', '"', ',', ']', ')', '}', '(', 'n', 't', 's', 'r', 'u',
++            ])
++            .boxed(),
++        ));
++        // KNOWN BUG exclusion: non-ASCII whitespace (U+00A0, U+2028, ...) serializes
++        // as `\<char>` which the parser rejects — see
++        // `known_bug_unicode_whitespace_char_does_not_reparse`.
++        if c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n' | '\r') {
++            ' '
++        } else {
++            c
++        }
++    }
++
++    /// A plain (non-namespaced) EDN symbol/keyword name.
++    fn draw_name(tc: &hegel::TestCase) -> String {
++        let base: String = tc
++            .draw(generators::from_regex(r"[A-Za-z][A-Za-z0-9_.*+!?$%&=<>-]{0,8}").fullmatch(true));
++        if RESERVED.contains(&base.as_str()) {
++            format!("{base}x")
++        } else {
++            base
++        }
++    }
++
++    /// A symbol name, optionally namespaced (`foo/bar`).
++    fn draw_symbol_name(tc: &hegel::TestCase) -> String {
++        let name = draw_name(tc);
++        if tc.draw(generators::booleans()) {
++            format!("{}/{name}", draw_name(tc))
++        } else {
++            name
++        }
++    }
++
++    fn draw_double(tc: &hegel::TestCase) -> f64 {
++        // NaN/infinity are excluded because the crate cannot emit them as valid
++        // EDN at all (`NaN`/`inf` are parsed back as symbols) — part of the
++        // Double serialization bug pinned by
++        // `known_bug_whole_double_reparses_as_integer`.
++        let d = tc.draw(
++            generators::floats::<f64>()
++                .allow_nan(false)
++                .allow_infinity(false),
++        );
++        if d.fract() == 0.0 {
++            // KNOWN BUG exclusion: integral doubles display without ".0" and
++            // reparse as UInt/Int — see
++            // `known_bug_whole_double_reparses_as_integer`. Replace with a
++            // guaranteed-fractional value.
++            f64::from(tc.draw(generators::integers::<i32>())) + 0.5
++        } else {
++            d
++        }
++    }
++
++    fn draw_rational(tc: &hegel::TestCase) -> String {
++        let num = tc.draw(generators::integers::<i64>());
++        let den = tc.draw(generators::integers::<u64>());
++        format!("{num}/{den}")
++    }
++
++    /// A map key in its serialized form (`Edn::Map` stores keys as `String`,
++    /// holding the serialized form of the key element).
++    fn draw_map_key(tc: &hegel::TestCase) -> String {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => format!(":{}", draw_symbol_name(tc)),
++            1 => tc.draw(generators::integers::<u64>()).to_string(),
++            _ => format!("{:?}", draw_string(tc)),
++        }
++    }
++
++    /// Recursive generator over parser-canonical `Edn` values.
++    ///
++    /// "Parser-canonical" means values `Edn::from_str` can actually produce:
++    /// non-negative integers are always `UInt` (the parser tries `u64` first),
++    /// doubles are non-integral, strings/chars avoid the pinned known-bug
++    /// regions (each exclusion is commented at its generator above).
++    fn edn_values(depth: u32) -> generators::BoxedGenerator<'static, Edn> {
++        hegel::compose!(|tc| {
++            let max_kind: u8 = if depth == 0 {
++                9
++            } else if cfg!(feature = "sets") {
++                14
++            } else {
++                13
++            };
++            let kind = tc.draw(generators::integers::<u8>().max_value(max_kind));
++            match kind {
++                0 => Edn::Nil,
++                1 => Edn::Bool(tc.draw(generators::booleans())),
++                // Only negative: the parser canonicalizes non-negative integers
++                // to UInt (see prop_integer_decimal_roundtrip).
++                2 => Edn::Int(tc.draw(generators::integers::<i64>().max_value(-1))),
++                3 => Edn::UInt(tc.draw(generators::integers::<u64>())),
++                4 => Edn::Double(draw_double(&tc).into()),
++                5 => Edn::Rational(draw_rational(&tc)),
++                6 => Edn::Str(draw_string(&tc)),
++                7 => Edn::Char(draw_char(&tc)),
++                8 => Edn::Key(format!(":{}", draw_symbol_name(&tc))),
++                9 => Edn::Symbol(draw_symbol_name(&tc)),
++                10 => Edn::Vector(Vector::new(
++                    tc.draw(generators::vecs(edn_values(depth - 1)).max_size(4)),
++                )),
++                11 => Edn::List(List::new(
++                    tc.draw(generators::vecs(edn_values(depth - 1)).max_size(4)),
++                )),
++                12 => {
++                    let n = tc.draw(generators::integers::<usize>().max_value(3));
++                    let mut m = BTreeMap::new();
++                    for _ in 0..n {
++                        let k = draw_map_key(&tc);
++                        let v = tc.draw(edn_values(depth - 1));
++                        m.insert(k, v);
++                    }
++                    Edn::Map(Map::new(m))
++                }
++                13 => Edn::Tagged(
++                    tc.draw(generators::from_regex(r"[A-Za-z][A-Za-z0-9._-]{0,8}").fullmatch(true)),
++                    Box::new(tc.draw(edn_values(depth - 1))),
++                ),
++                #[cfg(feature = "sets")]
++                14 => {
++                    let n = tc.draw(generators::integers::<usize>().max_value(3));
++                    let mut s = BTreeSet::new();
++                    for _ in 0..n {
++                        s.insert(tc.draw(edn_values(depth - 1)));
++                    }
++                    Edn::Set(Set::new(s))
++                }
++                _ => unreachable!(),
++            }
++        })
++        .boxed()
++    }
++
++    /// True when the serialized document would *end* with a single-character
++    /// symbol at EOF: a bare 1-char symbol, or a `Tagged` chain whose final
++    /// value is one (a tagged value has no closing delimiter after it).
++    /// KNOWN BUG exclusion — see `known_bug_single_char_symbol_at_eof_fails`.
++    fn ends_with_single_char_symbol(v: &Edn) -> bool {
++        match v {
++            Edn::Symbol(s) => s.len() == 1,
++            Edn::Tagged(_, inner) => ends_with_single_char_symbol(inner),
++            _ => false,
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Property 1: serialize -> parse is the identity on parser-canonical
++    // values, and serialization is a fixpoint.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_serialize_parse_fixpoint(tc: hegel::TestCase) {
++        let v = tc.draw(edn_values(3));
++        // KNOWN BUG exclusion: a document ending in a single-char symbol
++        // (bare, or as the final value of a tagged element, e.g. "#A A")
++        // fails to parse; inside bracketed containers it is fine — see
++        // `known_bug_single_char_symbol_at_eof_fails`.
++        tc.assume(!ends_with_single_char_symbol(&v));
++        let s = v.to_string();
++        let parsed = Edn::from_str(&s)
++            .unwrap_or_else(|e| panic!("failed to reparse {s:?} (from {v:?}): {e:?}"));
++        assert_eq!(parsed, v, "roundtrip changed value, serialized: {s:?}");
++        let s2 = parsed.to_string();
++        assert_eq!(s2, s, "serialize -> parse -> serialize is not a fixpoint");
++    }
++
++    // ------------------------------------------------------------------
++    // Property 2: the parser never panics, on arbitrary text or on
++    // EDN-shaped token soup. It must return Ok or Err.
++    // ------------------------------------------------------------------
++    #[hegel::composite]
++    fn edn_soup(tc: hegel::TestCase) -> String {
++        let tokens: Vec<&str> = tc.draw(
++            generators::vecs(generators::sampled_from(vec![
++                "[",
++                "]",
++                "(",
++                ")",
++                "{",
++                "}",
++                "#{",
++                "#_",
++                "#",
++                "\"",
++                "\\",
++                "\\\\",
++                ":",
++                "::",
++                ";",
++                ";;\n",
++                "nil",
++                "true",
++                "false",
++                "t",
++                "f",
++                "n",
++                "1",
++                "-1",
++                "+1",
++                "0x",
++                "0xff",
++                "-0x",
++                "2r",
++                "2r101",
++                "36rZZ",
++                "37r1",
++                "1e5",
++                "1e5e5",
++                "0x5e5",
++                "1.5",
++                "3/4",
++                "-",
++                "+",
++                "e",
++                "E",
++                "r",
++                "R",
++                ".",
++                "/",
++                " ",
++                ",",
++                "\n",
++                "\t",
++                "sym",
++                ":kw",
++                "#inst",
++                "\"str\"",
++                "\\c",
++                "\\newline",
++                "İ",
++                "٣",
++                "9İr1",
++                "'",
++                "@",
++                "^",
++                "`",
++                "~",
++            ]))
++            .max_size(40),
++        );
++        tokens.concat()
++    }
++
++    #[hegel::test]
++    fn prop_parse_never_panics(tc: hegel::TestCase) {
++        let s: String = tc.draw(hegel::one_of!(
++            generators::text().boxed(),
++            edn_soup().boxed(),
++        ));
++        drop(Edn::from_str(&s));
++    }
++
++    // ------------------------------------------------------------------
++    // Property 3: deeply nested balanced collections parse successfully.
++    //
++    // Depth is capped at 300 because the parser recurses once per nesting
++    // level and overflows the 2 MiB test-thread stack at roughly depth 1000
++    // (a real bug). The cap protects the test process, not the library's
++    // contract — see `known_bug_deep_nesting_stack_overflow` below.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_deeply_nested_collections_parse(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(300));
++        let max_kind: u8 = if cfg!(feature = "sets") { 3 } else { 2 };
++        let kinds: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(max_kind))
++                .min_size(depth)
++                .max_size(depth),
++        );
++        let mut s = String::new();
++        for k in &kinds {
++            s.push_str(match k {
++                0 => "[",
++                1 => "(",
++                2 => "{:k ",
++                _ => "#{",
++            });
++        }
++        s.push('1');
++        for k in kinds.iter().rev() {
++            s.push_str(match k {
++                0 => "]",
++                1 => ")",
++                _ => "}",
++            });
++        }
++        let r = Edn::from_str(&s);
++        assert!(r.is_ok(), "depth {depth} failed: {r:?}");
++    }
++
++    // ------------------------------------------------------------------
++    // Property 4: decimal integers parse to the correct value across the
++    // full i64/u64 range (boundaries included). The parser's canonical form
++    // is UInt for non-negative values and Int for negatives; a redundant
++    // leading '+' is allowed by the EDN spec.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_integer_decimal_roundtrip(tc: hegel::TestCase) {
++        let n: i64 = tc.draw(hegel::one_of!(
++            generators::integers::<i64>().boxed(),
++            generators::sampled_from(vec![i64::MIN, i64::MAX, 0, -1, 1]).boxed(),
++        ));
++        let expected = if n >= 0 {
++            Edn::UInt(u64::try_from(n).unwrap())
++        } else {
++            Edn::Int(n)
++        };
++        assert_eq!(Edn::from_str(&n.to_string()), Ok(expected));
++
++        let u: u64 = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().boxed(),
++            generators::sampled_from(vec![u64::MAX, 1 << 63, 0, 1]).boxed(),
++        ));
++        assert_eq!(Edn::from_str(&u.to_string()), Ok(Edn::UInt(u)));
++        assert_eq!(Edn::from_str(&format!("+{u}")), Ok(Edn::UInt(u)));
++    }
++
++    // ------------------------------------------------------------------
++    // Property 5: radix integer literals (NrDIGITS and 0x hex) parse to the
++    // value computed by an independent base-conversion oracle.
++    // ------------------------------------------------------------------
++    fn to_radix_string(mut v: u64, radix: u32) -> String {
++        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
++        if v == 0 {
++            return "0".to_string();
++        }
++        let mut out = Vec::new();
++        while v > 0 {
++            out.push(DIGITS[usize::try_from(v % u64::from(radix)).unwrap()]);
++            v /= u64::from(radix);
++        }
++        out.reverse();
++        String::from_utf8(out).unwrap()
++    }
++
++    /// KNOWN BUG exclusion: digit strings like "5e5" hit the parser's float
++    /// notation arm and are misparsed as doubles — see
++    /// `known_bug_radix_digits_with_e_misparse_as_double`.
++    fn hits_float_notation_bug(digits: &str) -> bool {
++        (digits.contains('e') || digits.contains('E')) && digits.parse::<f64>().is_ok()
++    }
++
++    #[hegel::test]
++    fn prop_radix_integer_parse(tc: hegel::TestCase) {
++        let v: u64 = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().boxed(),
++            generators::sampled_from(vec![0, 1, u64::MAX, i64::MAX as u64]).boxed(),
++        ));
++        let radix = tc.draw(generators::integers::<u32>().min_value(2).max_value(36));
++        let mut digits = to_radix_string(v, radix);
++        if tc.draw(generators::booleans()) {
++            digits = digits.to_uppercase();
++        }
++        tc.assume(!hits_float_notation_bug(&digits));
++        assert_eq!(
++            Edn::from_str(&format!("{radix}r{digits}")),
++            Ok(Edn::UInt(v)),
++            "radix {radix}, digits {digits}"
++        );
++        if let Ok(iv) = i64::try_from(v)
++            && iv > 0
++        {
++            assert_eq!(
++                Edn::from_str(&format!("-{radix}r{digits}")),
++                Ok(Edn::Int(-iv)),
++                "radix {radix}, digits {digits}"
++            );
++        }
++
++        let hex = format!("{v:x}");
++        tc.assume(!hits_float_notation_bug(&hex));
++        assert_eq!(Edn::from_str(&format!("0x{hex}")), Ok(Edn::UInt(v)));
++    }
++
++    // ------------------------------------------------------------------
++    // Property 6: strings round-trip through serialization, generated at the
++    // escape-set boundary (quotes, backslashes, \n \r \t, delimiters,
++    // comment characters, full Unicode).
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_string_escape_roundtrip(tc: hegel::TestCase) {
++        let chars: Vec<char> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::sampled_from(vec![
++                    '"', '\\', '\n', '\t', '\r', '\'', '/', ';', '#', '{', '}', '[', ']', '(', ')',
++                    ' ', ',', ':', 'n', 't', 'u',
++                ])
++                .boxed(),
++                any_char().boxed(),
++            ))
++            .max_size(24),
++        );
++        // Control chars and other Debug-\u{..}-escaped chars excluded — see
++        // known_bug_control_char_in_string_does_not_reparse.
++        let s: String = chars
++            .into_iter()
++            .map(|c| if str_safe(c) { c } else { '\u{FFFD}' })
++            .collect();
++        let edn = Edn::Str(s);
++        let serialized = edn.to_string();
++        assert_eq!(
++            Edn::from_str(&serialized),
++            Ok(edn),
++            "serialized: {serialized:?}"
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // Property 7: char literals round-trip through serialization, including
++    // the named literals (\newline \return \tab \space) and delimiters.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_char_roundtrip(tc: hegel::TestCase) {
++        let c = draw_char(&tc);
++        let edn = Edn::Char(c);
++        let serialized = edn.to_string();
++        assert_eq!(
++            Edn::from_str(&serialized),
++            Ok(edn),
++            "serialized: {serialized:?}"
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // Property 8: keywords (including namespaced ones) parse to Edn::Key and
++    // serialize back to the same text.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_keyword_roundtrip(tc: hegel::TestCase) {
++        let k = format!(":{}", draw_symbol_name(&tc));
++        let parsed = Edn::from_str(&k);
++        assert_eq!(parsed, Ok(Edn::Key(k.clone())));
++        assert_eq!(parsed.unwrap().to_string(), k);
++    }
++
++    // ------------------------------------------------------------------
++    // Property 9: symbols (including namespaced ones) parse to Edn::Symbol
++    // and serialize back to the same text.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn prop_symbol_roundtrip(tc: hegel::TestCase) {
++        let mut name = draw_symbol_name(&tc);
++        // KNOWN BUG exclusion: a single-char symbol at end of input fails to
++        // parse — see `known_bug_single_char_symbol_at_eof_fails`.
++        if name.len() == 1 {
++            name.push('x');
++        }
++        let parsed = Edn::from_str(&name);
++        assert_eq!(parsed, Ok(Edn::Symbol(name.clone())));
++        assert_eq!(parsed.unwrap().to_string(), name);
++    }
++
++    // ------------------------------------------------------------------
++    // Property 10: parsing is insensitive to whitespace variants, commas,
++    // line comments (;) and #_ discard forms inserted between tokens.
++    // ------------------------------------------------------------------
++    fn sep(tc: &hegel::TestCase, out: &mut String) {
++        out.push_str(tc.draw(generators::sampled_from(vec![
++            " ",
++            ",",
++            "\n",
++            "\t",
++            "\r\n",
++            " ; comment with delimiters ]})\" \n",
++            ",, ",
++        ])));
++        if tc.draw(generators::booleans()) {
++            out.push_str(tc.draw(generators::sampled_from(vec![" ", ",", "\n", " ;;\n"])));
++        }
++    }
++
++    fn maybe_noise(tc: &hegel::TestCase, out: &mut String) {
++        if tc.draw(generators::booleans()) {
++            sep(tc, out);
++        }
++    }
++
++    /// With small probability, emit a `#_ <element>` discard form.
++    fn maybe_discard(tc: &hegel::TestCase, out: &mut String) {
++        if tc.draw(generators::integers::<u8>().max_value(9)) == 0 {
++            out.push_str("#_");
++            sep(tc, out);
++            out.push_str(tc.draw(generators::sampled_from(vec![
++                "0",
++                "nil",
++                ":discarded",
++                "[1 2]",
++                "\"gone\"",
++            ])));
++            sep(tc, out);
++        }
++    }
++
++    fn emit_noisy(tc: &hegel::TestCase, edn: &Edn, out: &mut String) {
++        match edn {
++            Edn::Vector(_) | Edn::List(_) => {
++                let (open, close) = if matches!(edn, Edn::Vector(_)) {
++                    ('[', ']')
++                } else {
++                    ('(', ')')
++                };
++                out.push(open);
++                for e in edn.iter_some().unwrap() {
++                    maybe_noise(tc, out);
++                    maybe_discard(tc, out);
++                    emit_noisy(tc, e, out);
++                    sep(tc, out);
++                }
++                maybe_noise(tc, out);
++                out.push(close);
++            }
++            Edn::Map(_) => {
++                out.push('{');
++                for (k, v) in edn.map_iter().unwrap() {
++                    maybe_noise(tc, out);
++                    out.push_str(k);
++                    sep(tc, out);
++                    emit_noisy(tc, v, out);
++                    sep(tc, out);
++                }
++                maybe_noise(tc, out);
++                out.push('}');
++            }
++            #[cfg(feature = "sets")]
++            Edn::Set(_) => {
++                out.push_str("#{");
++                for e in edn.set_iter().unwrap() {
++                    maybe_noise(tc, out);
++                    emit_noisy(tc, e, out);
++                    sep(tc, out);
++                }
++                maybe_noise(tc, out);
++                out.push('}');
++            }
++            Edn::Tagged(tag, inner) => {
++                out.push('#');
++                out.push_str(tag);
++                sep(tc, out);
++                emit_noisy(tc, inner, out);
++            }
++            _ => out.push_str(&edn.to_string()),
++        }
++    }
++
++    #[hegel::test]
++    fn prop_whitespace_comment_discard_insensitivity(tc: hegel::TestCase) {
++        let v = tc.draw(edn_values(2));
++        // KNOWN BUG exclusion: a document ending in a single-char symbol
++        // fails to parse — see `known_bug_single_char_symbol_at_eof_fails`.
++        tc.assume(!ends_with_single_char_symbol(&v));
++        let mut s = String::new();
++        maybe_noise(&tc, &mut s);
++        maybe_discard(&tc, &mut s);
++        emit_noisy(&tc, &v, &mut s);
++        assert_eq!(Edn::from_str(&s).as_ref(), Ok(&v), "noisy input: {s:?}");
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURES — real bugs, deterministically pinned.
++    // Do not "fix" these tests; fix the library.
++    // ------------------------------------------------------------------
++
++    /// KNOWN FAILURE — real bug: `Edn::Double` of a whole number serializes
++    /// without a ".0" suffix (`Edn::Double(3.0).to_string() == "3"`), so it
++    /// reparses as `Edn::UInt(3)`/`Edn::Int(-3)`. EDN distinguishes `3` from
++    /// `3.0`; the emitted text silently changes the value's type. (Related:
++    /// `Double(f64::NAN)`/`Double(f64::INFINITY)` serialize as `NaN`/`inf`,
++    /// which are not valid EDN and reparse as symbols.)
++    #[hegel::test]
++    fn known_bug_whole_double_reparses_as_integer(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i32>());
++        let edn = Edn::Double(f64::from(n).into());
++        let s = edn.to_string();
++        let reparsed = Edn::from_str(&s);
++        assert_eq!(
++            reparsed.as_ref(),
++            Ok(&edn),
++            "Double({n}.0) serialized as {s:?} and reparsed as {reparsed:?}"
++        );
++    }
++
++    /// KNOWN FAILURE — real bug: `Edn::Str` serializes via Rust's `{:?}`
++    /// formatting, which escapes control characters as `\u{7f}` etc. The
++    /// parser only understands \t \r \n \\ \" and rejects `\u`, so any string
++    /// containing a control character serializes to unparseable EDN.
++    #[hegel::test]
++    fn known_bug_control_char_in_string_does_not_reparse(tc: hegel::TestCase) {
++        let cp: u32 = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(0x08),
++            generators::integers::<u32>()
++                .min_value(0x0b)
++                .max_value(0x0c),
++            generators::integers::<u32>()
++                .min_value(0x0e)
++                .max_value(0x1f),
++            generators::just(0x7f_u32),
++        ));
++        let c = char::from_u32(cp).unwrap();
++        let edn = Edn::Str(format!("a{c}b"));
++        let s = edn.to_string();
++        let reparsed = Edn::from_str(&s);
++        assert_eq!(
++            reparsed.as_ref(),
++            Ok(&edn),
++            "Str with control char U+{cp:04X} serialized as {s:?} and reparsed as {reparsed:?}"
++        );
++    }
++
++    /// KNOWN FAILURE — real bug: `Edn::Char` of a non-ASCII whitespace
++    /// character (U+00A0 NBSP, U+2028 LINE SEPARATOR, ...) serializes as
++    /// `\<char>`, but the parser reads char literals with
++    /// `take_while(!is_whitespace)`, sees an empty element, and errors.
++    #[hegel::test]
++    fn known_bug_unicode_whitespace_char_does_not_reparse(tc: hegel::TestCase) {
++        let c = tc.draw(generators::sampled_from(vec![
++            '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2003}', '\u{2028}', '\u{2029}',
++            '\u{202f}', '\u{3000}',
++        ]));
++        let edn = Edn::Char(c);
++        let s = edn.to_string();
++        let reparsed = Edn::from_str(&s);
++        assert_eq!(
++            reparsed.as_ref(),
++            Ok(&edn),
++            "Char(U+{:04X}) serialized as {s:?} and reparsed as {reparsed:?}",
++            c as u32
++        );
++    }
++
++    /// KNOWN FAILURE — real bug: after stripping a `0x`/`NNr` radix prefix,
++    /// the parser checks the remaining digits against float notation *first*,
++    /// so hex/radix digit strings that happen to look like `<digits>e<digits>`
++    /// are misparsed as doubles: `0x5e5` parses as `Double(500000.0)` instead
++    /// of `UInt(0x5e5) == UInt(1509)`.
++    #[hegel::test]
++    fn known_bug_radix_digits_with_e_misparse_as_double(tc: hegel::TestCase) {
++        let a = tc.draw(generators::integers::<u32>().max_value(9));
++        let b = tc.draw(generators::integers::<u32>().max_value(9));
++        let digits = format!("{a}e{b}");
++        let expected = u64::from_str_radix(&digits, 16).unwrap();
++        let parsed = Edn::from_str(&format!("0x{digits}"));
++        assert_eq!(
++            parsed.as_ref(),
++            Ok(&Edn::UInt(expected)),
++            "0x{digits} parsed as {parsed:?}"
++        );
++    }
++
++    /// KNOWN FAILURE — real bug: a single-character symbol at the end of the
++    /// input fails to parse: `Edn::from_str("a")` returns
++    /// `Err(ParseEdn("Could not identify symbol index"))`. `read_symbol` (and
++    /// `read_bool_or_nil`) unconditionally require a lookahead character to
++    /// compute an error-message index, so a symbol whose last char is the last
++    /// char of the document errors out. `"a "` (trailing space) parses fine.
++    /// Also reproduces nested at end-of-document, e.g. `"#A A"` (a tagged
++    /// element whose value is a single-char symbol).
++    #[hegel::test]
++    fn known_bug_single_char_symbol_at_eof_fails(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::from_regex(r"[A-Za-z*!?$%&=<>]").fullmatch(true));
++        let parsed = Edn::from_str(&s);
++        assert_eq!(
++            parsed.as_ref(),
++            Ok(&Edn::Symbol(s.clone())),
++            "input {s:?} parsed as {parsed:?}"
++        );
++    }
++
++    /// KNOWN FAILURE (process-aborting) — real bug: the parser recurses once
++    /// per nesting level with no depth limit, so deeply nested input from an
++    /// untrusted source overflows the stack and aborts the whole process
++    /// (observed at depth ~1000 on a 2 MiB test-thread stack; also reproduces
++    /// with `{:a {:a ...}}` and `#{#{...}}` nesting).
++    ///
++    /// Kept `#[ignore]`d because a stack overflow cannot be caught: running it
++    /// takes down the entire test binary. Run explicitly with:
++    ///   cargo test --test parse `known_bug_deep_nesting_stack_overflow` -- --ignored
++    #[test]
++    #[ignore = "stack overflow: aborts the process; see comment"]
++    fn known_bug_deep_nesting_stack_overflow() {
++        let depth = 10_000;
++        let s = "[".repeat(depth) + &"]".repeat(depth);
++        drop(Edn::from_str(&s));
++    }
++}
