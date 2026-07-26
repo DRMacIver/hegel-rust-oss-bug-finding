@@ -186,7 +186,7 @@ mod model {
 
         let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(max_steps));
         for _ in 0..steps {
-            match tc.draw(gs::integers::<u8>().min_value(0).max_value(10)) {
+            match tc.draw(gs::integers::<u8>().min_value(0).max_value(18)) {
                 // reserve an entity id concurrently (not visible until flush)
                 8 => {
                     let e = world.reserve_entity();
@@ -206,6 +206,198 @@ mod model {
                         let existed = model.remove(&e).is_some();
                         assert_eq!(ok, existed, "take ok-ness disagrees for {:?}", e);
                     }
+                }
+                // insert a multi-component bundle in one call (Bundle path, not insert_one)
+                11 => {
+                    flush_model(&mut model, &mut reserved);
+                    if let Some(e) = pick(tc, &known) {
+                        let live = model.contains_key(&e);
+                        let a = tc.draw(gs::optional(val()));
+                        let b = tc.draw(gs::optional(val()));
+                        let c = tc.draw(gs::booleans());
+                        let d = tc.draw(gs::optional(val()));
+                        let mut builder = EntityBuilder::new();
+                        if let Some(v) = a {
+                            builder.add(A(v));
+                        }
+                        if let Some(v) = b {
+                            builder.add(B(v));
+                        }
+                        if c {
+                            builder.add(C);
+                        }
+                        if let Some(v) = d {
+                            builder.add(D::new(v));
+                        }
+                        let ok = world.insert(e, builder.build()).is_ok();
+                        assert_eq!(ok, live, "insert bundle ok-ness for {:?}", e);
+                        if let Some(m) = model.get_mut(&e) {
+                            if let Some(v) = a {
+                                m.a = Some(v);
+                            }
+                            if let Some(v) = b {
+                                m.b = Some(v);
+                            }
+                            if c {
+                                m.c = true;
+                            }
+                            if let Some(v) = d {
+                                m.d = Some(v);
+                            }
+                        }
+                        // if the target was dead, the built D (if any) is dropped by insert -> net 0
+                    }
+                }
+                // remove a whole bundle: all-or-nothing (Err if any member missing, removes nothing)
+                12 => {
+                    flush_model(&mut model, &mut reserved);
+                    if let Some(e) = pick(tc, &known) {
+                        match tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) {
+                            0 => {
+                                let ok = world.remove::<(A, B)>(e).is_ok();
+                                let had = model
+                                    .get(&e)
+                                    .map(|m| m.a.is_some() && m.b.is_some())
+                                    .unwrap_or(false);
+                                assert_eq!(ok, had, "remove (A,B) for {:?}", e);
+                                if ok {
+                                    let m = model.get_mut(&e).unwrap();
+                                    m.a = None;
+                                    m.b = None;
+                                }
+                            }
+                            _ => {
+                                // the removed D (on success) is returned and dropped here
+                                let ok = world.remove::<(C, D)>(e).is_ok();
+                                let had = model
+                                    .get(&e)
+                                    .map(|m| m.c && m.d.is_some())
+                                    .unwrap_or(false);
+                                assert_eq!(ok, had, "remove (C,D) for {:?}", e);
+                                if ok {
+                                    let m = model.get_mut(&e).unwrap();
+                                    m.c = false;
+                                    m.d = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                // exchange one component for another (routes via an intermediate archetype)
+                13 => {
+                    flush_model(&mut model, &mut reserved);
+                    if let Some(e) = pick(tc, &known) {
+                        let v = tc.draw(val());
+                        match tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) {
+                            0 => {
+                                // remove A, add B: requires A present
+                                let ok = world.exchange_one::<A, B>(e, B(v)).is_ok();
+                                let had =
+                                    model.get(&e).map(|m| m.a.is_some()).unwrap_or(false);
+                                assert_eq!(ok, had, "exchange A->B for {:?}", e);
+                                if ok {
+                                    let m = model.get_mut(&e).unwrap();
+                                    m.a = None;
+                                    m.b = Some(v);
+                                }
+                            }
+                            _ => {
+                                // remove D, add A: requires D present; removed D is returned & dropped
+                                let ok = world.exchange_one::<D, A>(e, A(v)).is_ok();
+                                let had =
+                                    model.get(&e).map(|m| m.d.is_some()).unwrap_or(false);
+                                assert_eq!(ok, had, "exchange D->A for {:?}", e);
+                                if ok {
+                                    let m = model.get_mut(&e).unwrap();
+                                    m.d = None;
+                                    m.a = Some(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                // mutate a single component in place via get::<&mut _> (a read path: does NOT flush)
+                14 => {
+                    if let Some(e) = pick(tc, &known) {
+                        let v = tc.draw(val());
+                        match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
+                            0 => {
+                                if let Ok(mut a) = world.get::<&mut A>(e) {
+                                    a.0 = v;
+                                }
+                                if let Some(m) = model.get_mut(&e) {
+                                    if m.a.is_some() {
+                                        m.a = Some(v);
+                                    }
+                                }
+                            }
+                            1 => {
+                                if let Ok(mut b) = world.get::<&mut B>(e) {
+                                    b.0 = v;
+                                }
+                                if let Some(m) = model.get_mut(&e) {
+                                    if m.b.is_some() {
+                                        m.b = Some(v);
+                                    }
+                                }
+                            }
+                            _ => {
+                                // mutate D's payload in place — no construct/drop, so D_LIVE is unchanged
+                                if let Ok(mut d) = world.get::<&mut D>(e) {
+                                    d.0 = v;
+                                }
+                                if let Some(m) = model.get_mut(&e) {
+                                    if m.d.is_some() {
+                                        m.d = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // sweep-mutate every A via query_mut, setting each to a drawn value
+                15 => {
+                    let v = tc.draw(val());
+                    for (_e, a) in world.query_mut::<(Entity, &mut A)>() {
+                        a.0 = v;
+                    }
+                    for m in model.values_mut() {
+                        if m.a.is_some() {
+                            m.a = Some(v);
+                        }
+                    }
+                }
+                // clear the whole world (Entity values then repeat — stale handles may alias)
+                16 => {
+                    world.clear();
+                    model.clear();
+                    reserved.clear();
+                }
+                // spawn a homogeneous batch of (A, B) entities in one call
+                17 => {
+                    flush_model(&mut model, &mut reserved);
+                    let n = tc.draw(gs::integers::<u32>().min_value(0).max_value(5));
+                    let v = tc.draw(val());
+                    let ents: Vec<Entity> =
+                        world.spawn_batch((0..n).map(|_| (A(v), B(v)))).collect();
+                    for e in ents {
+                        model.insert(
+                            e,
+                            M {
+                                a: Some(v),
+                                b: Some(v),
+                                c: false,
+                                d: None,
+                            },
+                        );
+                        known.push(e);
+                    }
+                }
+                // reserve component capacity (a pure hint: no observable change)
+                18 => {
+                    flush_model(&mut model, &mut reserved);
+                    let n = tc.draw(gs::integers::<u32>().min_value(0).max_value(8));
+                    world.reserve::<(A, B)>(n);
                 }
                 // spawn an arbitrary subset of {A, B, C, D}
                 0 | 1 => {
