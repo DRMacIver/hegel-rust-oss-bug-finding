@@ -1,0 +1,11 @@
+[package]
+name = "hecs-pbt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+hecs = { version = "*", features = ["row-serialize", "column-serialize"] }
+hegeltest = "0.28.2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
