@@ -11,7 +11,10 @@
 
 #[cfg(test)]
 mod model {
-    use hecs::{Entity, EntityBuilder, Or, PreparedQuery, QueryOneError, With, Without, World};
+    use hecs::{
+        Entity, EntityBuilder, EntityBuilderClone, Or, PreparedQuery, QueryOneError, With, Without,
+        World,
+    };
     use hegel::generators as gs;
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
@@ -354,12 +357,24 @@ mod model {
 
         let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(max_steps));
         for _ in 0..steps {
-            match tc.draw(gs::integers::<u8>().min_value(0).max_value(20)) {
-                // reserve an entity id concurrently (not visible until flush)
+            match tc.draw(gs::integers::<u8>().min_value(0).max_value(22)) {
+                // reserve entity id(s) concurrently (not visible until flush): one, or a bulk range
                 8 => {
-                    let e = world.reserve_entity();
-                    reserved.push(e);
-                    known.push(e);
+                    match tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) {
+                        0 => {
+                            let e = world.reserve_entity();
+                            reserved.push(e);
+                            known.push(e);
+                        }
+                        _ => {
+                            let n = tc.draw(gs::integers::<u32>().min_value(0).max_value(4));
+                            let ents: Vec<Entity> = world.reserve_entities(n).collect();
+                            for e in ents {
+                                reserved.push(e);
+                                known.push(e);
+                            }
+                        }
+                    }
                 }
                 // explicit flush: reserved -> empty real entities
                 9 => {
@@ -673,6 +688,55 @@ mod model {
                         }
                     }
                 }
+                // take an entity and MOVE it into a scratch world (exercises TakenEntity::put,
+                // the unsafe component-move path — distinct from the drop-on-take path in arm 10)
+                21 => {
+                    flush_model(&mut model, &mut reserved);
+                    if let Some(e) = pick(tc, &known) {
+                        let expected = model.get(&e).copied();
+                        match world.take(e) {
+                            Ok(taken) => {
+                                let m = expected.expect("take Ok implies entity was modelled");
+                                let mut scratch = World::new();
+                                let e2 = scratch.spawn(taken); // moves components via put()
+                                assert_eq!(scratch.get::<&A>(e2).ok().map(|r| r.0), m.a, "migrated A");
+                                assert_eq!(scratch.get::<&B>(e2).ok().map(|r| r.0), m.b, "migrated B");
+                                assert_eq!(scratch.get::<&C>(e2).is_ok(), m.c, "migrated C");
+                                assert_eq!(scratch.get::<&D>(e2).ok().map(|r| r.0), m.d, "migrated D");
+                                assert_eq!(scratch.len(), 1, "scratch world holds exactly the moved entity");
+                                model.remove(&e);
+                                // scratch drops here: any moved D drops now, matching model.remove
+                            }
+                            Err(_) => assert!(expected.is_none(), "take failed but {:?} modelled", e),
+                        }
+                    }
+                }
+                // spawn via the clonable builder (EntityBuilderClone); D is not Clone, so {A,B,C} only
+                22 => {
+                    flush_model(&mut model, &mut reserved);
+                    let a = tc.draw(gs::optional(val()));
+                    let b = tc.draw(gs::optional(val()));
+                    let c = tc.draw(gs::booleans());
+                    let mut builder = EntityBuilderClone::new();
+                    if let Some(v) = a {
+                        builder.add(A(v));
+                    }
+                    if let Some(v) = b {
+                        builder.add(B(v));
+                    }
+                    if c {
+                        builder.add(C);
+                    }
+                    assert_eq!(builder.has::<A>(), a.is_some(), "clone-builder.has::<A>");
+                    let built = builder.build();
+                    // build() consumes into a reusable bundle; spawn twice to exercise the clone path
+                    let e1 = world.spawn(&built);
+                    let e2 = world.spawn(&built);
+                    model.insert(e1, M { a, b, c, d: None });
+                    model.insert(e2, M { a, b, c, d: None });
+                    known.push(e1);
+                    known.push(e2);
+                }
                 // spawn an arbitrary subset of {A, B, C, D}
                 0 | 1 => {
                     flush_model(&mut model, &mut reserved);
@@ -693,6 +757,17 @@ mod model {
                     if let Some(v) = d {
                         builder.add(D::new(v));
                     }
+                    // EntityBuilder introspection agrees with what we added
+                    assert_eq!(builder.has::<A>(), a.is_some(), "builder.has::<A>");
+                    assert_eq!(builder.has::<B>(), b.is_some(), "builder.has::<B>");
+                    assert_eq!(builder.has::<C>(), c, "builder.has::<C>");
+                    assert_eq!(builder.has::<D>(), d.is_some(), "builder.has::<D>");
+                    assert_eq!(builder.get::<&A>().map(|r| r.0), a, "builder.get::<&A>");
+                    let ntypes = a.is_some() as usize
+                        + b.is_some() as usize
+                        + c as usize
+                        + d.is_some() as usize;
+                    assert_eq!(builder.component_types().count(), ntypes, "builder.component_types");
                     let e = world.spawn(builder.build());
                     model.insert(e, M { a, b, c, d });
                     known.push(e);
