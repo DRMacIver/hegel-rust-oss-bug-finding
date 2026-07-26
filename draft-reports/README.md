@@ -39,7 +39,7 @@ Each ends with the requested hegel attribution line.
 - iri-string — [lo48576/iri-string#62](https://github.com/lo48576/iri-string/issues/62)
 - geo — [georust/geo#1566](https://github.com/georust/geo/issues/1566)
 - jj-lib — [jj-vcs/jj#9868](https://github.com/jj-vcs/jj/issues/9868) (with AI-disclosure line)
-- rustybuzz — [harfbuzz/rustybuzz#168](https://github.com/harfbuzz/rustybuzz/issues/168)
+- rustybuzz — [harfbuzz/rustybuzz#168](https://github.com/harfbuzz/rustybuzz/issues/168) — **repo unmaintained** (maintainer redirected to `harfrust`); should not have been filed. See postmortem below.
 - yaml-rust2 — [Ethiraric/yaml-rust2#78](https://github.com/Ethiraric/yaml-rust2/issues/78)
 - quick-xml — [tafia/quick-xml#984](https://github.com/tafia/quick-xml/issues/984)
 - euclid — [servo/euclid#555](https://github.com/servo/euclid/issues/555)
@@ -65,6 +65,8 @@ Each ends with the requested hegel attribution line.
 - pulldown-cmark — [pulldown-cmark/pulldown-cmark#1115](https://github.com/pulldown-cmark/pulldown-cmark/issues/1115)
 
 Five carry a "still reproduces after #N" reference (quick-xml #755, native_db #214, bson #385, rkyv #301, geo #912); jj-lib carries an AI-agent disclosure line (its PR template expects LLM disclosure). The categorisation below records which were strong (Tier A) vs lower-value (Tier B).
+
+**Postmortem — rustybuzz (#168) was filed to an unmaintained repo.** The maintainer replied that rustybuzz is no longer maintained (use `harfrust`). It wasn't archived and had no README deprecation notice, but it was ~13 months stale with a named successor crate — signals our checks (repro + duplicate + policy) never looked at. Fix: a maintenance/staleness check (`archived` + `pushed_at` + successor-crate glance) is now a filing-gate step in `prioritising-bugs-to-report`. A sweep of the other 33 filed repos found **none** stale (oldest ~7 months, none archived), so rustybuzz was the only miss.
 
 **Tier A — strong, oracle-independent, clean (32):**
 `b3-01` bigdecimal `normalized()` scale overflow · `b3-02` sqlparser bracket-ident roundtrip · `b3-05` taffy stale layout after `remove` · `b3-06` vte C1 split dispatch · `b3-08` lz4_flex `Max8MB` self-reject · `b3-13` ipnet subnets past `end` · `b3-14` iri-string empty fragment · `b3-15` geo non-convex hull · `b3-20` yaml-rust2 decode infinite loop · `b3-21` quick-xml `trim_text_end` empty Text · `b3-24` hifitime `ZERO-MIN` vs `-MIN` · `b3-27` native_db `range(..=end)` exclusive · `b3-28` sled DoubleEnded re-yield · `b3-31` starlark AST Display roundtrip · `b3-33` rune `-i64::MIN` · `b3-36` openraft `Vote` PartialOrd panic · `b3-37` parry `distance` asymmetric · `b3-39` brotli BroCatli non-decodable · `b3-40` swash `advance_width` underflow · `b3-42` rkyv `access` release stack-overflow DoS · `b3-43` kurbo `eval` NaN endpoints · `b3-44` gltf slice-vs-reader disagree · `b3-45` palette hue out of `[0,360)` · `b3-47` similar empty-input panic · `b3-48` statrs `Gamma::pdf` NaN · `b3-49` bson decode release stack-overflow DoS · `b3-50` pulldown-cmark tasklist-in-heading · `b3-17` jj-lib conflict `\r` data loss · `b3-22` euclid angle range · `b3-29` diamond-types `load_from` panic · `b3-35` rumqtt `Publish` topic≥64KiB corruption
