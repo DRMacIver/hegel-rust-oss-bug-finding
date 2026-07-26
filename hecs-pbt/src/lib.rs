@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod model {
-    use hecs::{Entity, EntityBuilder, With, Without, World};
+    use hecs::{Entity, EntityBuilder, Or, QueryOneError, With, Without, World};
     use hegel::generators as gs;
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
@@ -122,6 +122,122 @@ mod model {
         assert_eq!(without, without_want, "query::<Without<&A,&B>>");
     }
 
+    /// `query::<Or<&A,&B>>`: exactly the entities with A or B, each variant reflecting which it has.
+    fn check_query_or(world: &World, model: &HashMap<Entity, M>) {
+        let mut got: HashMap<Entity, (Option<i32>, Option<i32>)> = HashMap::new();
+        for (e, ab) in world.query::<(Entity, Or<&A, &B>)>().iter() {
+            let pair = match ab {
+                Or::Left(a) => (Some(a.0), None),
+                Or::Right(b) => (None, Some(b.0)),
+                Or::Both(a, b) => (Some(a.0), Some(b.0)),
+            };
+            assert!(got.insert(e, pair).is_none(), "query::<Or<&A,&B>> dup {:?}", e);
+        }
+        let want: HashMap<Entity, (Option<i32>, Option<i32>)> = model
+            .iter()
+            .filter(|(_, m)| m.a.is_some() || m.b.is_some())
+            .map(|(&e, m)| (e, (m.a, m.b)))
+            .collect();
+        assert_eq!(got, want, "query::<Or<&A,&B>> set/values");
+    }
+
+    /// `query::<(&A, Option<&B>)>`: exactly the entities with A, each carrying its optional B.
+    fn check_query_option(world: &World, model: &HashMap<Entity, M>) {
+        let mut got: HashMap<Entity, Option<i32>> = HashMap::new();
+        for (e, _a, ob) in world.query::<(Entity, &A, Option<&B>)>().iter() {
+            assert!(got.insert(e, ob.map(|b| b.0)).is_none(), "Option query dup {:?}", e);
+        }
+        let want: HashMap<Entity, Option<i32>> =
+            model.iter().filter_map(|(&e, m)| m.a.map(|_| (e, m.b))).collect();
+        assert_eq!(got, want, "query::<(&A, Option<&B>)> set/values");
+    }
+
+    /// `query_one` (shared borrow) agrees with the model for every live entity, incl. Unsatisfied.
+    fn check_query_one(world: &World, model: &HashMap<Entity, M>) {
+        for (&e, m) in model {
+            match world.query_one::<&A>(e).get() {
+                Ok(a) => assert_eq!(Some(a.0), m.a, "query_one &A value {:?}", e),
+                Err(QueryOneError::Unsatisfied) => {
+                    assert!(m.a.is_none(), "query_one &A Unsatisfied but modelled present {:?}", e)
+                }
+                Err(QueryOneError::NoSuchEntity) => panic!("query_one &A NoSuchEntity for live {:?}", e),
+            }
+            match world.query_one::<(&A, &B)>(e).get() {
+                Ok((a, b)) => {
+                    assert_eq!(Some(a.0), m.a, "query_one (A,B).A {:?}", e);
+                    assert_eq!(Some(b.0), m.b, "query_one (A,B).B {:?}", e);
+                }
+                Err(QueryOneError::Unsatisfied) => assert!(
+                    m.a.is_none() || m.b.is_none(),
+                    "query_one (A,B) Unsatisfied but both modelled {:?}",
+                    e
+                ),
+                Err(QueryOneError::NoSuchEntity) => panic!("query_one (A,B) NoSuchEntity for live {:?}", e),
+            }
+        }
+    }
+
+    /// `query_one_mut` (unique borrow — the fast path) agrees with the model for every live entity.
+    fn check_query_one_mut(world: &mut World, model: &HashMap<Entity, M>) {
+        for (&e, m) in model {
+            match world.query_one_mut::<&A>(e) {
+                Ok(a) => assert_eq!(Some(a.0), m.a, "query_one_mut &A value {:?}", e),
+                Err(QueryOneError::Unsatisfied) => {
+                    assert!(m.a.is_none(), "query_one_mut &A Unsatisfied but modelled present {:?}", e)
+                }
+                Err(QueryOneError::NoSuchEntity) => panic!("query_one_mut &A NoSuchEntity for live {:?}", e),
+            }
+        }
+    }
+
+    /// `satisfies` agrees with the model for single and compound queries.
+    fn check_satisfies(world: &World, model: &HashMap<Entity, M>) {
+        for (&e, m) in model {
+            assert_eq!(world.satisfies::<&A>(e), m.a.is_some(), "satisfies &A {:?}", e);
+            assert_eq!(world.satisfies::<&B>(e), m.b.is_some(), "satisfies &B {:?}", e);
+            assert_eq!(world.satisfies::<&C>(e), m.c, "satisfies &C {:?}", e);
+            assert_eq!(world.satisfies::<&D>(e), m.d.is_some(), "satisfies &D {:?}", e);
+            assert_eq!(
+                world.satisfies::<(&A, &B)>(e),
+                m.a.is_some() && m.b.is_some(),
+                "satisfies (A,B) {:?}",
+                e
+            );
+        }
+    }
+
+    /// The `EntityRef` view of each live entity matches the model (has/get/len/component_types/query).
+    fn check_entity_ref(world: &World, model: &HashMap<Entity, M>) {
+        for (&e, m) in model {
+            let er = world.entity(e).expect("live modelled entity must have an EntityRef");
+            assert_eq!(er.entity(), e, "EntityRef.entity");
+            assert_eq!(er.has::<A>(), m.a.is_some(), "EntityRef.has::<A> {:?}", e);
+            assert_eq!(er.has::<B>(), m.b.is_some(), "EntityRef.has::<B> {:?}", e);
+            assert_eq!(er.has::<C>(), m.c, "EntityRef.has::<C> {:?}", e);
+            assert_eq!(er.has::<D>(), m.d.is_some(), "EntityRef.has::<D> {:?}", e);
+            assert_eq!(er.get::<&A>().map(|r| r.0), m.a, "EntityRef.get::<&A> {:?}", e);
+            assert_eq!(er.get::<&B>().map(|r| r.0), m.b, "EntityRef.get::<&B> {:?}", e);
+            assert_eq!(er.get::<&D>().map(|r| r.0), m.d, "EntityRef.get::<&D> {:?}", e);
+            assert_eq!(er.satisfies::<&A>(), m.a.is_some(), "EntityRef.satisfies::<&A> {:?}", e);
+            let expect_len = m.a.is_some() as usize
+                + m.b.is_some() as usize
+                + m.c as usize
+                + m.d.is_some() as usize;
+            assert_eq!(er.len(), expect_len, "EntityRef.len {:?}", e);
+            assert_eq!(er.is_empty(), expect_len == 0, "EntityRef.is_empty {:?}", e);
+            assert_eq!(
+                er.component_types().count(),
+                expect_len,
+                "EntityRef.component_types count {:?}",
+                e
+            );
+            match er.query::<&A>().get() {
+                Ok(a) => assert_eq!(Some(a.0), m.a, "EntityRef.query::<&A> {:?}", e),
+                Err(_) => assert!(m.a.is_none(), "EntityRef.query::<&A> err but modelled {:?}", e),
+            }
+        }
+    }
+
     /// Full oracle: World and model describe the same entities/components, drops balance,
     /// archetypes partition the entities, and queries return exactly the right sets.
     /// Materialize reserved entities into empty real entities (mirrors hecs's implicit flush).
@@ -164,10 +280,15 @@ mod model {
         assert_eq!(arch_total, world.len(), "Σ archetype.len() != world.len()");
         assert_eq!(ids.len() as u32, world.len(), "archetype id count != world.len()");
 
-        // query correctness
+        // query correctness (shared-borrow query shapes + per-entity views)
         check_query_a(world, model);
         check_query_ab(world, model);
         check_query_with_without(world, model);
+        check_query_or(world, model);
+        check_query_option(world, model);
+        check_query_one(world, model);
+        check_satisfies(world, model);
+        check_entity_ref(world, model);
 
         // reserved-but-unflushed entities: contained, but excluded from len/iter/queries/model
         for &r in reserved {
@@ -515,6 +636,8 @@ mod model {
                     }
                 }
             }
+            // unique-borrow query path (query_one_mut) checked separately, then the shared oracle
+            check_query_one_mut(&mut world, &model);
             check(&world, &model, &reserved);
         }
     }
