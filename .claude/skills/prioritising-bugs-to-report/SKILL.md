@@ -36,6 +36,7 @@ jiff `-PT0.5S` parsing as `+0.5s` is strong on every axis: valid ISO 8601 input,
 - **A `Result`-returning API panicking instead of returning `Err`** on invalid input is a real but minor API-quality issue — file it as exactly that, without inflating the blast radius.
 - **Differential disagreement with no authority.** "Crate A and crate B disagree" is only a bug if a spec, RFC, or the crate's own stated guarantee says which is right. Absent that, it's an observation, and weak — especially against a hardened, widely-used crate where the behaviour is likely deliberate.
 - **An accepted, opt-in-mitigated limitation.** Some imperfections are a known, tolerated class the ecosystem treats as fine, often with an opt-in switch to fix them. serde_json's default float parse is an ULP off unless you enable `float_roundtrip`, and that's considered acceptable, not a bug. Before reporting one, look for the tells: a feature flag or config that fixes it (ron's `number_suffixes` makes lossy `Value` f32 round-trips exact), a documented "not guaranteed" stance, or maintainers saying so on the tracker. If the fix is already a switch the user is expected to flip, it's a docs/ergonomics point at best.
+- **Reachable only through internal (`pub(crate)`) APIs.** If you can only trigger it via the crate's own test hooks — not from the public API — it's easier for a maintainer to wave off, even when there's a real production path, because the report has to carry the whole reachability argument instead of just showing a public one-liner. Not disqualifying (it can still be a genuine, production-reachable bug), but it lowers priority; prefer findings that reproduce straight through the public surface.
 - **Unmaintained / deprecated / dormant** crate, or one whose policy declines AI-found reports.
 
 ## Search the tracker for the behaviour, not just your exact repro
@@ -71,3 +72,8 @@ Ask, in order:
 6. Can I file it directly, or does the repo's AI policy mean a human has to? (Affects effort and who does it, not whether it's a bug.)
 
 If a finding only survives as "a Result API panics instead of erroring on the documented-max input, and the docs are off by one" — that's honest, but it's not top-tier. Rank it accordingly, or leave it out of a curated shortlist.
+
+## Filing etiquette and volume
+
+- **The bar is "reasonable to report", not "certain to be fixed".** The goal is not to avoid every wontfix — a maintainer closing something as won't-fix after a fair judgement call is a normal, fine outcome, and it's OK if the call is genuinely theirs to make. What to avoid is filing things a maintainer would consider *intrinsically unreasonable to report at all*. If a whole class of reports keeps getting closed as "that's expected / out of scope", deprioritise more of that class — but one-off wontfixes are not failures.
+- **Cap issues per owner, not per repo.** Until there's an established relationship with a maintainer, file at most **2 issues total to a given GitHub owner** (org or user) across *all* their repos — not 2 per repo. More than that, unsolicited, reads as dumping on them. Track the running per-owner count across batches, since an owner can accumulate across separate filing rounds.
