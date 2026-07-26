@@ -41,6 +41,8 @@ fatal runtime error: stack overflow, aborting
 
 The input here is just a document nested 10,000 levels deep under one field name, a valid BSON byte layout, and it takes the process down before either function returns a `Result`. Both crash in debug and release builds.
 
+(#385 fixed the `raw_deserialize` path; the eager `deserialize_from_slice` / `from_reader` paths still overflow.)
+
 Tested on bson 3.1.0 (`serde` feature).
 
 BTW, this bug was found using [hegel](https://crates.io/crates/hegeltest). Happy to contribute the tests if you're interested.

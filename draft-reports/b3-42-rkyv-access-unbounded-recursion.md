@@ -28,6 +28,8 @@ fatal runtime error: stack overflow, aborting
 
 Serialization succeeds and the archive is well-formed — a linear `Cons` chain, no shared or cyclic pointers. `access` overflows the stack and aborts before it can return `Err`, rather than rejecting the input. A shallower archive (e.g. 50,000 levels) validates and returns `Ok`, so the crash is depth-dependent.
 
+(#301 addressed the deserialize path; the checked `access` validation path still aborts.)
+
 Tested on rkyv 0.8.17 (release build).
 
 BTW, this bug was found using [hegel](https://crates.io/crates/hegeltest). Happy to contribute the tests if you're interested.

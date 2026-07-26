@@ -48,3 +48,5 @@ The merge's left side is the three bytes `left\r`, with no `\n` anywhere in any 
 Tested on jj-lib 0.43.0.
 
 BTW, this bug was found using [hegel](https://crates.io/crates/hegeltest). Happy to contribute the tests if you're interested.
+
+*This report was drafted by an AI agent (Claude Code) and reviewed by @DRMacIver before filing.*

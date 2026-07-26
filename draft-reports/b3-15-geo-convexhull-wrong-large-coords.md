@@ -43,6 +43,8 @@ input point POINT(-1.0 9150170671525436.0) is strictly to the RIGHT of hull edge
 
 The returned ring visits `(0,0)` twice and is self-intersecting rather than convex: two of the four input points end up strictly outside edges of the "hull" that is supposed to contain them, which the exact `orient2d` predicate from the `robust` crate (already a dependency of `geo`) confirms. Same result in a release build.
 
+(A failing convex-hull test was added in #912 but not merged; this is the same area.)
+
 Tested on `geo` 0.33.1.
 
 BTW, this bug was found using [hegel](https://crates.io/crates/hegeltest). Happy to contribute the tests if you're interested.

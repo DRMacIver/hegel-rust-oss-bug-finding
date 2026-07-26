@@ -46,6 +46,8 @@ range(..=0) with one item pk=0 returned: []
 
 The database contains a single item with primary key `0`. Scanning with `range(..=0u32)` returns an empty result, as if the range were exclusive of its end bound. The same happens scanning a unique secondary key with `range(..=0u32)` over an item whose secondary key is `0`.
 
+(#214 fixed inclusive ranges for non-unique secondary keys; the primary-key case here still reproduces.)
+
 Tested with native_db 0.8.2 (native_model 0.4.20).
 
 BTW, this bug was found using [hegel](https://crates.io/crates/hegeltest). Happy to contribute the tests if you're interested.
