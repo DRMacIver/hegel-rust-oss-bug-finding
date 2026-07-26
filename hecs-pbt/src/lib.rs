@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod model {
-    use hecs::{Entity, EntityBuilder, Or, QueryOneError, With, Without, World};
+    use hecs::{Entity, EntityBuilder, Or, PreparedQuery, QueryOneError, With, Without, World};
     use hegel::generators as gs;
     use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
@@ -238,6 +238,50 @@ mod model {
         }
     }
 
+    /// Random-access `View` (via `world.view`): `get`/`contains` agree with the model per entity.
+    fn check_view(world: &World, model: &HashMap<Entity, M>) {
+        let view = world.view::<&A>();
+        for (&e, m) in model {
+            assert_eq!(view.get(e).map(|a| a.0), m.a, "view.get::<&A> {:?}", e);
+            assert_eq!(view.contains(e), m.a.is_some(), "view.contains::<&A> {:?}", e);
+        }
+        // an entity with no A must be absent from the view even though it exists
+        for (&e, m) in model {
+            if m.a.is_none() {
+                assert!(view.get(e).is_none(), "view.get returned Some for A-less {:?}", e);
+            }
+        }
+    }
+
+    /// Batched iteration must visit exactly the same set/values as flat iteration.
+    fn check_iter_batched(world: &World, model: &HashMap<Entity, M>) {
+        let mut got: HashMap<Entity, i32> = HashMap::new();
+        let mut q = world.query::<(Entity, &A)>();
+        for batch in q.iter_batched(2) {
+            for (e, a) in batch {
+                assert!(got.insert(e, a.0).is_none(), "iter_batched dup {:?}", e);
+            }
+        }
+        let want: HashMap<Entity, i32> =
+            model.iter().filter_map(|(&e, m)| m.a.map(|v| (e, v))).collect();
+        assert_eq!(got, want, "iter_batched::<&A> set/values");
+    }
+
+    /// A `PreparedQuery` (archetype-cached) must return exactly the same set/values as a fresh query.
+    fn check_prepared(world: &World, model: &HashMap<Entity, M>) {
+        let mut pq = PreparedQuery::<(Entity, &A)>::new();
+        let mut got: HashMap<Entity, i32> = HashMap::new();
+        {
+            let mut borrow = pq.query(world);
+            for (e, a) in borrow.iter() {
+                assert!(got.insert(e, a.0).is_none(), "prepared dup {:?}", e);
+            }
+        }
+        let want: HashMap<Entity, i32> =
+            model.iter().filter_map(|(&e, m)| m.a.map(|v| (e, v))).collect();
+        assert_eq!(got, want, "PreparedQuery::<&A> set/values");
+    }
+
     /// Full oracle: World and model describe the same entities/components, drops balance,
     /// archetypes partition the entities, and queries return exactly the right sets.
     /// Materialize reserved entities into empty real entities (mirrors hecs's implicit flush).
@@ -289,6 +333,9 @@ mod model {
         check_query_one(world, model);
         check_satisfies(world, model);
         check_entity_ref(world, model);
+        check_view(world, model);
+        check_iter_batched(world, model);
+        check_prepared(world, model);
 
         // reserved-but-unflushed entities: contained, but excluded from len/iter/queries/model
         for &r in reserved {
@@ -307,7 +354,7 @@ mod model {
 
         let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(max_steps));
         for _ in 0..steps {
-            match tc.draw(gs::integers::<u8>().min_value(0).max_value(18)) {
+            match tc.draw(gs::integers::<u8>().min_value(0).max_value(20)) {
                 // reserve an entity id concurrently (not visible until flush)
                 8 => {
                     let e = world.reserve_entity();
@@ -519,6 +566,112 @@ mod model {
                     flush_model(&mut model, &mut reserved);
                     let n = tc.draw(gs::integers::<u32>().min_value(0).max_value(8));
                     world.reserve::<(A, B)>(n);
+                }
+                // mutate two DISTINCT entities' A at once via query_disjoint_mut (does NOT flush)
+                19 => {
+                    if known.len() >= 2 {
+                        let i1 =
+                            tc.draw(gs::integers::<usize>().min_value(0).max_value(known.len() - 1));
+                        let i2 =
+                            tc.draw(gs::integers::<usize>().min_value(0).max_value(known.len() - 1));
+                        let (e1, e2) = (known[i1], known[i2]);
+                        // assert_distinct panics on equal handles, so only proceed when distinct
+                        if e1 != e2 {
+                            let v1 = tc.draw(val());
+                            let v2 = tc.draw(val());
+                            let (e1_had, e2_had);
+                            {
+                                let [r1, r2] = world.query_disjoint_mut::<&mut A, 2>([e1, e2]);
+                                e1_had = if let Ok(a) = r1 {
+                                    a.0 = v1;
+                                    true
+                                } else {
+                                    false
+                                };
+                                e2_had = if let Ok(a) = r2 {
+                                    a.0 = v2;
+                                    true
+                                } else {
+                                    false
+                                };
+                            }
+                            let m1 = model.get(&e1).map(|m| m.a.is_some()).unwrap_or(false);
+                            let m2 = model.get(&e2).map(|m| m.a.is_some()).unwrap_or(false);
+                            assert_eq!(e1_had, m1, "query_disjoint_mut A-presence e1 {:?}", e1);
+                            assert_eq!(e2_had, m2, "query_disjoint_mut A-presence e2 {:?}", e2);
+                            if e1_had {
+                                model.get_mut(&e1).unwrap().a = Some(v1);
+                            }
+                            if e2_had {
+                                model.get_mut(&e2).unwrap().a = Some(v2);
+                            }
+                        }
+                    }
+                }
+                // mutate B via a random-access View (view_mut -> get_mut / get_disjoint_mut; no flush)
+                20 => {
+                    if let Some(e1) = pick(tc, &known) {
+                        match tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) {
+                            0 => {
+                                // single-entity random access
+                                let v = tc.draw(val());
+                                let had = {
+                                    let mut view = world.view_mut::<&mut B>();
+                                    if let Some(b) = view.get_mut(e1) {
+                                        b.0 = v;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                let m1 = model.get(&e1).map(|m| m.b.is_some()).unwrap_or(false);
+                                assert_eq!(had, m1, "view.get_mut B-presence {:?}", e1);
+                                if had {
+                                    model.get_mut(&e1).unwrap().b = Some(v);
+                                }
+                            }
+                            _ => {
+                                // disjoint two-entity random access
+                                let i2 = tc.draw(
+                                    gs::integers::<usize>().min_value(0).max_value(known.len() - 1),
+                                );
+                                let e2 = known[i2];
+                                if e1 != e2 {
+                                    let v1 = tc.draw(val());
+                                    let v2 = tc.draw(val());
+                                    let (e1_had, e2_had);
+                                    {
+                                        let mut view = world.view_mut::<&mut B>();
+                                        let [r1, r2] = view.get_disjoint_mut([e1, e2]);
+                                        e1_had = if let Some(b) = r1 {
+                                            b.0 = v1;
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        e2_had = if let Some(b) = r2 {
+                                            b.0 = v2;
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                    }
+                                    let m1 =
+                                        model.get(&e1).map(|m| m.b.is_some()).unwrap_or(false);
+                                    let m2 =
+                                        model.get(&e2).map(|m| m.b.is_some()).unwrap_or(false);
+                                    assert_eq!(e1_had, m1, "view.get_disjoint_mut B e1 {:?}", e1);
+                                    assert_eq!(e2_had, m2, "view.get_disjoint_mut B e2 {:?}", e2);
+                                    if e1_had {
+                                        model.get_mut(&e1).unwrap().b = Some(v1);
+                                    }
+                                    if e2_had {
+                                        model.get_mut(&e2).unwrap().b = Some(v2);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // spawn an arbitrary subset of {A, B, C, D}
                 0 | 1 => {
