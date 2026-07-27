@@ -952,8 +952,11 @@ mod model {
         drive(&tc, 300);
     }
 
+    // Under Miri the harness is ~50–100× slower, so generation throughput trips hegel's
+    // TooSlow health check even though nothing is wrong — Miri here is a UB oracle, not a
+    // generation-speed benchmark, so that one check is suppressed for this entry point only.
     #[cfg(miri)]
-    #[hegel::test(test_cases = 12)]
+    #[hegel::test(test_cases = 12, suppress_health_check = [hegel::HealthCheck::TooSlow])]
     fn world_matches_model(tc: hegel::TestCase) {
         drive(&tc, 25);
     }
