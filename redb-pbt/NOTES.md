@@ -67,7 +67,13 @@ skills from the hecs work (`stateful-model-based-testing`,
   so the "some j ≥ floor" oracle shape is required, not just convenient.
 
 ## Run
-- `cargo test` — baseline 500 cases × ≤40 txns + crash 300 cases × ≤20 txns (~7s total).
+- `cargo test` — 21 tests (13 hegel properties + 8 deterministic error-contract tests),
+  ~11s total.
+- Coverage of the redb dependency (`cargo llvm-cov --tests --dep-coverage redb
+  --summary-only`): **57.97% → 73.15% region coverage** over this session (functions
+  60.8% → 76.1%). Remaining cold: `error.rs` 17.9% (Display arms of hard-to-provoke
+  variants: upgrade/poisoned-lock/io), `multimap_table.rs` 52.9% (deep subtree
+  reorganisation paths), `db.rs` 67% (repair callback, upgrade, ReadOnlyDatabase).
 - redb build/test conventions (for any upstream contribution): `just test`
   (fmt + clippy --all-targets --all-features + test --all-features), `just test_all` for
   workspace crates, `just fuzz` for the libFuzzer harness. Commit authorship = the human;
@@ -77,12 +83,39 @@ skills from the hecs work (`stateful-model-based-testing`,
 - [DONE] baseline substrate (model-vs-BTreeMap + commit/abort + durability + snapshot seed).
 - [DONE] crash/power-loss injection StorageBackend (`src/crash.rs`) — passes 300 cases.
 - [DONE] MVCC interleaved-snapshot-consistency (`src/mvcc.rs`) — passes 500 cases.
-- [DONE] savepoints as model-restore (`src/savepoints.rs`) — passes 400 cases.
-- [DONE] metamorphic txn-grouping invariance (`src/metamorphic.rs`) — passes 400 cases.
+- [DONE] savepoints as model-restore (`src/savepoints.rs`) — ephemeral + persistent
+  (persistent adds a model of the savepoint table itself: list/delete/restore-deletes-newer).
+- [DONE] metamorphic txn-grouping invariance (`src/metamorphic.rs`).
 - [DONE] torn-write crash model (arbitrary in-order cut of the full write stream,
-  next write optionally torn mid-write) — passes 300 cases.
-- [LATER] multimap tables, range/retain/drain query surface, coverage-guided pass
-  (`cargo llvm-cov --dep-coverage redb`), crash-during-database-creation window.
+  next write optionally torn mid-write) with drawn 2-phase-commit/quick-repair flags.
+- [DONE] multimap tables (`src/multimap.rs`) incl. bulk inserts to force inline→subtree
+  spill and reverse iteration (rows and per-key values descending).
+- [DONE] coverage-guided pass: `src/surface.rs` (get_mut/pop_first/pop_last/retain_in/
+  extract_from_if/first/last/bounded range both directions, wide key domain),
+  `src/tables.rs` (catalog: create/delete/rename/list with full rename error contract),
+  `src/typed.rs` (tuple/Vec/i64/Option/&[u8]/bool/char/String/[u64;3] encodings must
+  iterate in Rust-Ord order and round-trip), `src/errors.rs` (8 provoked-error
+  contracts), `src/maintenance.rs` (check_integrity/compact identities + real-file
+  FileBackend round-trip). redb region coverage 57.97% → 73.15%.
+- [LATER] crash-during-database-creation window; write-reordering (non-prefix subset)
+  crash model — needs a page-granularity argument for what redb actually guarantees;
+  real-thread reader/writer stress (record-and-check, nondeterministic — keep separate);
+  deeper multimap subtree churn (many keys × many values with remove_all).
 
 ## Findings
-- None yet (baseline passes; redb is mature).
+- No redb divergences: every oracle above passes at the stated case counts, including
+  power-loss/torn-write recovery under all four commit-protocol combinations
+  (1-phase/2-phase × quick-repair on/off). redb is mature and its crash story held up
+  exactly as documented. (The only red run all session was a harness bug of ours: the
+  multimap reverse-iteration oracle first compared descending values against an
+  ascending model — hegel shrank it to a single key with two values instantly.)
+- Techniques validated by mutation instead: each major oracle was temporarily
+  strengthened to a wrong invariant and REQUIRED to fail (see crash/mvcc module docs);
+  all did, so green means tested, not vacuous.
+
+## Skills
+- NEW: `.claude/skills/crash-injection-testing/SKILL.md` — the CrashBackend pattern,
+  any-prefix-is-a-valid-crash-image insight, the two modeling lessons, and the
+  mutation-validation discipline.
+- EXTENDED: `stateful-model-based-testing` gained the tagged-snapshot-handles (MVCC)
+  oracle family.
