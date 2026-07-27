@@ -21,6 +21,8 @@ mod common;
 #[cfg(test)]
 mod crash;
 #[cfg(test)]
+mod errors;
+#[cfg(test)]
 mod metamorphic;
 #[cfg(test)]
 mod model;
@@ -34,3 +36,5 @@ mod savepoints;
 mod surface;
 #[cfg(test)]
 mod tables;
+#[cfg(test)]
+mod typed;
