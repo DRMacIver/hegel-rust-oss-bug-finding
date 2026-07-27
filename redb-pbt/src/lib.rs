@@ -23,6 +23,8 @@ mod crash;
 #[cfg(test)]
 mod errors;
 #[cfg(test)]
+mod maintenance;
+#[cfg(test)]
 mod metamorphic;
 #[cfg(test)]
 mod model;
