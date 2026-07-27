@@ -21,6 +21,8 @@ mod common;
 #[cfg(test)]
 mod crash;
 #[cfg(test)]
+mod metamorphic;
+#[cfg(test)]
 mod model;
 #[cfg(test)]
 mod mvcc;
