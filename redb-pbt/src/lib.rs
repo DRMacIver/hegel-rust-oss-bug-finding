@@ -25,6 +25,8 @@ mod metamorphic;
 #[cfg(test)]
 mod model;
 #[cfg(test)]
+mod multimap;
+#[cfg(test)]
 mod mvcc;
 #[cfg(test)]
 mod savepoints;
