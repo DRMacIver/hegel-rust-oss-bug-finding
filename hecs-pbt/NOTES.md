@@ -19,6 +19,10 @@ reusable PBT technique with hegel. Techniques are codified as the
   (bundle query-satisfaction vs spec, clone-builder algebra, add_bundle ≡ individual adds,
   Ref/RefMut map/clone/format, whole-column Archetype::get vs per-entity reads). Found
   findings E and F below.
+- `tests/query_shapes.rs` — coverage-guided query-surface properties: every public read shape
+  (Satisfies, &mut fetches via query(), Or accessors, QueryBorrow/QueryMut with/without/view/
+  into_iter_batched, iterator len/size_hint, ViewIter, ViewBorrow get_mut/get_disjoint_mut/
+  get_unchecked, full PreparedView surface) must project the fingerprint exactly.
 - `tests/serialize_roundtrip.rs` — row + column serialize→deserialize round-trip.
 - `tests/command_buffer.rs` — CommandBuffer (buffered run_on vs eager direct application).
 - `tests/change_tracker.rs` — ChangeTracker added/changed/removed vs a model, exact semantics.
@@ -27,25 +31,26 @@ reusable PBT technique with hegel. Techniques are codified as the
   malformed-stream validation, serialize_satisfying, Drop-tracked leak hunt.
 
 ## Run
-- `cargo test` — full suite (43 tests across 9 binaries; core harness ~18s, serialize_errors ~12s).
+- `cargo test` — full suite (44 tests across 10 binaries; core harness ~18s, serialize_errors ~12s).
 - Miri, with `MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-disable-isolation"`
   (`-Zmiri-disable-isolation` is REQUIRED: hegel reads its test-case DB from disk):
   - `cargo +nightly miri test --lib` (~32s), and
   - `cargo +nightly miri test --test metamorphic --test differential_paths
-     --test serialize_roundtrip --test builder_bundle_api` (~2min) — cfg(miri)-gated small
-    configs; the serialize round-trips and builder/column paths are UB oracles there.
+     --test serialize_roundtrip --test builder_bundle_api --test query_shapes` (~2.5min) —
+    cfg(miri)-gated small configs; the serialize round-trips and builder/column/view paths
+    are UB oracles there.
 
 ## Coverage of hecs (cargo-llvm-cov --dep-coverage hecs)
 - Core harness alone (`--lib`): 32.9% → **57%** region coverage after the breadth push.
-- Full suite (`--tests`): 32.9% → 81.3% → **86.2%** region coverage (2026-07-27, after the
-  coverage-guided builder/bundle suite). Per-file: command_buffer 100%, take 100%,
-  entity_ref 100%, entity_builder 98%, change_tracker 97%, bundle 94%, archetype 92%,
-  world.rs 91%, query_one 91%, batch 87%, serialize/row 83%, serialize/column 83%,
-  entities 83%, query.rs 71%.
+- Full suite (`--tests`): 32.9% → 81.3% → **91.2%** region coverage (2026-07-27, after the
+  coverage-guided builder/bundle + query-shapes suites). Per-file: command_buffer 100%,
+  take 100%, entity_ref 100%, entity_builder 98%, change_tracker 97%, bundle 94%,
+  archetype 92%, world.rs 91%, query.rs 91%, query_one 91%, batch 87%, serialize/row 83%,
+  serialize/column 83%, entities 83%.
 - NOTE: hecs 0.11.0 has NO par_iter/rayon feature (only row-serialize/column-serialize/std) —
-  that path does not exist to cover. Remaining gap is mostly query.rs (obscure Fetch impls:
-  &mut-flavored With/Without/Or/Satisfies fetches, size_hint paths) and entities.rs edge
-  branches.
+  that path does not exist to cover. Remaining gaps: entities.rs edge branches (freelist
+  growth races that need concurrent reserve), serialize error-formatting arms, batch.rs
+  error paths adjacent to the known findings, and Debug/dangling impls.
 
 ## Operations exercised (core harness; fixed universe A(i32), B(i32), C(ZST), D(Drop-tracked))
 spawn(arbitrary subset) · despawn · insert_one · remove_one · insert(bundle) ·
