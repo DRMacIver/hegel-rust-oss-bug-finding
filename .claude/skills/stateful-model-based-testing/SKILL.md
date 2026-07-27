@@ -132,3 +132,8 @@ reset≡fresh) and N-way differential construction paths compared through an
 observational fingerprint. Cheaper to write than a model, and it catches
 cross-path/order/history bugs this harness structurally cannot; the two share
 their component universe and Drop oracle.
+
+`coverage-guided-property-testing` — once this harness plateaus, measure the
+DEPENDENCY's per-file region coverage, read why the cold regions are cold, and
+aim new property-shaped tests (with real oracles) at them; run each under Miri
+immediately. The least-covered files are where the untested-code bugs live.
