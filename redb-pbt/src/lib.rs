@@ -30,3 +30,5 @@ mod multimap;
 mod mvcc;
 #[cfg(test)]
 mod savepoints;
+#[cfg(test)]
+mod surface;
