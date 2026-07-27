@@ -66,6 +66,14 @@ CRDT (model = the abstract value), etc.
   the modelled entries satisfying it, with correct values and no duplicates.
 - **Round-trip identities.** `deserialize(serialize(x)) == x`, `from_bits(to_bits(e)) == e`.
   Great as their own property over an arbitrary generated state.
+- **Tagged-snapshot handles (MVCC / snapshot isolation).** If the system hands out
+  snapshot views (read transactions, iterators over a version, savepoints), keep a
+  pool of up to K OPEN handles, each tagged with the index into the linear committed
+  `history` at which it was opened; interleave {open handle, mutate+commit, close
+  handle} and after EVERY step assert each open handle still observes exactly
+  `history[its tag]`. Deterministic single-threaded transaction-lifetime overlap is
+  the concurrency that MVCC must get right — no threads needed, and it shrinks well
+  (proved out on redb read transactions; the same shape fits any versioned store).
 - **Miri as an oracle (for unsafe code).** Run the *same* harness under `cargo miri test`.
   Generated operation sequences drive the unsafe machinery over inputs a human would
   never hand-write, and Miri reports UB the model checks can't. See "Running under Miri".
