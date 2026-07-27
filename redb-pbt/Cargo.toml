@@ -1,0 +1,9 @@
+[package]
+name = "redb-pbt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+redb = "4.1.0"
+hegeltest = "0.28.2"
