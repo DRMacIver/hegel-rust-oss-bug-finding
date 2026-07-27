@@ -250,11 +250,11 @@ fn val() -> impl gs::Generator<i32> {
 /// Build an arbitrary `World`: a sequence of spawns (each with an arbitrary component
 /// subset) interleaved with despawns, so entity ids get recycled and generations advance --
 /// exercising handle/generation preservation across the round-trip.
-fn arbitrary_world(tc: &hegel::TestCase) -> World {
+fn arbitrary_world(tc: &hegel::TestCase, max_steps: u32) -> World {
     let mut world = World::new();
     let mut live: Vec<Entity> = Vec::new();
 
-    let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(40));
+    let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(max_steps));
     for _ in 0..steps {
         // 0..=2 => spawn, 3 => despawn a live entity (if any).
         let op = tc.draw(gs::integers::<u8>().min_value(0).max_value(3));
@@ -283,16 +283,37 @@ fn arbitrary_world(tc: &hegel::TestCase) -> World {
     world
 }
 
+#[cfg(not(miri))]
 #[hegel::test(test_cases = 200)]
 fn row_format_roundtrips(tc: hegel::TestCase) {
-    let world = arbitrary_world(&tc);
+    let world = arbitrary_world(&tc, 40);
     let restored = row_roundtrip(&world);
     assert_equivalent(&world, &restored, "row");
 }
 
+#[cfg(not(miri))]
 #[hegel::test(test_cases = 200)]
 fn column_format_roundtrips(tc: hegel::TestCase) {
-    let world = arbitrary_world(&tc);
+    let world = arbitrary_world(&tc, 40);
+    let restored = column_roundtrip(&world);
+    assert_equivalent(&world, &restored, "column");
+}
+
+// Under Miri these are UB oracles for the unsafe bulk-copy serialize paths
+// (row + column ser/de move component data through raw pointers), so small
+// configs suffice; TooSlow is generation-speed noise under Miri.
+#[cfg(miri)]
+#[hegel::test(test_cases = 8, suppress_health_check = [hegel::HealthCheck::TooSlow])]
+fn row_format_roundtrips(tc: hegel::TestCase) {
+    let world = arbitrary_world(&tc, 10);
+    let restored = row_roundtrip(&world);
+    assert_equivalent(&world, &restored, "row");
+}
+
+#[cfg(miri)]
+#[hegel::test(test_cases = 8, suppress_health_check = [hegel::HealthCheck::TooSlow])]
+fn column_format_roundtrips(tc: hegel::TestCase) {
+    let world = arbitrary_world(&tc, 10);
     let restored = column_roundtrip(&world);
     assert_equivalent(&world, &restored, "column");
 }
