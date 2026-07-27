@@ -1,3 +1,5 @@
+<!-- FILED 2026-07-27 as https://github.com/Ralith/hecs/issues/450 -->
+
 # `ColumnBatchBuilder` leaks its written components when dropped without a successful `build()`
 
 Components pushed into a `ColumnBatchBuilder` are never dropped if the builder is dropped without being consumed by a successful `build()`. This program pushes two components, drops the builder, and the two values' destructors never run:

@@ -50,8 +50,10 @@ All target a handle pool that includes stale/despawned/reserved handles.
 
 ## Findings (all confirmed on 0.11.0 AND master; no newer release; no duplicate issues;
 ## hecs actively maintained — last commit 2026-06-10; no AI policy)
-Per-owner cap: max 2 issues to Ralith until a relationship exists — the two strongest are
-Finding A (memory-safety UB) and Finding B (leak). Filing is on HOLD per user (2026-07-27).
+Per-owner cap (max 2 to Ralith) reached — FILED 2026-07-27:
+  - Finding A (UB): https://github.com/Ralith/hecs/issues/449
+  - Finding B (leak): https://github.com/Ralith/hecs/issues/450
+Findings C and D held (would exceed the cap).
 
 - **Finding A (memory safety — strongest): `spawn_column_batch_at` with a duplicate handle
   → subtract-overflow panic (debug) / out-of-bounds write at index u32::MAX (release UB).**

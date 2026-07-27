@@ -1,3 +1,5 @@
+<!-- FILED 2026-07-27 as https://github.com/Ralith/hecs/issues/449 -->
+
 # `spawn_column_batch_at` panics or writes out of bounds when `handles` repeats an entity
 
 Passing a `handles` slice containing the same entity twice to `spawn_column_batch_at` triggers a subtraction overflow on a debug build and an out-of-bounds write on a release build:
