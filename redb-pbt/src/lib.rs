@@ -32,3 +32,5 @@ mod mvcc;
 mod savepoints;
 #[cfg(test)]
 mod surface;
+#[cfg(test)]
+mod tables;
