@@ -126,8 +126,27 @@ Findings C and D held (would exceed the cap).
 - Infra notes: hegel under Miri requires -Zmiri-disable-isolation; the heavy harness trips
   hegel's TooSlow health check under Miri (suppressed for the cfg(miri) entry point only).
 
+## Techniques developed here (2026-07-27 session) and their observed value
+- **Metamorphic relations** (tests/metamorphic.rs; skill: metamorphic-and-differential-testing):
+  cheap to write, no model bookkeeping; pinned subtle documented contracts (clear() handle
+  reuse, SpawnBatchIter Drop-drains). Passed clean on hecs — its value here was contract
+  pinning + the reusable fingerprint/twin infrastructure.
+- **Differential construction paths** (tests/differential_paths.rs): 5 API routes to the same
+  spec + mutation amplification; validated hecs's allocation determinism and history-
+  unobservability. Clean on hecs; shrinks planted bugs to minimal single-spec cases.
+- **Coverage-guided property placement** (tests/builder_bundle_api.rs, tests/query_shapes.rs;
+  skill: coverage-guided-property-testing): by far the highest bug yield per effort this
+  session — both new findings (E, F) came from the least-covered file within hours, one
+  Miri-only. Lesson: after a broad harness plateaus, dependency coverage IS the bug map.
+- **Shrinking quality** (3 planted-bug experiments): hegel shrank every plant to the minimal
+  spec (single entity, minimal field set), and the fingerprint-diff failure output reads as
+  the semantic delta directly. Wrong-relation vs SUT-bug ambiguity is resolved by reading the
+  dependency's source, never by weakening.
+
 ## Possible next steps
-- Close remaining coverage: enable `parallel` feature to test `par_iter`; QueryOne
-  with/without; PreparedView; serialize of more component universes + error paths.
-- Run the new integration tests under Miri too (currently only the core harness is Miri-gated).
-- Apply the same harness/skill to the "unreasonable degree" scale-up target (redb).
+- Fold findings C/D/E/F into filings when the per-owner cap frees up (check master first —
+  E/F were confirmed on 0.11.0 only, offline session).
+- entities.rs (83%): concurrent reserve_entity from multiple threads (free_cursor CAS paths)
+  needs a threaded harness — a new technique opportunity (concurrency PBT).
+- serialize/{row,column} remaining arms are mostly error Display/serde plumbing; low value.
+- Apply the three skills to the "unreasonable degree" scale-up target (redb).
