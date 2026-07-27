@@ -34,6 +34,14 @@ skills from the hecs work (`stateful-model-based-testing`,
   oracles for full contents, point gets, len, per-op return values; plus a
   snapshot-isolation check (a read txn opened before a commit keeps seeing the
   pre-commit snapshot).
+- `src/mvcc.rs` — TECHNIQUE 2: MVCC snapshot consistency over interleaved transactions.
+  Up to 4 OPEN read txns at once, each tagged with the `history` index at which it was
+  opened; interleaved ops = {open reader, write txn (commit → history push, or abort),
+  close reader (via `ReadTransaction::close`)}; after EVERY step, every open reader must
+  observe exactly `history[its tag]`. Deterministic (no threads) — the concurrency is
+  transaction-lifetime overlap, which is what MVCC must get right — and shrinks well.
+  Mutation sanity-check: asserting readers see the LATEST state fails immediately, so
+  the harness genuinely holds stale snapshots across commits.
 - `src/crash.rs` — TECHNIQUE 1: crash/power-loss injection. `CrashBackend`
   (`Arc<Mutex<{data, durable}>>`): writes land in `data`, `sync_data()` copies `data`
   → `durable` (the fsync point). Property: run committed txns under drawn
@@ -54,7 +62,7 @@ skills from the hecs work (`stateful-model-based-testing`,
 ## Status
 - [DONE] baseline substrate (model-vs-BTreeMap + commit/abort + durability + snapshot seed).
 - [DONE] crash/power-loss injection StorageBackend (`src/crash.rs`) — passes 300 cases.
-- [NEXT] MVCC interleaved-snapshot-consistency technique.
+- [DONE] MVCC interleaved-snapshot-consistency (`src/mvcc.rs`) — passes 500 cases.
 - [LATER] torn/partial-write crash model (arbitrary prefix of post-sync writes applied
   before reopen — read redb's 1-phase/2-phase commit + checksum-slot design first),
   savepoints (fuzzer covers; our angle: savepoint == restore-to-earlier-model),

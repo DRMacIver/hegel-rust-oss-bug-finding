@@ -22,3 +22,5 @@ mod common;
 mod crash;
 #[cfg(test)]
 mod model;
+#[cfg(test)]
+mod mvcc;
