@@ -24,3 +24,5 @@ mod crash;
 mod model;
 #[cfg(test)]
 mod mvcc;
+#[cfg(test)]
+mod savepoints;
