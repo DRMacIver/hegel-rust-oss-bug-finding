@@ -123,3 +123,12 @@ reusable, high-coverage harness and a validated technique, and any future regres
 (or the same technique aimed at a less-tested crate) has a ready oracle. Don't weaken a
 check to make it pass; a divergence is either a real bug or a wrong model, and both are
 worth the dig.
+
+## See also
+
+`metamorphic-and-differential-testing` — model-free oracles for the same kind of
+system: metamorphic relations (commutation, do/undo identities, batch≡loop,
+reset≡fresh) and N-way differential construction paths compared through an
+observational fingerprint. Cheaper to write than a model, and it catches
+cross-path/order/history bugs this harness structurally cannot; the two share
+their component universe and Drop oracle.
