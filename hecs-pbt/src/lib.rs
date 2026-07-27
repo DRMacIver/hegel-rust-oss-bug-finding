@@ -177,6 +177,31 @@ mod model {
                 ),
                 Err(QueryOneError::NoSuchEntity) => panic!("query_one (A,B) NoSuchEntity for live {:?}", e),
             }
+            // QueryOne::with / without combinators: A-value filtered by B-presence
+            match world.query_one::<&A>(e).with::<&B>().get() {
+                Ok(a) => {
+                    assert_eq!(Some(a.0), m.a, "query_one::<&A>.with::<&B> value {:?}", e);
+                    assert!(m.b.is_some(), "with::<&B> Ok but no B modelled {:?}", e);
+                }
+                Err(QueryOneError::Unsatisfied) => assert!(
+                    m.a.is_none() || m.b.is_none(),
+                    "with::<&B> Unsatisfied but A&B modelled {:?}",
+                    e
+                ),
+                Err(QueryOneError::NoSuchEntity) => panic!("with NoSuchEntity for live {:?}", e),
+            }
+            match world.query_one::<&A>(e).without::<&B>().get() {
+                Ok(a) => {
+                    assert_eq!(Some(a.0), m.a, "query_one::<&A>.without::<&B> value {:?}", e);
+                    assert!(m.b.is_none(), "without::<&B> Ok but B modelled {:?}", e);
+                }
+                Err(QueryOneError::Unsatisfied) => assert!(
+                    m.a.is_none() || m.b.is_some(),
+                    "without::<&B> Unsatisfied but A-only modelled {:?}",
+                    e
+                ),
+                Err(QueryOneError::NoSuchEntity) => panic!("without NoSuchEntity for live {:?}", e),
+            }
         }
     }
 
@@ -270,7 +295,8 @@ mod model {
         assert_eq!(got, want, "iter_batched::<&A> set/values");
     }
 
-    /// A `PreparedQuery` (archetype-cached) must return exactly the same set/values as a fresh query.
+    /// A `PreparedQuery` (archetype-cached) must return exactly the same set/values as a fresh query,
+    /// both by iteration and by `PreparedQueryBorrow::view` random access.
     fn check_prepared(world: &World, model: &HashMap<Entity, M>) {
         let mut pq = PreparedQuery::<(Entity, &A)>::new();
         let mut got: HashMap<Entity, i32> = HashMap::new();
@@ -283,6 +309,25 @@ mod model {
         let want: HashMap<Entity, i32> =
             model.iter().filter_map(|(&e, m)| m.a.map(|v| (e, v))).collect();
         assert_eq!(got, want, "PreparedQuery::<&A> set/values");
+
+        // PreparedQueryBorrow::view — random access by handle over the cached query
+        let mut pv = PreparedQuery::<&A>::new();
+        let mut borrow = pv.query(world);
+        let view = borrow.view();
+        for (&e, m) in model {
+            assert_eq!(view.get(e).map(|a| a.0), m.a, "prepared borrow view.get {:?}", e);
+            assert_eq!(view.contains(e), m.a.is_some(), "prepared borrow view.contains {:?}", e);
+        }
+    }
+
+    /// `PreparedView` on a uniquely-borrowed world: random access by handle agrees with the model.
+    fn check_prepared_view(world: &mut World, model: &HashMap<Entity, M>) {
+        let mut pq = PreparedQuery::<&A>::new();
+        let view = pq.view_mut(world);
+        for (&e, m) in model {
+            assert_eq!(view.get(e).map(|a| a.0), m.a, "prepared_view.get {:?}", e);
+            assert_eq!(view.contains(e), m.a.is_some(), "prepared_view.contains {:?}", e);
+        }
     }
 
     /// Full oracle: World and model describe the same entities/components, drops balance,
@@ -357,7 +402,7 @@ mod model {
 
         let steps = tc.draw(gs::integers::<u32>().min_value(0).max_value(max_steps));
         for _ in 0..steps {
-            match tc.draw(gs::integers::<u8>().min_value(0).max_value(22)) {
+            match tc.draw(gs::integers::<u8>().min_value(0).max_value(23)) {
                 // reserve entity id(s) concurrently (not visible until flush): one, or a bulk range
                 8 => {
                     match tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) {
@@ -737,6 +782,36 @@ mod model {
                     known.push(e1);
                     known.push(e2);
                 }
+                // spawn_at a chosen handle: forces that exact id+generation live, overwriting
+                // (and dropping) whatever entity currently occupies that id
+                23 => {
+                    flush_model(&mut model, &mut reserved);
+                    if let Some(handle) = pick(tc, &known) {
+                        let a = tc.draw(gs::optional(val()));
+                        let b = tc.draw(gs::optional(val()));
+                        let c = tc.draw(gs::booleans());
+                        let d = tc.draw(gs::optional(val()));
+                        let mut builder = EntityBuilder::new();
+                        if let Some(v) = a {
+                            builder.add(A(v));
+                        }
+                        if let Some(v) = b {
+                            builder.add(B(v));
+                        }
+                        if c {
+                            builder.add(C);
+                        }
+                        if let Some(v) = d {
+                            builder.add(D::new(v));
+                        }
+                        world.spawn_at(handle, builder.build());
+                        // any live entity sharing this id is destroyed (its D, if any, dropped);
+                        // the id now resolves to exactly `handle`
+                        let vid = handle.id();
+                        model.retain(|k, _| k.id() != vid);
+                        model.insert(handle, M { a, b, c, d });
+                    }
+                }
                 // spawn an arbitrary subset of {A, B, C, D}
                 0 | 1 => {
                     flush_model(&mut model, &mut reserved);
@@ -864,8 +939,9 @@ mod model {
                     }
                 }
             }
-            // unique-borrow query path (query_one_mut) checked separately, then the shared oracle
+            // unique-borrow query paths (query_one_mut, PreparedView) checked separately
             check_query_one_mut(&mut world, &model);
+            check_prepared_view(&mut world, &model);
             check(&world, &model, &reserved);
         }
     }
