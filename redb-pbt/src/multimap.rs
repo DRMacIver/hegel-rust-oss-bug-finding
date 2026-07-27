@@ -62,6 +62,19 @@ fn check_mm(db: &Database, model: &Model) {
     }
     let absent = table.get(u64::MAX).unwrap();
     assert_eq!(absent.count(), 0, "get(absent key) must be empty");
+    // Backward iteration: keys descending, values within a key descending.
+    let mut back: Vec<(u64, Vec<u64>)> = Vec::new();
+    for row in table.iter().unwrap().rev() {
+        let (k, values) = row.unwrap();
+        let vals: Vec<u64> = values.map(|v| v.unwrap().value()).rev().collect();
+        back.push((k.value(), vals));
+    }
+    let want_back: Vec<(u64, Vec<u64>)> = model
+        .iter()
+        .rev()
+        .map(|(&k, set)| (k, set.iter().rev().copied().collect()))
+        .collect();
+    assert_eq!(back, want_back, "reverse iteration");
 }
 
 fn drive_mm(tc: &hegel::TestCase, max_txns: u32) {
