@@ -51,6 +51,20 @@ skills from the hecs work (`stateful-model-based-testing`,
   (b) recovered contents == `history[j]` for some `j >= last_durable`. Mutation
   sanity-check: strengthening (b) to "== latest commit" fails immediately (recovered
   `{}` vs a non-durable insert), so the crash model genuinely drops un-fsynced state.
+  TORN-WRITE STRETCH (same file): the backend also records the FULL mutation stream
+  (`Write`/`SetLen`/`Sync` markers). Key insight: under in-order persistence, ANY
+  prefix `F[..m]` of the stream is a valid power-loss image (crash at issue point `m`
+  with all issued writes persisted), so cutting anywhere — including MID-COMMIT,
+  before an Immediate commit's fsync — plus optionally tearing the next write at a
+  drawn byte offset, models torn writes without needing subset/reorder semantics.
+  Admissible recovery = any committed snapshot ≥ the newest Immediate commit that
+  fully completed (its recorded log position ≤ cut). Two empirical facts the mutation
+  checks established: (1) `Durability::None` commits produce NO backend writes by
+  quiesce (they live in redb's own page cache), so end-of-run crashes always recover
+  exactly the last durable state — mid-stream cuts are ESSENTIAL for the torn model
+  to explore anything; (2) with mid-commit cuts, recovery genuinely lands AHEAD of
+  the durable floor sometimes (1-phase commit writes the god byte BEFORE its fsync),
+  so the "some j ≥ floor" oracle shape is required, not just convenient.
 
 ## Run
 - `cargo test` — baseline 500 cases × ≤40 txns + crash 300 cases × ≤20 txns (~7s total).
@@ -63,10 +77,12 @@ skills from the hecs work (`stateful-model-based-testing`,
 - [DONE] baseline substrate (model-vs-BTreeMap + commit/abort + durability + snapshot seed).
 - [DONE] crash/power-loss injection StorageBackend (`src/crash.rs`) — passes 300 cases.
 - [DONE] MVCC interleaved-snapshot-consistency (`src/mvcc.rs`) — passes 500 cases.
-- [LATER] torn/partial-write crash model (arbitrary prefix of post-sync writes applied
-  before reopen — read redb's 1-phase/2-phase commit + checksum-slot design first),
-  savepoints (fuzzer covers; our angle: savepoint == restore-to-earlier-model),
-  multimap tables, range/retain/drain query surface, metamorphic (txn grouping invariance).
+- [DONE] savepoints as model-restore (`src/savepoints.rs`) — passes 400 cases.
+- [DONE] metamorphic txn-grouping invariance (`src/metamorphic.rs`) — passes 400 cases.
+- [DONE] torn-write crash model (arbitrary in-order cut of the full write stream,
+  next write optionally torn mid-write) — passes 300 cases.
+- [LATER] multimap tables, range/retain/drain query surface, coverage-guided pass
+  (`cargo llvm-cov --dep-coverage redb`), crash-during-database-creation window.
 
 ## Findings
 - None yet (baseline passes; redb is mature).
