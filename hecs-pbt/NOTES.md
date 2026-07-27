@@ -1,11 +1,24 @@
 # hecs PBT testbed — state of play
 
 Goal: property-based-test hecs to an unreasonable degree, as a testbed for developing
-reusable stateful-model PBT technique with hegel. Technique is codified as the
-`stateful-model-based-testing` skill (../.claude/skills/).
+reusable PBT technique with hegel. Techniques are codified as the
+`stateful-model-based-testing` and `metamorphic-and-differential-testing` skills
+(../.claude/skills/).
 
 ## Layout
 - `src/lib.rs` — core stateful model-based harness: `drive()` + cfg-gated normal/miri entry points.
+- `tests/common/mod.rs` — shared model-free-oracle infrastructure: component universe,
+  observational `fingerprint()`, twin-world builder (deterministic replay), Drop oracle.
+- `tests/metamorphic.rs` — model-free relations: commuting disjoint ops, insert∘remove and
+  exchange round-trip adjusted identities, spawn_batch ≡ loop (incl. partial consumption),
+  clear() ≡ fresh world (incl. handle reuse), insert-order independence.
+- `tests/differential_paths.rs` — same drawn specs through 5 construction paths (EntityBuilder,
+  static tuples over all 16 subsets, reserve+insert, CommandBuffer, incremental insert_one),
+  N-way fingerprint equality + spec ground truth + mutation-amplification phase.
+- `tests/builder_bundle_api.rs` — coverage-guided builder/bundle/Ref/column API properties
+  (bundle query-satisfaction vs spec, clone-builder algebra, add_bundle ≡ individual adds,
+  Ref/RefMut map/clone/format, whole-column Archetype::get vs per-entity reads). Found
+  findings E and F below.
 - `tests/serialize_roundtrip.rs` — row + column serialize→deserialize round-trip.
 - `tests/command_buffer.rs` — CommandBuffer (buffered run_on vs eager direct application).
 - `tests/change_tracker.rs` — ChangeTracker added/changed/removed vs a model, exact semantics.
@@ -14,19 +27,25 @@ reusable stateful-model PBT technique with hegel. Technique is codified as the
   malformed-stream validation, serialize_satisfying, Drop-tracked leak hunt.
 
 ## Run
-- `cargo test` — full suite (14 tests across 5 files; core harness ~18s).
-- `cargo +nightly miri test --lib` with
-  `MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-disable-isolation"` — UB hunt (~32s).
-  `-Zmiri-disable-isolation` is REQUIRED: hegel reads its test-case DB from disk.
+- `cargo test` — full suite (43 tests across 9 binaries; core harness ~18s, serialize_errors ~12s).
+- Miri, with `MIRIFLAGS="-Zmiri-permissive-provenance -Zmiri-disable-isolation"`
+  (`-Zmiri-disable-isolation` is REQUIRED: hegel reads its test-case DB from disk):
+  - `cargo +nightly miri test --lib` (~32s), and
+  - `cargo +nightly miri test --test metamorphic --test differential_paths
+     --test serialize_roundtrip --test builder_bundle_api` (~2min) — cfg(miri)-gated small
+    configs; the serialize round-trips and builder/column paths are UB oracles there.
 
 ## Coverage of hecs (cargo-llvm-cov --dep-coverage hecs)
 - Core harness alone (`--lib`): 32.9% → **57%** region coverage after the breadth push.
-- Full suite (`--tests`): 32.9% → **81.3%** region coverage. Per-file highlights: command_buffer
-  100%, take 100%, world.rs 91%, change_tracker 97%, query_one 91%, batch 87%, serialize/row 83%,
-  serialize/column 83%, entities 83%, archetype 82%.
+- Full suite (`--tests`): 32.9% → 81.3% → **86.2%** region coverage (2026-07-27, after the
+  coverage-guided builder/bundle suite). Per-file: command_buffer 100%, take 100%,
+  entity_ref 100%, entity_builder 98%, change_tracker 97%, bundle 94%, archetype 92%,
+  world.rs 91%, query_one 91%, batch 87%, serialize/row 83%, serialize/column 83%,
+  entities 83%, query.rs 71%.
 - NOTE: hecs 0.11.0 has NO par_iter/rayon feature (only row-serialize/column-serialize/std) —
-  that path does not exist to cover. Remaining gaps are DynamicBundleClone (bundle.rs 66%),
-  some EntityRef/EntityBuilder methods, and obscure Fetch impls.
+  that path does not exist to cover. Remaining gap is mostly query.rs (obscure Fetch impls:
+  &mut-flavored With/Without/Or/Satisfies fetches, size_hint paths) and entities.rs edge
+  branches.
 
 ## Operations exercised (core harness; fixed universe A(i32), B(i32), C(ZST), D(Drop-tracked))
 spawn(arbitrary subset) · despawn · insert_one · remove_one · insert(bundle) ·
@@ -47,6 +66,25 @@ All target a handle pool that includes stale/despawned/reserved handles.
   iter_batched (== flat iter), PreparedQuery (== fresh query)
 - reserved-state: reserved handles contained() but excluded from len/iter/queries/model
 - serialize round-trip (row + column), exact Entity-handle preservation
+
+## New findings (unfiled — per-owner cap reached with #449/#450; confirmed on 0.11.0 only,
+## master NOT checked this session (no network); both found 2026-07-27 by
+## tests/builder_bundle_api.rs, the second only under Miri)
+- **Finding E (memory safety): `From<BuiltEntityClone> for EntityBuilderClone` leaves a
+  stale `indices` map** — `build()` sorts `info` by descending alignment without rebuilding
+  `indices`, so a round-tripped builder's `get`/`get_mut`/`add` hit the wrong slot. Same-size
+  components: silent value corruption/swap via safe code (how the suite caught it). Different
+  sizes: `add` does an out-of-bounds read (Miri-confirmed at entity_builder.rs:351), `get` can
+  read uninit. Deterministic repro with align-1-then-align-8 components.
+  Draft: `../draft-reports/hecs-builtentityclone-stale-indices.md`. In-suite:
+  `from_built_entity_clone_stale_indices_observation` pins the current wrong-slot read.
+- **Finding F (UB): `EntityBuilderClone::clone` / `BuiltEntityClone::clone` on an empty or
+  ZST-only builder calls `alloc` with a zero-size layout** (entity_builder.rs:411) — UB per
+  GlobalAlloc's contract, Miri-confirmed on `EntityBuilderClone::new().clone()`. `drop` and
+  `grow` both guard zero-size; `clone` doesn't. Draft:
+  `../draft-reports/hecs-entitybuilderclone-clone-zero-alloc.md`. In-suite the
+  clone-equivalence property is guarded to sized components (loudly commented) so Miri stays
+  green; the repro lives in the draft.
 
 ## Findings (all confirmed on 0.11.0 AND master; no newer release; no duplicate issues;
 ## hecs actively maintained — last commit 2026-06-10; no AI policy)
