@@ -10,6 +10,8 @@ reusable stateful-model PBT technique with hegel. Technique is codified as the
 - `tests/command_buffer.rs` — CommandBuffer (buffered run_on vs eager direct application).
 - `tests/change_tracker.rs` — ChangeTracker added/changed/removed vs a model, exact semantics.
 - `tests/column_batch.rs` — ColumnBatch / spawn_column_batch(_at) vs one-by-one spawn.
+- `tests/serialize_errors.rs` — serialize edge/error paths: truncated/corrupted input safety,
+  malformed-stream validation, serialize_satisfying, Drop-tracked leak hunt.
 
 ## Run
 - `cargo test` — full suite (14 tests across 5 files; core harness ~18s).
@@ -18,11 +20,13 @@ reusable stateful-model PBT technique with hegel. Technique is codified as the
   `-Zmiri-disable-isolation` is REQUIRED: hegel reads its test-case DB from disk.
 
 ## Coverage of hecs (cargo-llvm-cov --dep-coverage hecs)
-- Core harness alone (`--lib`): 32.9% → **54.2%** region coverage after the breadth push.
-- Full suite (`--tests`): **77.8%** region coverage. Per-file highlights: command_buffer 100%,
-  take 100%, world.rs 91%, change_tracker 97%, entities 82%, archetype 82%, batch 72%.
-- Remaining gaps are mostly feature-gated (rayon `par_iter`), plus QueryOne with/without
-  combinators, PreparedView, and some serialize error paths.
+- Core harness alone (`--lib`): 32.9% → **57%** region coverage after the breadth push.
+- Full suite (`--tests`): 32.9% → **81.3%** region coverage. Per-file highlights: command_buffer
+  100%, take 100%, world.rs 91%, change_tracker 97%, query_one 91%, batch 87%, serialize/row 83%,
+  serialize/column 83%, entities 83%, archetype 82%.
+- NOTE: hecs 0.11.0 has NO par_iter/rayon feature (only row-serialize/column-serialize/std) —
+  that path does not exist to cover. Remaining gaps are DynamicBundleClone (bundle.rs 66%),
+  some EntityRef/EntityBuilder methods, and obscure Fetch impls.
 
 ## Operations exercised (core harness; fixed universe A(i32), B(i32), C(ZST), D(Drop-tracked))
 spawn(arbitrary subset) · despawn · insert_one · remove_one · insert(bundle) ·
@@ -44,19 +48,38 @@ All target a handle pool that includes stale/despawned/reserved handles.
 - reserved-state: reserved handles contained() but excluded from len/iter/queries/model
 - serialize round-trip (row + column), exact Entity-handle preservation
 
-## Findings
-- **BUG (reportable): `ColumnBatchBuilder` leaks its written components** when the builder
-  is dropped without a successful `build()` — both on plain drop and when `build()` returns
-  `Err(BatchIncomplete)`. Confirmed on 0.11.0 and on master; no newer release; no duplicate
-  issue; hecs actively maintained (last commit 2026-06-10, no AI policy). Draft at
-  `../draft-reports/hecs-columnbatchbuilder-leak.md`. Root cause (for us, not the report):
+## Findings (all confirmed on 0.11.0 AND master; no newer release; no duplicate issues;
+## hecs actively maintained — last commit 2026-06-10; no AI policy)
+Per-owner cap: max 2 issues to Ralith until a relationship exists — the two strongest are
+Finding A (memory-safety UB) and Finding B (leak). Filing is on HOLD per user (2026-07-27).
+
+- **Finding A (memory safety — strongest): `spawn_column_batch_at` with a duplicate handle
+  → subtract-overflow panic (debug) / out-of-bounds write at index u32::MAX (release UB).**
+  Reachable through the SAFE `column::deserialize` API: `visit_seq` passes the stream's raw
+  entity-id list to `spawn_column_batch_at` with no dedup, so deserializing untrusted/corrupt
+  column data whose id list repeats an id triggers it. Root cause: the second `alloc_at(id)`
+  takes the "id already live" branch and returns the EMPTY sentinel location {archetype:0,
+  index:u32::MAX}; hecs then calls `Archetype::remove(u32::MAX, true)` → `self.len - 1`
+  underflow. Draft: `../draft-reports/hecs-column-deserialize-duplicate-id-ub.md`. Verified by
+  a standalone repro (debug panic at archetype.rs:321).
+- **Finding B (leak): `ColumnBatchBuilder` leaks its written components** when dropped without
+  a successful `build()` — plain drop AND `build()`→`Err(BatchIncomplete)`. Also reachable via
+  `column::deserialize` of truncated data (leaks every component already parsed into the
+  internal builder). Draft: `../draft-reports/hecs-columnbatchbuilder-leak.md`. Root cause:
   `ColumnBatchBuilder::drop` steps a `*mut u8` by byte-index and calls `drop_in_place::<u8>`
-  (a no-op), and `build()` moves the archetype out (len 0) before the completeness check so
-  the `Err` path drops nothing. The happy path (full build → spawn → World drop) is correct.
+  (no-op); `build()` moves the archetype out (len 0) before the completeness check.
+- **Finding C (panic, lower severity): column `entity_count == u32::MAX`** trips
+  `assert!(size < u32::MAX)` in `ColumnBatchType::into_batch` — panic instead of `Err` on
+  malformed input (after `Vec::reserve`-ing ~34GB from the untrusted count). No separate draft
+  yet; candidate to fold into a deserialize-hardening report.
+- **Finding D (analysis, not filed): unbounded allocation** — both deserializers trust
+  attacker-controlled ids/counts before validation (row `spawn_at` grows metadata to the id;
+  column `entity_count` drives reserve), so one corrupted high byte can commit tens of GB.
 - Everything else passes at scale: core model-vs-map + per-op + Drop + archetype + all query
-  shapes + reserved-state + serialize + CommandBuffer + ChangeTracker + column-batch happy
-  paths + Miri, all clean.
-- Infra note: hegel under Miri requires -Zmiri-disable-isolation.
+  shapes (incl. spawn_at, disjoint-mut, PreparedView) + reserved-state + serialize round-trip +
+  CommandBuffer + ChangeTracker + column-batch happy paths + Miri (UB-clean), all clean.
+- Infra notes: hegel under Miri requires -Zmiri-disable-isolation; the heavy harness trips
+  hegel's TooSlow health check under Miri (suppressed for the cfg(miri) entry point only).
 
 ## Possible next steps
 - Close remaining coverage: enable `parallel` feature to test `par_iter`; QueryOne

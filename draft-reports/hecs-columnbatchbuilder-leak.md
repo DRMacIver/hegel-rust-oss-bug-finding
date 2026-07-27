@@ -65,6 +65,8 @@ live Tracked after build() returned Err: 2
 
 A fully-filled builder that is consumed by a successful `build()` and spawned into a `World` drops its components correctly; the leak only affects the drop-without-build and the `Err(BatchIncomplete)` paths.
 
+The same leak is reachable from safe deserialization: `column::deserialize` builds its entities through an internal `ColumnBatchBuilder`, so a column-format stream that ends partway through the component data (truncated or corrupted) returns `Err` but leaks every component already deserialized into that builder. Deserializing a one-entity `(Tracked, i32)` column stream with the trailing byte removed leaks the one `Tracked` value.
+
 Tested on hecs 0.11.0 and on current `master`.
 
 BTW, this was found with [hegel](https://crates.io/crates/hegeltest) while property-testing hecs; happy to contribute the tests if useful.
