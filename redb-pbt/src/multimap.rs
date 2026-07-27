@@ -85,7 +85,7 @@ fn drive_mm(tc: &hegel::TestCase, max_txns: u32) {
             let mut table = wtxn.open_multimap_table(MM).unwrap();
             let ops = tc.draw(gs::integers::<u32>().min_value(0).max_value(8));
             for _ in 0..ops {
-                match tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) {
+                match tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) {
                     // insert(k, v): returns true iff the pair was ALREADY present.
                     0 | 1 => {
                         let k = tc.draw(key());
@@ -110,6 +110,20 @@ fn drive_mm(tc: &hegel::TestCase, max_txns: u32) {
                             None => false,
                         };
                         assert_eq!(removed, model_removed, "remove({k},{v}) return");
+                    }
+                    // Bulk insert: many distinct values under ONE key, to push the
+                    // per-key collection out of its inline representation into a
+                    // subtree (redb stores small value sets inline in the leaf and
+                    // spills to a full B-tree beyond that).
+                    4 => {
+                        let k = tc.draw(key());
+                        let n = tc.draw(gs::integers::<u64>().min_value(1).max_value(150));
+                        let base = tc.draw(gs::integers::<u64>().min_value(0).max_value(10_000));
+                        let set = staged.entry(k).or_default();
+                        for v in base..base + n {
+                            let was_present = table.insert(k, v).unwrap();
+                            assert_eq!(was_present, !set.insert(v), "bulk insert({k},{v})");
+                        }
                     }
                     // remove_all(k): yields the removed values in ascending order.
                     _ => {

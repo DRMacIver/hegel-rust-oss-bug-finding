@@ -207,6 +207,12 @@ fn run_random_txns(
             Durability::None
         })
         .unwrap();
+        // Exercise the alternative commit protocols: 2-phase commit (fsync between the
+        // slot write and the god-byte flip) and quick-repair (persist allocator state,
+        // implies 2-phase). Both strengthen, never weaken, the recovery guarantee, so
+        // the oracle is unchanged.
+        wtxn.set_two_phase_commit(tc.draw(gs::booleans()));
+        wtxn.set_quick_repair(tc.draw(gs::booleans()));
 
         let mut staged = history.last().unwrap().clone();
         {
