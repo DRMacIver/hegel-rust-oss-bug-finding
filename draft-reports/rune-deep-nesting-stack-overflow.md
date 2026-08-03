@@ -1,3 +1,5 @@
+<!-- FILED 2026-08-03 as https://github.com/rune-rs/rune/issues/1040 -->
+
 # Deeply nested expressions abort the process with a stack overflow at compile time
 
 Compiling a deeply nested expression overflows the stack and aborts the process instead of returning a compile error:

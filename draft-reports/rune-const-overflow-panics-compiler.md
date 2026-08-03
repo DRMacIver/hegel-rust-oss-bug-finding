@@ -1,3 +1,5 @@
+<!-- FILED 2026-08-03 as https://github.com/rune-rs/rune/issues/1039 -->
+
 # Compiling a `const` with overflowing integer arithmetic panics the compiler
 
 Compiling a `const` whose initializer overflows `i64` panics the compiler on a debug build, and accepts the wrapped value on a release build:
