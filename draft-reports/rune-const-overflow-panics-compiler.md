@@ -32,4 +32,4 @@ The same overflowing arithmetic evaluated at runtime (e.g. `9223372036854775807 
 
 Tested on rune 0.14.2 and on current `main`.
 
-BTW, this was found with [hegel](https://crates.io/crates/hegeltest) while property-testing rune; happy to contribute the tests if useful.
+This was another bug found with Hegel while preparing the follow-on PR discussed in #1030.
